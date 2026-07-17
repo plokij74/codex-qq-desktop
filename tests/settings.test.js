@@ -1,0 +1,29 @@
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { DEFAULT_SETTINGS, getSettingsPath, loadSettings, saveSettings } = require('../src/ai/settings');
+
+describe('settings', () => {
+  it('getSettingsPath joins settings.json', () => {
+    assert.equal(getSettingsPath(path.join('tmp', 'data')), path.join('tmp', 'data', 'settings.json'));
+  });
+
+  it('loadSettings returns defaults when file missing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const s = loadSettings(dir);
+    assert.equal(s.mode, 'local');
+    assert.equal(s.model, DEFAULT_SETTINGS.model);
+  });
+
+  it('saveSettings persists and loadSettings reads back', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    saveSettings(dir, { mode: 'api', apiKey: 'sk-test', model: 'gpt-test' });
+    const s = loadSettings(dir);
+    assert.equal(s.mode, 'api');
+    assert.equal(s.apiKey, 'sk-test');
+    assert.equal(s.model, 'gpt-test');
+    assert.equal(s.baseUrl, DEFAULT_SETTINGS.baseUrl);
+  });
+});

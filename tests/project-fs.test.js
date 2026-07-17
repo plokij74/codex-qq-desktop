@@ -1,0 +1,70 @@
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const {
+  resolveSafe,
+  writeFile,
+  readFile,
+  parseWriteFences,
+  applyWriteFences,
+  listTree,
+  isListIntent,
+  isStructureIntent,
+  buildTreeReply,
+} = require('../src/ai/project-fs');
+
+describe('project-fs', () => {
+  it('resolveSafe blocks path escape', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-proj-'));
+    assert.throws(() => resolveSafe(root, '../outside.txt'), /越界/);
+  });
+
+  it('write and read file inside project', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-proj-'));
+    writeFile(root, 'a/b.txt', 'hello');
+    const f = readFile(root, 'a/b.txt');
+    assert.equal(f.content, 'hello');
+  });
+
+  it('applyWriteFences writes files', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-proj-'));
+    const text = '说明\n\n```write:note.md\n# hi\n```\n';
+    const r = applyWriteFences(root, text);
+    assert.equal(r.applied.length, 1);
+    assert.equal(r.applied[0].ok, true);
+    assert.equal(fs.readFileSync(path.join(root, 'note.md'), 'utf8'), '# hi');
+  });
+
+  it('parseWriteFences extracts ops', () => {
+    const ops = parseWriteFences('```create:x.js\n1\n```');
+    assert.equal(ops[0].path, 'x.js');
+    assert.equal(ops[0].content, '1');
+  });
+
+  it('listTree walks nested dirs', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-proj-'));
+    fs.mkdirSync(path.join(root, 'src', 'util'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'util', 'a.js'), '1');
+    fs.writeFileSync(path.join(root, 'README.md'), 'x');
+    const t = listTree(root, { maxDepth: 5, maxEntries: 100 });
+    assert.match(t.treeText, /src\//);
+    assert.match(t.treeText, /a\.js/);
+    assert.ok(t.count >= 3);
+  });
+
+  it('intent detectors', () => {
+    assert.equal(isListIntent('列出所有目录'), true);
+    assert.equal(isStructureIntent('帮我整理目录结构'), true);
+    assert.equal(isListIntent('写个登录页'), false);
+  });
+
+  it('buildTreeReply returns real tree', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-proj-'));
+    fs.writeFileSync(path.join(root, 'f.txt'), '1');
+    const r = buildTreeReply({ name: 'demo', path: root }, '列出文件');
+    assert.match(r.content, /真实扫盘|真实路径/);
+    assert.match(r.content, /f\.txt/);
+  });
+});

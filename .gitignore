@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.npm-cache/
+*.tgz
+*.zip
+npm-install.*
+electron-meta.json
+fetch-meta.js
+run-npm-install.ps1
+.DS_Store

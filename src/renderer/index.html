@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: blob:;" />
+  <title>Codex 2007</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="qq-app">
+    <header class="qq-titlebar">
+      <div class="qq-titlebar-left">
+        <span class="qq-logo">🐧</span>
+        <span class="qq-title-text">Codex 2007 - <span id="session-title">优化 KV 读写成本</span></span>
+      </div>
+      <div class="qq-titlebar-right">
+        <button type="button" class="win-btn" id="btn-settings" title="设置">⚙</button>
+      </div>
+    </header>
+
+    <nav class="qq-toolbar" id="main-toolbar">
+      <button type="button" class="tb-btn" data-view="new-task">新建任务</button>
+      <button type="button" class="tb-btn" data-view="scheduled">已安排</button>
+      <button type="button" class="tb-btn" data-view="plugins">插件</button>
+      <button type="button" class="tb-btn" data-view="sites">站点</button>
+      <button type="button" class="tb-btn" data-view="prs">拉取请求</button>
+      <button type="button" class="tb-btn active" data-view="chat">聊天</button>
+    </nav>
+
+    <div class="qq-body">
+      <aside class="qq-left">
+        <div class="left-section">
+          <div class="left-header">🐧 Codex</div>
+          <ul class="nav-list" id="left-nav">
+            <li class="nav-item" data-view="new-task">新建任务</li>
+            <li class="nav-item" data-view="scheduled">已安排</li>
+            <li class="nav-item" data-view="plugins">插件</li>
+            <li class="nav-item" data-view="sites">站点</li>
+            <li class="nav-item" data-view="prs">拉取请求</li>
+            <li class="nav-item active" data-view="chat">聊天</li>
+          </ul>
+        </div>
+
+        <div id="left-dynamic"></div>
+
+        <div class="left-section contact-section">
+          <div class="contact-row" id="contact-randy" role="button" tabindex="0">
+            <span class="avatar-sm">👤</span>
+            <div>
+              <div class="contact-name">Randy Lu</div>
+              <div class="contact-status online">在线</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="left-search">
+          <input type="search" id="left-search" placeholder="搜索会话 / 项目..." />
+        </div>
+      </aside>
+
+      <main class="qq-main">
+        <!-- Chat mode -->
+        <div id="view-chat" class="view-panel">
+          <div class="session-head">
+            <div>
+              <h1 id="session-heading">优化 KV 读写成本</h1>
+              <div class="session-sub" id="session-sub">与 Codex 小蓝 对话</div>
+            </div>
+            <div class="session-actions">
+              <button type="button" class="ghost-btn hidden" id="btn-bind-project">绑定目录</button>
+              <button type="button" class="ghost-btn" id="btn-clear-chat" title="清空当前会话">清空</button>
+            </div>
+          </div>
+          <div id="message-list" class="message-list" aria-live="polite"></div>
+          <div class="composer">
+            <div class="composer-tools">
+              <button type="button" class="tool-btn" id="btn-emoji" title="表情">😊 表情</button>
+              <button type="button" class="tool-btn" id="btn-image" title="图片">🖼 图片</button>
+              <button type="button" class="tool-btn" id="btn-attach" title="附件">📎 附加</button>
+              <input type="file" id="file-image" accept="image/*" hidden />
+              <input type="file" id="file-attach" hidden />
+            </div>
+            <div id="emoji-panel" class="emoji-panel hidden"></div>
+            <div id="attach-preview" class="attach-preview hidden"></div>
+            <textarea id="chat-input" rows="3" placeholder="输入消息，Enter 发送..."></textarea>
+            <div class="composer-footer">
+              <span class="hint">Enter 发送 · Shift+Enter 换行 · /help 查看命令</span>
+              <button type="button" id="btn-stop" class="stop-btn hidden" title="停止生成">停止</button><button type="button" id="btn-send" class="send-btn">发送(S)</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Other feature views -->
+        <div id="view-work" class="view-panel hidden">
+          <div class="session-head">
+            <div>
+              <h1 id="work-title">工作台</h1>
+              <div class="session-sub" id="work-sub"></div>
+            </div>
+          </div>
+          <div id="work-body" class="work-body"></div>
+        </div>
+      </main>
+
+      <aside class="qq-right" id="friend-panel">
+        <div class="right-head">
+          <span id="right-title">Codex 好友</span>
+          <span class="lv-badge">LV07</span>
+        </div>
+        <div class="robot-card" id="robot-card" role="button" tabindex="0" title="和 Codex 聊天">
+          <img src="assets/robot.svg" alt="Codex 机器人" class="robot-avatar" />
+          <div class="robot-name">Codex 小蓝</div>
+          <div class="robot-bio" id="robot-bio">
+            代码有问题？找我！<br />
+            我是你的智能伙伴 Codex<br />
+            陪你写代码，改 Bug，<br />
+            查文档，超可靠哇！
+          </div>
+        </div>
+        <div class="friend-list-head" id="friend-list-head">我的好友</div>
+        <ul class="friend-list" id="friend-list"></ul>
+      </aside>
+    </div>
+
+    <footer class="qq-status">
+      <span id="status-left">安全 · 本地模式</span>
+      <span id="status-mid"></span>
+      <span id="clock"></span>
+    </footer>
+  </div>
+
+  <!-- New task modal -->
+  <div id="task-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-title">新建任务</div>
+      <label class="field">
+        <span>任务标题</span>
+        <input id="task-title" type="text" placeholder="例如：修复登录超时" maxlength="80" />
+      </label>
+      <label class="field">
+        <span>首条说明（可选）</span>
+        <textarea id="task-brief" rows="3" placeholder="简单描述目标..."></textarea>
+      </label>
+      <div class="modal-actions">
+        <button type="button" id="btn-task-cancel" class="btn-secondary">取消</button>
+        <button type="button" id="btn-task-ok" class="btn-primary">创建并开始</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-card">
+      <div class="modal-title" id="settings-title">设置</div>
+      <label class="field">
+        <span>模式</span>
+        <select id="set-mode">
+          <option value="local">本地模拟</option>
+          <option value="api">OpenAI 兼容 API</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Base URL</span>
+        <input id="set-base-url" type="text" placeholder="https://api.openai.com/v1" />
+      </label>
+      <label class="field">
+        <span>API Key</span>
+        <input id="set-api-key" type="password" placeholder="留空则保留原 Key" autocomplete="off" />
+        <small id="set-api-hint" class="field-hint"></small>
+      </label>
+      <label class="field">
+        <span>Model</span>
+        <input id="set-model" type="text" placeholder="gpt-4o-mini" />
+      </label>
+      <div class="field-block">
+        <div class="field-title">Agent / 终端</div>
+        <label class="switch-row"><input type="checkbox" id="set-agent-enabled" checked /> <span>启用多轮 Agent（list/read/write 循环）</span></label>
+        <label class="field"><span>最大 Agent 轮数</span><input id="set-agent-turns" type="number" min="0" max="50" value="8" title="0 表示不限制轮数" /></label>
+        <label class="switch-row"><input type="checkbox" id="set-terminal-enabled" /> <span>允许终端命令（默认关）</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-terminal-confirm" checked /> <span>执行前弹窗确认</span></label>
+        <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。</small>
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="btn-settings-cancel" class="btn-secondary">取消</button>
+        <button type="button" id="btn-settings-save" class="btn-primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  
+  <div id="project-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-title">添加项目</div>
+      <label class="field">
+        <span>项目名称</span>
+        <input id="project-name" type="text" placeholder="例如：my-app" maxlength="80" />
+      </label>
+      <label class="field">
+        <span>真实目录</span>
+        <div class="path-row">
+          <input id="project-path" type="text" placeholder="选择本地文件夹" readonly />
+          <button type="button" id="btn-project-browse" class="btn-secondary">浏览…</button>
+        </div>
+      </label>
+      <div class="modal-actions">
+        <button type="button" id="btn-project-cancel" class="btn-secondary">取消</button>
+        <button type="button" id="btn-project-ok" class="btn-primary">添加</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="ctx-menu" class="ctx-menu hidden"></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
+
