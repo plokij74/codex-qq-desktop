@@ -48,6 +48,9 @@ let activeSessionId = '';
 let currentView = 'chat';
 let sending = false;
 
+/** Active agent/stream run for the current send (event-driven UI). */
+let chatRun = null;
+
 function setSending(on) {
   sending = !!on;
   const btn = document.getElementById('btn-send');
@@ -59,8 +62,19 @@ function setSending(on) {
 /** Local cancel token for friend mock / short delays */
 let localSendToken = null;
 
+function disableApprovalCards(root) {
+  const scope = root || document;
+  scope.querySelectorAll('.approval-card:not(.resolved)').forEach((card) => {
+    card.classList.add('resolved');
+    card.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = true; });
+    const res = card.querySelector('.appr-result');
+    if (res && !res.textContent) res.textContent = '已取消';
+  });
+}
+
 async function stopGenerating() {
   if (localSendToken) localSendToken.aborted = true;
+  if (chatRun?.el) disableApprovalCards(chatRun.el);
   try {
     if (window.codex?.stopChat) await window.codex.stopChat();
     if (sending) toast('正在停止…');
@@ -172,14 +186,297 @@ function renderMessages() {
   const list = document.getElementById('message-list'); if (!list) return;
   const session = activeSession(); const msgs = session?.messages || [];
   const botName = peerName(session?.peer || 'codex');
+  const liveRun = chatRun && chatRun.sessionId === activeSessionId && !chatRun.finalized;
+  const showTyping = sending && !liveRun;
   list.innerHTML = msgs.map((msg) => {
     const roleClass = msg.role === 'user' ? 'msg-user' : 'msg-assistant';
     const errClass = msg.error ? ' msg-error' : '';
     const who = msg.role === 'user' ? '我' : botName;
     return '<div class="msg '+roleClass+errClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+renderMarkdownLite(msg.content)+'</div></div>';
-  }).join('') + (sending ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '');
+  }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '');
+  if (liveRun && chatRun.el) {
+    list.appendChild(chatRun.el);
+  }
   scrollToBottom();
   bindInlineStop();
+}
+
+function toolArgsSummary(tool, args) {
+  if (!args || typeof args !== 'object') return '';
+  if (args.path) return String(args.path);
+  if (args.pattern) return String(args.pattern);
+  if (args.command) return String(args.command).slice(0, 80);
+  try {
+    return JSON.stringify(args).slice(0, 80);
+  } catch {
+    return '';
+  }
+}
+
+function createAssistantRunPlaceholder(sessionId) {
+  const session = activeSession();
+  const botName = peerName(session?.peer || 'codex');
+  const el = document.createElement('div');
+  el.className = 'msg msg-assistant msg-run';
+  el.dataset.runId = 'pending';
+  el.innerHTML =
+    '<div class="bubble has-run">' +
+      '<div class="msg-meta">' + escapeHtml(botName) + '</div>' +
+      '<div class="agent-timeline" data-role="timeline"></div>' +
+      '<div class="stream-body is-streaming" data-role="stream"></div>' +
+      '<div class="stream-status" data-role="status"></div>' +
+    '</div>';
+  chatRun = {
+    runId: null,
+    sessionId,
+    el,
+    timelineEl: el.querySelector('[data-role="timeline"]'),
+    streamEl: el.querySelector('[data-role="stream"]'),
+    statusEl: el.querySelector('[data-role="status"]'),
+    textBuffer: '',
+    contentFinal: null,
+    applied: null,
+    doneEvent: false,
+    invokeDone: false,
+    finalized: false,
+    error: false,
+    aborted: false,
+  };
+  return chatRun;
+}
+
+function appendTimelineRow(kind, tool, summary, ok) {
+  if (!chatRun?.timelineEl) return;
+  const row = document.createElement('div');
+  row.className = 'agent-step step-' + kind + (kind === 'end' && ok === false ? ' is-fail' : '') + (kind === 'start' ? ' step-running' : '');
+  const icon = kind === 'start' ? '▸' : (ok === false ? '✗' : '✓');
+  row.innerHTML =
+    '<span class="step-icon">' + icon + '</span>' +
+    '<span class="step-body"><span class="step-tool">' + escapeHtml(tool || 'tool') + '</span>' +
+    (summary ? '<span class="step-summary">' + escapeHtml(summary) + '</span>' : '') +
+    '</span>';
+  chatRun.timelineEl.appendChild(row);
+  scrollToBottom();
+}
+
+function updateStreamBody() {
+  if (!chatRun?.streamEl) return;
+  chatRun.streamEl.textContent = chatRun.textBuffer;
+  scrollToBottom();
+}
+
+function setRunStatus(text, kind) {
+  if (!chatRun?.statusEl) return;
+  chatRun.statusEl.textContent = text || '';
+  chatRun.statusEl.classList.remove('is-error', 'is-aborted');
+  if (kind === 'error') chatRun.statusEl.classList.add('is-error');
+  if (kind === 'aborted') chatRun.statusEl.classList.add('is-aborted');
+}
+
+function decisionLabel(decision) {
+  if (decision === 'allow') return '已允许';
+  if (decision === 'allow_session') return '本会话始终允许';
+  if (decision === 'deny') return '已拒绝';
+  return decision || '';
+}
+
+function renderApprovalCard(ev) {
+  if (!chatRun?.timelineEl) return;
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.dataset.approvalId = ev.approvalId || '';
+  const title = '需要确认：' + (ev.tool || '操作') + (ev.risk ? '（' + ev.risk + '）' : '');
+  const detail = ev.detail || '';
+  card.innerHTML =
+    '<div class="appr-title">' + escapeHtml(title) + '</div>' +
+    '<div class="appr-summary">' + escapeHtml(ev.summary || ev.path || '') + '</div>' +
+    (detail ? '<pre class="appr-detail">' + escapeHtml(detail) + '</pre>' : '') +
+    '<div class="appr-actions">' +
+      '<button type="button" class="appr-btn" data-decision="allow">允许</button>' +
+      '<button type="button" class="appr-btn appr-deny" data-decision="deny">拒绝</button>' +
+      '<button type="button" class="appr-btn appr-session" data-decision="allow_session">本会话始终允许此类</button>' +
+    '</div>' +
+    '<div class="appr-result"></div>';
+  card.querySelectorAll('.appr-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (card.classList.contains('resolved') || !chatRun || chatRun.finalized) return;
+      const decision = btn.dataset.decision;
+      card.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await window.codex.approveChat({ approvalId: ev.approvalId, decision });
+        if (!res?.ok) {
+          card.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = false; });
+          toast(res?.error || '审批失败');
+          return;
+        }
+        // approval-resolved event will mark UI; optimistic label
+        const resultEl = card.querySelector('.appr-result');
+        if (resultEl) resultEl.textContent = decisionLabel(decision);
+        card.classList.add('resolved');
+      } catch (e) {
+        card.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = false; });
+        toast(e?.message || String(e));
+      }
+    });
+  });
+  chatRun.timelineEl.appendChild(card);
+  scrollToBottom();
+}
+
+function markApprovalResolved(approvalId, decision) {
+  if (!chatRun?.el) return;
+  let target = null;
+  chatRun.el.querySelectorAll('.approval-card').forEach((c) => {
+    if (String(c.dataset.approvalId) === String(approvalId)) target = c;
+  });
+  if (!target) return;
+  target.classList.add('resolved');
+  target.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = true; });
+  const resultEl = target.querySelector('.appr-result');
+  if (resultEl) resultEl.textContent = decisionLabel(decision);
+}
+
+function finalizeChatRun(opts = {}) {
+  if (!chatRun || chatRun.finalized) return;
+  const session = sessions.find((s) => s.id === chatRun.sessionId) || activeSession();
+  if (!session) {
+    chatRun.finalized = true;
+    chatRun = null;
+    return;
+  }
+  let content = opts.content;
+  if (content == null || content === '') content = chatRun.contentFinal;
+  if (content == null || content === '') content = chatRun.textBuffer;
+  if (content == null) content = '';
+
+  const aborted = opts.aborted || chatRun.aborted;
+  const error = opts.error || chatRun.error;
+  if (aborted && !String(content).trim()) {
+    content = '⏹ 已停止生成。已完成的文件改动会保留，可继续发送新消息。';
+  } else if (error && !String(content).trim()) {
+    content = '请求失败：\n' + (opts.errorMessage || '未知错误');
+  }
+
+  if (chatRun.streamEl) {
+    chatRun.streamEl.classList.remove('is-streaming');
+    chatRun.streamEl.classList.add('is-final');
+    chatRun.streamEl.innerHTML = renderMarkdownLite(content);
+  }
+  disableApprovalCards(chatRun.el);
+
+  session.messages.push({
+    role: 'assistant',
+    content,
+    error: Boolean(error && !aborted),
+  });
+  session.updatedAt = Date.now();
+  chatRun.finalized = true;
+  const applied = opts.applied || chatRun.applied;
+  if (applied?.length) {
+    toast('已应用 ' + applied.filter((a) => a.ok).length + '/' + applied.length + ' 个文件变更');
+  }
+  chatRun = null;
+  saveState();
+  renderMessages();
+}
+
+function handleChatEvent(ev) {
+  if (!ev || !chatRun || chatRun.finalized) return;
+  // Route by active run once runId is known; accept first event to bind runId
+  if (chatRun.runId && ev.runId && chatRun.runId !== ev.runId) return;
+  if (chatRun.sessionId !== activeSessionId && chatRun.sessionId !== activeSession()?.id) {
+    // still process if run belongs to its session; allow background finalize
+  }
+
+  const type = ev.type;
+  if (type === 'run-start') {
+    if (ev.runId) {
+      chatRun.runId = ev.runId;
+      chatRun.el.dataset.runId = ev.runId;
+    }
+    setRunStatus('生成中…');
+    return;
+  }
+  if (type === 'text-delta') {
+    const piece = ev.text != null ? String(ev.text) : (ev.delta != null ? String(ev.delta) : '');
+    chatRun.textBuffer += piece;
+    updateStreamBody();
+    return;
+  }
+  if (type === 'tool-start') {
+    const sum = toolArgsSummary(ev.tool, ev.args);
+    appendTimelineRow('start', ev.tool, sum || '运行中…');
+    setRunStatus('工具：' + (ev.tool || ''));
+    return;
+  }
+  if (type === 'tool-end') {
+    appendTimelineRow('end', ev.tool, ev.summary || (ev.ok === false ? '失败' : '完成'), ev.ok !== false);
+    return;
+  }
+  if (type === 'approval-needed') {
+    renderApprovalCard(ev);
+    setRunStatus('等待确认…');
+    return;
+  }
+  if (type === 'approval-resolved') {
+    markApprovalResolved(ev.approvalId, ev.decision);
+    setRunStatus('生成中…');
+    return;
+  }
+  if (type === 'turn-end') {
+    return;
+  }
+  if (type === 'done') {
+    chatRun.doneEvent = true;
+    if (ev.content != null) chatRun.contentFinal = String(ev.content);
+    if (ev.applied) chatRun.applied = ev.applied;
+    if (chatRun.streamEl) {
+      chatRun.streamEl.classList.remove('is-streaming');
+      if (chatRun.contentFinal != null) {
+        chatRun.streamEl.classList.add('is-final');
+        chatRun.streamEl.innerHTML = renderMarkdownLite(chatRun.contentFinal);
+      }
+    }
+    setRunStatus('');
+    // Finalize when invoke also settled (or if invoke already done)
+    if (chatRun.invokeDone) {
+      finalizeChatRun({ content: chatRun.contentFinal, applied: chatRun.applied });
+      setSending(false);
+    }
+    return;
+  }
+  if (type === 'aborted') {
+    chatRun.aborted = true;
+    chatRun.doneEvent = true;
+    disableApprovalCards(chatRun.el);
+    setRunStatus('已停止', 'aborted');
+    if (chatRun.streamEl) chatRun.streamEl.classList.remove('is-streaming');
+    if (chatRun.invokeDone) {
+      finalizeChatRun({ aborted: true, content: chatRun.contentFinal || chatRun.textBuffer });
+      setSending(false);
+    }
+    return;
+  }
+  if (type === 'error') {
+    chatRun.error = true;
+    chatRun.doneEvent = true;
+    const msg = ev.message || '未知错误';
+    disableApprovalCards(chatRun.el);
+    setRunStatus(msg, 'error');
+    if (chatRun.streamEl) chatRun.streamEl.classList.remove('is-streaming');
+    if (!chatRun.textBuffer && !chatRun.contentFinal) {
+      chatRun.contentFinal = '请求失败：\n' + msg;
+      if (chatRun.streamEl) {
+        chatRun.streamEl.classList.add('is-final');
+        chatRun.streamEl.innerHTML = renderMarkdownLite(chatRun.contentFinal);
+      }
+    }
+    if (chatRun.invokeDone) {
+      finalizeChatRun({ error: true, errorMessage: msg, content: chatRun.contentFinal || chatRun.textBuffer });
+      setSending(false);
+    }
+    return;
+  }
 }
 function scrollToBottom() { const list = document.getElementById('message-list'); if (list) list.scrollTop = list.scrollHeight; }
 function matchQuery(text) { if (!searchQuery) return true; return String(text).toLowerCase().includes(searchQuery.toLowerCase()); }
@@ -497,6 +794,8 @@ async function openSettings() {
   document.getElementById('set-model').value = settings.model || '';
   document.getElementById('set-api-key').value = '';
   document.getElementById('set-api-hint').textContent = settings.apiKeySet ? '已配置 API Key（留空保存则保留原 Key）' : '尚未配置 API Key';
+  const pm = document.getElementById('set-permission-mode');
+  if (pm) pm.value = settings.permissionMode || 'confirm-writes';
   const ae = document.getElementById('set-agent-enabled');
   if (ae) ae.checked = settings.agentEnabled !== false;
   const at = document.getElementById('set-agent-turns');
@@ -513,6 +812,7 @@ async function saveSettingsFromForm() {
     mode: document.getElementById('set-mode').value,
     baseUrl: document.getElementById('set-base-url').value.trim(),
     model: document.getElementById('set-model').value.trim(),
+    permissionMode: document.getElementById('set-permission-mode')?.value || 'confirm-writes',
     agentEnabled: document.getElementById('set-agent-enabled')?.checked !== false,
     maxAgentTurns: Number(document.getElementById('set-agent-turns')?.value || 8),
     terminalEnabled: Boolean(document.getElementById('set-terminal-enabled')?.checked),
@@ -523,7 +823,7 @@ async function saveSettingsFromForm() {
 }
 async function sendMessage() {
   if (sending) return;
-  const input = document.getElementById('chat-input'); const btn = document.getElementById('btn-send');
+  const input = document.getElementById('chat-input');
   const raw = input.value || ''; const text = buildOutgoingText(raw); if (!text.trim()) return;
   if (handleSlashCommand(raw.trim())) { input.value = ''; pendingAttaches = []; renderAttachPreview(); return; }
   const session = activeSession(); const proj = sessionProject(session);
@@ -534,8 +834,9 @@ async function sendMessage() {
   }
   session.messages.push({ role: 'user', content: text }); session.updatedAt = Date.now();
   sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
-  input.value = ''; pendingAttaches = []; renderAttachPreview(); setSending(true); saveState(); renderMessages(); renderLeftDynamic();
+  input.value = ''; pendingAttaches = []; renderAttachPreview(); setSending(true); saveState();
   if (session.peer && session.peer !== 'codex') {
+    renderMessages(); renderLeftDynamic();
     const token = { aborted: false };
     localSendToken = token;
     setTimeout(() => {
@@ -548,24 +849,76 @@ async function sendMessage() {
       session.updatedAt = Date.now(); setSending(false); saveState(); renderMessages(); input.focus();
     }, 450); return;
   }
+
+  // Live assistant placeholder driven by onChatEvent
+  createAssistantRunPlaceholder(session.id);
+  renderMessages();
+  renderLeftDynamic();
+
+  let invokeResult = null;
+  let invokeError = null;
   try {
-    const payload = { messages: session.messages.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })), project: proj?.path ? { name: proj.name, path: proj.path } : null };
-    const res = await window.codex.sendChat(payload);
-    session.messages.push({ role: 'assistant', content: res.content || '' });
-    if (res.applied?.length) toast('已应用 ' + res.applied.filter((a) => a.ok).length + '/' + res.applied.length + ' 个文件变更');
+    const payload = {
+      messages: session.messages.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })),
+      project: proj?.path ? { name: proj.name, path: proj.path } : null,
+      sessionId: session.id,
+    };
+    invokeResult = await window.codex.sendChat(payload);
   } catch (err) {
-    let msg = err?.message || String(err);
-    msg = msg.replace(/^Error invoking remote method '[^']+':\s*/i, '').replace(/^Error:\s*/i, '');
-    const stopped = err?.code === 'ABORTED' || /已停止|ABORTED|The user aborted a request|AbortError/i.test(msg);
-    session.messages.push({
-      role: 'assistant',
-      content: stopped ? '⏹ 已停止生成。已完成的文件改动会保留，可继续发送新消息。' : ('请求失败：\n' + msg),
-      error: !stopped,
-    });
+    invokeError = err;
   } finally {
-    if (!(session.peer && session.peer !== 'codex')) localSendToken = null;
-    session.updatedAt = Date.now(); setSending(false); saveState(); renderMessages(); input.focus();
+    localSendToken = null;
   }
+
+  // Merge carefully: prefer done-event content, then invoke result
+  if (chatRun && !chatRun.finalized) {
+    chatRun.invokeDone = true;
+    if (invokeResult) {
+      if (chatRun.contentFinal == null && invokeResult.content != null) {
+        chatRun.contentFinal = String(invokeResult.content);
+      }
+      if (!chatRun.applied && invokeResult.applied) chatRun.applied = invokeResult.applied;
+      // Prefer event content already set; ensure final content exists
+      const content = chatRun.contentFinal != null ? chatRun.contentFinal : (invokeResult.content || chatRun.textBuffer || '');
+      finalizeChatRun({ content, applied: chatRun.applied || invokeResult.applied });
+    } else if (invokeError) {
+      let msg = invokeError?.message || String(invokeError);
+      msg = msg.replace(/^Error invoking remote method '[^']+':\s*/i, '').replace(/^Error:\s*/i, '');
+      const stopped = invokeError?.code === 'ABORTED'
+        || chatRun.aborted
+        || /已停止|ABORTED|The user aborted a request|AbortError/i.test(msg);
+      if (stopped) {
+        chatRun.aborted = true;
+        finalizeChatRun({
+          aborted: true,
+          content: chatRun.contentFinal || chatRun.textBuffer || '',
+        });
+      } else {
+        // Prefer event-filled content; avoid double toast/bubble noise
+        if (chatRun.doneEvent && (chatRun.contentFinal || chatRun.textBuffer)) {
+          finalizeChatRun({
+            error: chatRun.error,
+            errorMessage: msg,
+            content: chatRun.contentFinal || chatRun.textBuffer,
+          });
+        } else {
+          chatRun.error = true;
+          finalizeChatRun({ error: true, errorMessage: msg, content: chatRun.contentFinal || chatRun.textBuffer || '' });
+        }
+      }
+    } else if (chatRun.doneEvent) {
+      finalizeChatRun({ content: chatRun.contentFinal || chatRun.textBuffer || '', applied: chatRun.applied });
+    } else {
+      // Invoke returned nothing and no events — still clear UI
+      finalizeChatRun({ content: chatRun.textBuffer || '', applied: chatRun.applied });
+    }
+  }
+
+  session.updatedAt = Date.now();
+  setSending(false);
+  saveState();
+  renderMessages();
+  input.focus();
 }
 function bindEvents() {
   document.getElementById('btn-send').addEventListener('click', sendMessage);
@@ -603,6 +956,18 @@ function bindEvents() {
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideContextMenu(); });
 }
 function boot() {
-  loadState(); renderEmojiPanel(); bindEvents(); setView('chat'); updateStatusBar(); updateClock(); setInterval(updateClock, 30000);
+  loadState();
+  renderEmojiPanel();
+  bindEvents();
+  // One global chat:event listener; routes by active chatRun / runId
+  if (window.codex?.onChatEvent) {
+    window.codex.onChatEvent((ev) => {
+      try { handleChatEvent(ev); } catch (e) { console.error('chat event handler', e); }
+    });
+  }
+  setView('chat');
+  updateStatusBar();
+  updateClock();
+  setInterval(updateClock, 30000);
 }
 boot();

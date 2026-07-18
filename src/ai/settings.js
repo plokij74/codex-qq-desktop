@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS = {
   // Agent
   agentEnabled: true,
   maxAgentTurns: 8, // 0 = unlimited
+  permissionMode: 'confirm-writes', // read-only | confirm-writes | full-auto
   // Terminal (optional, off by default)
   terminalEnabled: false,
   terminalRequireConfirm: true,

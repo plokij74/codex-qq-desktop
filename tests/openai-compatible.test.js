@@ -1,11 +1,44 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { buildChatPayload, chatCompletion, normalizeBaseUrl } = require('../src/ai/openai-compatible');
+const {
+  buildChatPayload,
+  chatCompletion,
+  chatCompletionMessage,
+  normalizeBaseUrl,
+} = require('../src/ai/openai-compatible');
+
+function mockSseFetch(chunks, { captureBody } = {}) {
+  let i = 0;
+  const encoder = new TextEncoder();
+  return async (_url, opts) => {
+    if (captureBody) captureBody(opts?.body);
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (i >= chunks.length) return { done: true, value: undefined };
+              const value = encoder.encode(chunks[i++]);
+              return { done: false, value };
+            },
+          };
+        },
+      },
+    };
+  };
+}
 
 describe('openai-compatible', () => {
   it('buildChatPayload shapes request body', () => {
     const body = buildChatPayload('gpt-4o-mini', [{ role: 'user', content: 'hi' }]);
     assert.equal(body.model, 'gpt-4o-mini');
+  });
+
+  it('buildChatPayload sets stream when requested', () => {
+    const body = buildChatPayload('m', [{ role: 'user', content: 'hi' }], { stream: true });
+    assert.equal(body.stream, true);
   });
 
   it('normalizeBaseUrl strips chat/completions suffix', () => {
@@ -63,6 +96,111 @@ describe('openai-compatible', () => {
         fetchFn,
       }),
       /HTML|Base URL|JSON/
+    );
+  });
+
+  it('chatCompletionMessage stream concatenates deltas', async () => {
+    const chunks = [
+      'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    let posted;
+    const fetchFn = mockSseFetch(chunks, {
+      captureBody: (b) => { posted = JSON.parse(b); },
+    });
+    const deltas = [];
+    const msg = await chatCompletionMessage({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      onDelta: (d) => { if (d.text) deltas.push(d.text); },
+      fetchFn,
+    });
+    assert.equal(msg.content, 'Hello');
+    assert.equal(msg.role, 'assistant');
+    assert.deepEqual(deltas, ['Hel', 'lo']);
+    assert.equal(posted.stream, true);
+  });
+
+  it('chatCompletionMessage stream accumulates tool_calls deltas', async () => {
+    const chunks = [
+      'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_dir","arguments":""}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\""}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\".\\"}"}}]}}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    const fetchFn = mockSseFetch(chunks);
+    const deltas = [];
+    const msg = await chatCompletionMessage({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'm',
+      messages: [{ role: 'user', content: 'list' }],
+      stream: true,
+      onDelta: (d) => { if (d.text) deltas.push(d.text); },
+      fetchFn,
+    });
+    assert.equal(msg.content, '');
+    assert.deepEqual(deltas, []);
+    assert.ok(Array.isArray(msg.tool_calls));
+    assert.equal(msg.tool_calls.length, 1);
+    assert.equal(msg.tool_calls[0].id, 'call_1');
+    assert.equal(msg.tool_calls[0].type, 'function');
+    assert.equal(msg.tool_calls[0].function.name, 'list_dir');
+    assert.equal(msg.tool_calls[0].function.arguments, '{"path":"."}');
+  });
+
+  it('chatCompletionMessage stream abort throws ABORTED', async () => {
+    const ac = new AbortController();
+    const encoder = new TextEncoder();
+    let released = false;
+    const fetchFn = async (_url, opts) => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (opts.signal?.aborted) {
+                const err = new Error('The user aborted a request.');
+                err.name = 'AbortError';
+                throw err;
+              }
+              if (!released) {
+                released = true;
+                ac.abort();
+                return {
+                  done: false,
+                  value: encoder.encode('data: {"choices":[{"delta":{"content":"x"}}]}\n\n'),
+                };
+              }
+              // second read after abort
+              const err = new Error('The user aborted a request.');
+              err.name = 'AbortError';
+              throw err;
+            },
+          };
+        },
+      },
+    });
+    await assert.rejects(
+      () => chatCompletionMessage({
+        baseUrl: 'https://example.com/v1',
+        apiKey: 'k',
+        model: 'm',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+        signal: ac.signal,
+        fetchFn,
+      }),
+      (err) => {
+        assert.equal(err.code, 'ABORTED');
+        assert.match(err.message, /已停止/);
+        return true;
+      }
     );
   });
 });

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { isIgnored } = require('./gitignore');
 
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '.nuxt', 'coverage',
@@ -20,13 +21,14 @@ function resolveSafe(projectRoot, relPath = '.') {
 /**
  * Full directory walk on host (not model hallucination).
  * @param {string} projectRoot
- * @param {{maxDepth?:number,maxEntries?:number,includeSkippedMarkers?:boolean,showDot?:boolean}} opts
+ * @param {{maxDepth?:number,maxEntries?:number,includeSkippedMarkers?:boolean,showDot?:boolean,ignoreRules?:object[]}} opts
  */
 function listTree(projectRoot, opts = {}) {
   const maxDepth = opts.maxDepth ?? 10;
   const maxEntries = opts.maxEntries ?? 8000;
   const includeSkippedMarkers = opts.includeSkippedMarkers !== false;
   const showDot = opts.showDot === true;
+  const ignoreRules = opts.ignoreRules || null;
 
   const root = path.resolve(projectRoot);
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
@@ -37,6 +39,10 @@ function listTree(projectRoot, opts = {}) {
   let count = 0;
   let truncated = false;
   let skippedHeavy = 0;
+
+  function relFromRoot(full) {
+    return path.relative(root, full).replace(/\\/g, '/');
+  }
 
   function walk(dir, depth) {
     if (truncated) return;
@@ -72,6 +78,11 @@ function listTree(projectRoot, opts = {}) {
 
       const indent = '  '.repeat(depth);
       const full = path.join(dir, name);
+      const rel = relFromRoot(full);
+
+      if (ignoreRules && isIgnored(rel, ignoreRules)) {
+        continue;
+      }
 
       if (ent.isDirectory()) {
         if (SKIP_DIRS.has(name)) {
@@ -158,17 +169,173 @@ function buildTreeReply(project, userText) {
   };
 }
 
-function readFile(projectRoot, relPath, { maxBytes = 200_000 } = {}) {
+/**
+ * Read a file; full reads enforce maxBytes.
+ * When offset/limit is provided, allow a line slice even if total size > maxBytes
+ * by streaming lines (sync) instead of loading the whole file into memory for the result.
+ * Extremely large files still have a hard safety cap (maxBytes * 50) for the stream path.
+ */
+function readFile(projectRoot, relPath, { maxBytes = 200_000, offset, limit } = {}) {
   const full = resolveSafe(projectRoot, relPath);
   if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
     throw new Error(`文件不存在: ${relPath}`);
   }
   const stat = fs.statSync(full);
-  if (stat.size > maxBytes) {
+  const useSlice = offset != null || limit != null;
+  const pathNorm = relPath.replace(/\\/g, '/');
+
+  if (!useSlice) {
+    if (stat.size > maxBytes) {
+      throw new Error(`文件过大 (${stat.size} bytes)，拒绝读取: ${relPath}`);
+    }
+    const raw = fs.readFileSync(full, 'utf8');
+    return { path: pathNorm, content: raw, size: stat.size };
+  }
+
+  const startLine = Math.max(1, Number(offset) || 1);
+  const maxLines = limit != null ? Math.max(0, Number(limit)) : null;
+
+  // Small enough: keep prior full-read + split behavior
+  if (stat.size <= maxBytes) {
+    const raw = fs.readFileSync(full, 'utf8');
+    const lines = raw.split(/\r?\n/);
+    if (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
+    return formatSlicedLines(pathNorm, lines, startLine, maxLines, stat.size);
+  }
+
+  // Large file with slice: stream lines; hard cap to avoid unbounded work
+  const sliceHardCap = maxBytes * 50;
+  if (stat.size > sliceHardCap) {
     throw new Error(`文件过大 (${stat.size} bytes)，拒绝读取: ${relPath}`);
   }
-  const content = fs.readFileSync(full, 'utf8');
-  return { path: relPath.replace(/\\/g, '/'), content, size: stat.size };
+
+  const { lines, totalLines } = streamCollectLines(full, startLine, maxLines);
+  const endLine =
+    lines.length === 0
+      ? startLine - 1
+      : lines[lines.length - 1].n;
+  const width = String(Math.max(totalLines, 1)).length;
+  const numbered = lines.map(({ n, text }) => `${String(n).padStart(width, ' ')}|${text}`);
+  return {
+    path: pathNorm,
+    content: numbered.join('\n'),
+    size: stat.size,
+    totalLines,
+    startLine,
+    endLine,
+  };
+}
+
+function formatSlicedLines(pathNorm, lines, startLine, maxLines, size) {
+  const totalLines = lines.length;
+  const take = maxLines != null ? maxLines : totalLines;
+  const endLine = Math.min(totalLines, startLine + take - 1);
+  const width = String(Math.max(totalLines, 1)).length;
+  const numbered = [];
+  for (let i = startLine; i <= endLine; i += 1) {
+    const num = String(i).padStart(width, ' ');
+    numbered.push(`${num}|${lines[i - 1]}`);
+  }
+  return {
+    path: pathNorm,
+    content: numbered.join('\n'),
+    size,
+    totalLines,
+    startLine,
+    endLine: endLine < startLine ? startLine - 1 : endLine,
+  };
+}
+
+/**
+ * Sync stream: collect requested line window and total line count.
+ * Mirrors split(/\r?\n/) + pop trailing empty from final newline.
+ */
+function streamCollectLines(fullPath, startLine, maxLines) {
+  const fd = fs.openSync(fullPath, 'r');
+  const bufSize = 64 * 1024;
+  const buffer = Buffer.alloc(bufSize);
+  let leftover = '';
+  let totalLines = 0;
+  /** @type {{ n: number, text: string }[]} */
+  const selected = [];
+  let pos = 0;
+  let endedWithNewline = false;
+
+  const pushLine = (text) => {
+    totalLines += 1;
+    if (
+      totalLines >= startLine &&
+      (maxLines == null || selected.length < maxLines)
+    ) {
+      selected.push({ n: totalLines, text });
+    }
+  };
+
+  try {
+    let bytesRead;
+    while ((bytesRead = fs.readSync(fd, buffer, 0, bufSize, pos)) > 0) {
+      pos += bytesRead;
+      leftover += buffer.subarray(0, bytesRead).toString('utf8');
+      let idx;
+      while ((idx = leftover.indexOf('\n')) !== -1) {
+        let line = leftover.slice(0, idx);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        leftover = leftover.slice(idx + 1);
+        endedWithNewline = true;
+        pushLine(line);
+      }
+      if (leftover.length > 0) endedWithNewline = false;
+    }
+    // Trailing content without newline is a real last line
+    if (leftover.length > 0) {
+      pushLine(leftover.replace(/\r$/, ''));
+    } else if (pos === 0) {
+      // empty file
+      totalLines = 0;
+    }
+    // If file ended with newline, do not count a phantom empty last line (matches split+pop)
+    void endedWithNewline;
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  return { lines: selected, totalLines };
+}
+
+function searchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
+  const oldS = String(oldString ?? '');
+  const newS = String(newString ?? '');
+  if (!oldS) throw new Error('old_string 为空');
+  const full = resolveSafe(projectRoot, relPath);
+  if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
+    throw new Error(`文件不存在，请用 write_file 创建: ${relPath}`);
+  }
+  const text = fs.readFileSync(full, 'utf8');
+  let count = 0;
+  let idx = 0;
+  while ((idx = text.indexOf(oldS, idx)) !== -1) {
+    count += 1;
+    idx += oldS.length;
+  }
+  if (count === 0) throw new Error(`未找到 old_string 匹配: ${relPath}`);
+  if (!opts.replaceAll && count > 1) {
+    throw new Error(`old_string 出现 ${count} 次，默认要求唯一匹配；可设 replace_all=true`);
+  }
+  let next;
+  if (opts.replaceAll) {
+    next = text.split(oldS).join(newS);
+  } else {
+    const i = text.indexOf(oldS);
+    next = text.slice(0, i) + newS + text.slice(i + oldS.length);
+  }
+  fs.writeFileSync(full, next, 'utf8');
+  return {
+    path: relPath.replace(/\\/g, '/'),
+    replacements: opts.replaceAll ? count : 1,
+    bytes: Buffer.byteLength(next, 'utf8'),
+  };
 }
 
 function writeFile(projectRoot, relPath, content) {
@@ -258,6 +425,7 @@ module.exports = {
   resolveSafe,
   listTree,
   readFile,
+  searchReplace,
   writeFile,
   deletePath,
   parseWriteFences,

@@ -1,0 +1,261 @@
+const { describe, it, beforeEach } = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  createPermissionGate,
+  riskForTool,
+  clearSessionAllows,
+  getSessionAllows,
+} = require('../src/ai/permission');
+
+describe('permission', () => {
+  beforeEach(() => {
+    // Module-level session memory survives gate instances; isolate tests.
+    clearSessionAllows();
+  });
+
+  it('riskForTool maps tools', () => {
+    assert.equal(riskForTool('grep'), 'read');
+    assert.equal(riskForTool('search_replace'), 'write');
+    assert.equal(riskForTool('delete_path'), 'delete');
+    assert.equal(riskForTool('run_terminal'), 'terminal');
+  });
+
+  it('read-only denies write', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'read-only',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async () => { throw new Error('should not approve'); },
+    });
+    const r = await gate.authorize({
+      tool: 'write_file', risk: 'write', summary: 'w', sessionKey: 's1',
+    });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /只读|read-only|不允许/i);
+  });
+
+  it('confirm-writes auto-allows read', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: false,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async () => { throw new Error('no'); },
+    });
+    const r = await gate.authorize({ tool: 'grep', risk: 'read', summary: 'g', sessionKey: 's1' });
+    assert.equal(r.allowed, true);
+  });
+
+  it('confirm-writes waits for allow', async () => {
+    let pendingId;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => { pendingId = p.approvalId; },
+    });
+    const p = gate.authorize({
+      tool: 'search_replace', risk: 'write', summary: 'edit', path: 'a.js', sessionKey: 's1',
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(pendingId);
+    gate.resolveApproval(pendingId, 'allow');
+    const r = await p;
+    assert.equal(r.allowed, true);
+  });
+
+  it('allow_session skips later same risk', async () => {
+    const ids = [];
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => { ids.push(p.approvalId); },
+    });
+    const p1 = gate.authorize({ tool: 'write_file', risk: 'write', summary: '1', sessionKey: 's1' });
+    await new Promise((r) => setImmediate(r));
+    gate.resolveApproval(ids[0], 'allow_session');
+    assert.equal((await p1).allowed, true);
+    const r2 = await gate.authorize({ tool: 'write_file', risk: 'write', summary: '2', sessionKey: 's1' });
+    assert.equal(r2.allowed, true);
+    assert.equal(ids.length, 1);
+  });
+
+  it('abort during approval throws ABORTED', async () => {
+    const ac = new AbortController();
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async () => {},
+    });
+    const p = gate.authorize({
+      tool: 'write_file', risk: 'write', summary: 'x', sessionKey: 's1', signal: ac.signal,
+    });
+    await new Promise((r) => setImmediate(r));
+    ac.abort();
+    await assert.rejects(p, (err) => err.code === 'ABORTED' && err.message === '已停止');
+  });
+
+  it('full-auto allows write without onApprovalNeeded', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      terminalEnabled: true,
+      terminalRequireConfirm: false,
+      onApprovalNeeded: async () => { throw new Error('should not approve'); },
+    });
+    const r = await gate.authorize({
+      tool: 'write_file', risk: 'write', summary: 'w', sessionKey: 's1',
+    });
+    assert.equal(r.allowed, true);
+  });
+
+  it('confirm-writes terminalEnabled false denies run_terminal without approval', async () => {
+    let called = false;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: false,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async () => { called = true; },
+    });
+    const r = await gate.authorize({
+      tool: 'run_terminal', risk: 'terminal', summary: 'ls', sessionKey: 's1',
+    });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /终端|未启用|不允许/i);
+    assert.equal(called, false);
+  });
+
+  it('resolveApproval deny returns allowed false with Chinese reason', async () => {
+    let pendingId;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => { pendingId = p.approvalId; },
+    });
+    const p = gate.authorize({
+      tool: 'write_file', risk: 'write', summary: 'w', sessionKey: 's1',
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(pendingId);
+    gate.resolveApproval(pendingId, 'deny');
+    const r = await p;
+    assert.equal(r.allowed, false);
+    assert.equal(r.reason, '用户拒绝');
+  });
+
+  it('full-auto with terminalRequireConfirm still needs approval for terminal', async () => {
+    let pendingId;
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => { pendingId = p.approvalId; },
+    });
+    const p = gate.authorize({
+      tool: 'run_terminal', risk: 'terminal', summary: 'ls', sessionKey: 's1',
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(pendingId, 'should request approval for terminal');
+    gate.resolveApproval(pendingId, 'allow');
+    const r = await p;
+    assert.equal(r.allowed, true);
+  });
+
+  it('resolveApproval returns true when pending, false when missing', async () => {
+    let pendingId;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => { pendingId = p.approvalId; },
+    });
+    const p = gate.authorize({
+      tool: 'write_file', risk: 'write', summary: 'w', sessionKey: 's1',
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(pendingId);
+    assert.equal(gate.resolveApproval('missing-id', 'allow'), false);
+    assert.equal(gate.resolveApproval(pendingId, 'allow'), true);
+    assert.equal(gate.resolveApproval(pendingId, 'allow'), false);
+    assert.equal((await p).allowed, true);
+  });
+
+  it('onApprovalNeeded throw cleans pending and rethrows', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async () => { throw new Error('ui failed'); },
+    });
+    await assert.rejects(
+      gate.authorize({ tool: 'write_file', risk: 'write', summary: 'w', sessionKey: 's1' }),
+      (err) => err.message === 'ui failed',
+    );
+    // Second authorize should still work (no stuck pending / no leak side effects)
+    let pendingId;
+    const gate2 = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      onApprovalNeeded: async (p) => { pendingId = p.approvalId; },
+    });
+    const p = gate2.authorize({ tool: 'write_file', risk: 'write', summary: 'w2', sessionKey: 's1' });
+    await new Promise((r) => setImmediate(r));
+    gate2.resolveApproval(pendingId, 'allow');
+    assert.equal((await p).allowed, true);
+  });
+
+  it('allow_session is shared across gate instances with same sessionKey', async () => {
+    let called = 0;
+    const gate1 = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => {
+        called += 1;
+        gate1.resolveApproval(p.approvalId, 'allow_session');
+      },
+    });
+    const r1 = await gate1.authorize({
+      tool: 'write_file', risk: 'write', summary: '1', sessionKey: 'shared-sess',
+    });
+    assert.equal(r1.allowed, true);
+    assert.equal(called, 1);
+    assert.ok(getSessionAllows('shared-sess').has('write'));
+
+    let called2 = 0;
+    const gate2 = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async () => { called2 += 1; },
+    });
+    const r2 = await gate2.authorize({
+      tool: 'search_replace', risk: 'write', summary: '2', sessionKey: 'shared-sess',
+    });
+    assert.equal(r2.allowed, true);
+    assert.equal(called2, 0, 'second gate must not prompt when session already allows write');
+
+    // Different session still prompts
+    let called3 = 0;
+    let pendingId;
+    const gate3 = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      onApprovalNeeded: async (p) => {
+        called3 += 1;
+        pendingId = p.approvalId;
+      },
+    });
+    const p3 = gate3.authorize({
+      tool: 'write_file', risk: 'write', summary: '3', sessionKey: 'other-sess',
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(called3, 1);
+    gate3.resolveApproval(pendingId, 'allow');
+    assert.equal((await p3).allowed, true);
+
+    clearSessionAllows('shared-sess');
+    assert.equal(getSessionAllows('shared-sess').size, 0);
+  });
+});

@@ -26,4 +26,16 @@ describe('settings', () => {
     assert.equal(s.model, 'gpt-test');
     assert.equal(s.baseUrl, DEFAULT_SETTINGS.baseUrl);
   });
+
+  it('defaults permissionMode to confirm-writes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const s = loadSettings(dir);
+    assert.equal(s.permissionMode, 'confirm-writes');
+  });
+
+  it('saveSettings persists permissionMode', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    saveSettings(dir, { permissionMode: 'read-only' });
+    assert.equal(loadSettings(dir).permissionMode, 'read-only');
+  });
 });

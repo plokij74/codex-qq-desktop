@@ -6,6 +6,7 @@ function buildChatPayload(model, messages, extra = {}) {
   };
   if (extra.tools) body.tools = extra.tools;
   if (extra.tool_choice) body.tool_choice = extra.tool_choice;
+  if (extra.stream) body.stream = true;
   return body;
 }
 
@@ -49,14 +50,97 @@ function formatHttpError(status, url, text, json) {
   return `API ${status}${snippet ? `: ${snippet}` : ''}`;
 }
 
-async function chatRequest({ baseUrl, apiKey, model, messages, tools, tool_choice, fetchFn, temperature, signal }) {
+function abortedError() {
+  const e = new Error('已停止');
+  e.code = 'ABORTED';
+  return e;
+}
+
+function isAbortError(err, signal) {
+  return err?.code === 'ABORTED' || err?.name === 'AbortError' || !!signal?.aborted;
+}
+
+async function* iterateSse(fetchRes) {
+  const reader = fetchRes?.body?.getReader?.();
+  if (!reader) {
+    throw new Error('SSE stream: response body has no getReader');
+  }
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  while (true) {
+    let result;
+    try {
+      result = await reader.read();
+    } catch (err) {
+      if (isAbortError(err)) throw abortedError();
+      throw err;
+    }
+    if (result.done) break;
+    buffer += decoder.decode(result.value, { stream: true });
+    // Normalize CRLF; process complete lines
+    buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      if (payload === '[DONE]') return;
+      let json;
+      try {
+        json = JSON.parse(payload);
+      } catch {
+        throw new Error(`SSE parse error: ${payload.slice(0, 120)}`);
+      }
+      yield json;
+    }
+  }
+}
+
+function accumulateToolCall(map, tc) {
+  const idx = typeof tc.index === 'number' ? tc.index : 0;
+  let acc = map.get(idx);
+  if (!acc) {
+    acc = {
+      id: '',
+      type: 'function',
+      function: { name: '', arguments: '' },
+    };
+    map.set(idx, acc);
+  }
+  if (tc.id) acc.id = tc.id;
+  if (tc.type) acc.type = tc.type;
+  if (tc.function?.name) acc.function.name += tc.function.name;
+  if (typeof tc.function?.arguments === 'string') {
+    acc.function.arguments += tc.function.arguments;
+  }
+}
+
+async function postChatCompletions({
+  baseUrl,
+  apiKey,
+  model,
+  messages,
+  tools,
+  tool_choice,
+  fetchFn,
+  temperature,
+  signal,
+  stream,
+}) {
   const fetchImpl = fetchFn || globalThis.fetch;
   if (!fetchImpl) throw new Error('当前环境没有 fetch，无法调用 API');
   if (!model) throw new Error('Model 为空，请在设置中填写模型名');
 
   const root = normalizeBaseUrl(baseUrl);
   const url = `${root}/chat/completions`;
-  const body = buildChatPayload(model, messages, { tools, tool_choice, temperature });
+  const body = buildChatPayload(model, messages, {
+    tools,
+    tool_choice,
+    temperature,
+    stream: !!stream,
+  });
 
   let res;
   try {
@@ -70,13 +154,35 @@ async function chatRequest({ baseUrl, apiKey, model, messages, tools, tool_choic
       signal,
     });
   } catch (err) {
-    if (err?.name === 'AbortError' || signal?.aborted) {
-      const e = new Error('已停止');
-      e.code = 'ABORTED';
-      throw e;
-    }
+    if (isAbortError(err, signal)) throw abortedError();
     throw new Error(`网络请求失败（${url}）: ${err?.message || err}`);
   }
+  return { res, url };
+}
+
+async function chatRequest({
+  baseUrl,
+  apiKey,
+  model,
+  messages,
+  tools,
+  tool_choice,
+  fetchFn,
+  temperature,
+  signal,
+}) {
+  const { res, url } = await postChatCompletions({
+    baseUrl,
+    apiKey,
+    model,
+    messages,
+    tools,
+    tool_choice,
+    fetchFn,
+    temperature,
+    signal,
+    stream: false,
+  });
 
   const { text, json } = await readResponseBody(res);
   if (!res.ok) throw new Error(formatHttpError(res.status, url, text, json));
@@ -84,8 +190,84 @@ async function chatRequest({ baseUrl, apiKey, model, messages, tools, tool_choic
   return json;
 }
 
+async function streamChatCompletionMessage(opts) {
+  const {
+    baseUrl,
+    apiKey,
+    model,
+    messages,
+    tools,
+    tool_choice,
+    fetchFn,
+    temperature,
+    signal,
+    onDelta,
+  } = opts;
+
+  const { res, url } = await postChatCompletions({
+    baseUrl,
+    apiKey,
+    model,
+    messages,
+    tools,
+    tool_choice,
+    fetchFn,
+    temperature,
+    signal,
+    stream: true,
+  });
+
+  if (!res.ok) {
+    let text = '';
+    let json = null;
+    if (typeof res.text === 'function') {
+      ({ text, json } = await readResponseBody(res));
+    }
+    throw new Error(formatHttpError(res.status, url, text, json));
+  }
+
+  let content = '';
+  const toolMap = new Map();
+
+  try {
+    for await (const event of iterateSse(res)) {
+      if (signal?.aborted) throw abortedError();
+      const delta = event?.choices?.[0]?.delta;
+      if (!delta) continue;
+      if (typeof delta.content === 'string' && delta.content) {
+        content += delta.content;
+        if (typeof onDelta === 'function') onDelta({ text: delta.content });
+      }
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) accumulateToolCall(toolMap, tc);
+      }
+    }
+  } catch (err) {
+    if (isAbortError(err, signal)) throw abortedError();
+    throw err;
+  }
+
+  if (signal?.aborted) throw abortedError();
+
+  const tool_calls = toolMap.size
+    ? [...toolMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, v]) => v)
+    : undefined;
+
+  return {
+    role: 'assistant',
+    content,
+    tool_calls: tool_calls?.length ? tool_calls : undefined,
+  };
+}
+
 /** Returns assistant message object: { role, content, tool_calls? } */
 async function chatCompletionMessage(opts) {
+  if (opts?.stream) {
+    return streamChatCompletionMessage(opts);
+  }
+
   const json = await chatRequest(opts);
   const msg = json?.choices?.[0]?.message;
   if (!msg) {
