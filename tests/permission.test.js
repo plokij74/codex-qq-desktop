@@ -6,6 +6,7 @@ const {
   clearSessionAllows,
   getSessionAllows,
 } = require('../src/ai/permission');
+const { AGENT_EVENTS } = require('../src/ai/agent-events');
 
 describe('permission', () => {
   beforeEach(() => {
@@ -18,6 +19,19 @@ describe('permission', () => {
     assert.equal(riskForTool('search_replace'), 'write');
     assert.equal(riskForTool('delete_path'), 'delete');
     assert.equal(riskForTool('run_terminal'), 'terminal');
+  });
+
+  it('riskForTool classifies git tools', () => {
+    assert.equal(riskForTool('git_status'), 'read');
+    assert.equal(riskForTool('git_diff'), 'read');
+    assert.equal(riskForTool('git_commit'), 'write');
+  });
+
+  it('AGENT_EVENTS includes Phase B event names', () => {
+    assert.equal(AGENT_EVENTS.FILE_CHANGE, 'file-change');
+    assert.equal(AGENT_EVENTS.TERMINAL_START, 'terminal-start');
+    assert.equal(AGENT_EVENTS.TERMINAL_OUTPUT, 'terminal-output');
+    assert.equal(AGENT_EVENTS.TERMINAL_END, 'terminal-end');
   });
 
   it('read-only denies write', async () => {
@@ -61,6 +75,32 @@ describe('permission', () => {
     gate.resolveApproval(pendingId, 'allow');
     const r = await p;
     assert.equal(r.allowed, true);
+  });
+
+  it('onApprovalNeeded receives diff when provided', async () => {
+    let payload;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (p) => { payload = p; },
+    });
+    const diff = { path: 'a.js', before: 'old', after: 'new' };
+    const p = gate.authorize({
+      tool: 'search_replace',
+      risk: 'write',
+      summary: 'edit',
+      path: 'a.js',
+      sessionKey: 's1',
+      diff,
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.ok(payload);
+    assert.deepEqual(payload.diff, diff);
+    assert.equal(payload.path, 'a.js');
+    assert.equal(payload.tool, 'search_replace');
+    gate.resolveApproval(payload.approvalId, 'allow');
+    assert.equal((await p).allowed, true);
   });
 
   it('allow_session skips later same risk', async () => {

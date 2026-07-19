@@ -88,6 +88,20 @@
               <button type="button" id="btn-stop" class="stop-btn hidden" title="停止生成">停止</button><button type="button" id="btn-send" class="send-btn">发送(S)</button>
             </div>
           </div>
+          <div id="terminal-panel" class="terminal-panel collapsed">
+            <div class="terminal-head">
+              <button type="button" id="btn-term-toggle" class="term-toggle" title="展开/折叠终端">终端</button>
+              <span id="term-status" class="term-status"></span>
+              <button type="button" id="btn-term-stop" class="term-btn hidden">停止命令</button>
+              <button type="button" id="btn-term-clear" class="term-btn">清空</button>
+            </div>
+            <div id="term-approval" class="term-approval hidden"></div>
+            <div id="terminal-output" class="terminal-output" aria-live="polite"></div>
+            <div class="terminal-input-row">
+              <input id="terminal-input" type="text" placeholder="在项目根执行一条命令…" autocomplete="off" spellcheck="false" />
+              <button type="button" id="btn-term-run" class="term-run-btn">运行</button>
+            </div>
+          </div>
         </div>
 
         <!-- Other feature views -->

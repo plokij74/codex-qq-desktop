@@ -7,6 +7,7 @@ const { chatCompletion } = require('./ai/openai-compatible');
 const { runAgentLoop, applyWriteFencesWithGate } = require('./ai/agent');
 const { AGENT_EVENTS } = require('./ai/agent-events');
 const { createPermissionGate } = require('./ai/permission');
+const { runTerminal } = require('./ai/terminal');
 const {
   listTree,
   readFile,
@@ -17,14 +18,52 @@ const {
   isStructureIntent,
   buildTreeReply,
 } = require('./ai/project-fs');
+const { gitStatus, gitDiff } = require('./ai/git');
+const { expandAtRefs, completeAtPath } = require('./ai/at-ref');
+const { computeUnifiedDiff, truncateDiff } = require('./ai/diff');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
+
+/**
+ * Clone messages for the model; expand @refs on the last user message only.
+ * Renderer history keeps the original text (not this expanded copy).
+ */
+function messagesForModel(messages, projectPath) {
+  const out = (Array.isArray(messages) ? messages : []).map((m) => ({
+    role: m.role,
+    content: String(m.content || ''),
+  }));
+  if (!projectPath) return out;
+  for (let i = out.length - 1; i >= 0; i -= 1) {
+    if (out[i].role !== 'user') continue;
+    const userText = out[i].content;
+    try {
+      const expanded = expandAtRefs(projectPath, userText);
+      if (expanded.contextBlock) {
+        out[i] = {
+          role: 'user',
+          content: `${userText}\n\n${expanded.contextBlock}`,
+        };
+      }
+    } catch {
+      // leave original text if expand fails
+    }
+    break;
+  }
+  return out;
+}
 
 /**
  * Active chat run state.
  * @type {{ abort: AbortController, gate: ReturnType<typeof createPermissionGate>, runId: string, sender: Electron.WebContents } | null}
  */
 let activeRun = null;
+
+/**
+ * Manual terminal run (panel). Independent from activeRun / chat:stop.
+ * @type {{ abort: AbortController, gate: ReturnType<typeof createPermissionGate>, sessionId: string, sender: Electron.WebContents, termId: string } | null}
+ */
+let manualTerm = null;
 
 function userDataPath() {
   return app.getPath('userData');
@@ -81,6 +120,19 @@ function abortActiveRun() {
   } catch {
     /* ignore */
   }
+}
+
+function abortManualTerm() {
+  if (!manualTerm) return;
+  try {
+    manualTerm.abort.abort();
+  } catch {
+    /* ignore */
+  }
+}
+
+function makeTermId() {
+  return `term_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 }
 
 function createWindow() {
@@ -155,8 +207,36 @@ ipcMain.handle('project:readFile', async (_e, projectPath, relPath) => readFile(
 ipcMain.handle('project:writeFile', async (_e, projectPath, relPath, content) => writeFile(projectPath, relPath, content));
 ipcMain.handle('project:deletePath', async (_e, projectPath, relPath) => deletePath(projectPath, relPath));
 
+// Read-only git IPC (no commit — commit only via agent tool)
+ipcMain.handle('git:status', async (_e, payload = {}) => {
+  const projectPath = payload?.projectPath;
+  if (typeof projectPath !== 'string' || !projectPath.trim()) {
+    return { ok: false, branch: '', entries: [], summary: '', error: 'projectPath 无效' };
+  }
+  return gitStatus(projectPath);
+});
+
+ipcMain.handle('git:diff', async (_e, payload = {}) => {
+  const projectPath = payload?.projectPath;
+  if (typeof projectPath !== 'string' || !projectPath.trim()) {
+    return {
+      ok: false,
+      text: '',
+      truncated: false,
+      staged: !!payload?.staged,
+      error: 'projectPath 无效',
+    };
+  }
+  return gitDiff(projectPath, {
+    path: payload.path,
+    staged: payload.staged,
+    maxBytes: payload.maxBytes,
+  });
+});
+
 ipcMain.handle('chat:stop', async () => {
-  // Abort run; PermissionGate waitForApproval rejects pending entries on signal abort.
+  // Abort chat/agent run only — does NOT stop manual terminal panel runs.
+  // PermissionGate waitForApproval rejects pending entries on signal abort.
   abortActiveRun();
   return { ok: true };
 });
@@ -164,22 +244,207 @@ ipcMain.handle('chat:stop', async () => {
 ipcMain.handle('chat:approve', async (_e, payload = {}) => {
   const approvalId = payload?.approvalId;
   const decision = payload?.decision;
-  if (!activeRun?.gate || !approvalId) {
+  if (!approvalId) {
     return { ok: false, error: 'no-active-approval' };
   }
   const normalized =
     decision === 'allow' || decision === 'allow_session' ? decision : 'deny';
-  const resolved = activeRun.gate.resolveApproval(approvalId, normalized);
-  if (!resolved) {
-    return { ok: false, error: '无待审批项' };
+  // Try active chat gate first, then manual terminal gate.
+  const candidates = [
+    activeRun ? { gate: activeRun.gate, sender: activeRun.sender, runId: activeRun.runId } : null,
+    manualTerm ? { gate: manualTerm.gate, sender: manualTerm.sender, runId: activeRun?.runId ?? null } : null,
+  ].filter(Boolean);
+
+  if (!candidates.length) {
+    return { ok: false, error: 'no-active-approval' };
   }
-  safeSend(activeRun.sender, 'chat:event', {
-    type: AGENT_EVENTS.APPROVAL_RESOLVED,
-    runId: activeRun.runId,
-    approvalId,
-    decision: normalized,
+
+  for (const c of candidates) {
+    if (c.gate.resolveApproval(approvalId, normalized)) {
+      safeSend(c.sender, 'chat:event', {
+        type: AGENT_EVENTS.APPROVAL_RESOLVED,
+        runId: c.runId,
+        approvalId,
+        decision: normalized,
+      });
+      return { ok: true };
+    }
+  }
+  return { ok: false, error: '无待审批项' };
+});
+
+// --- Manual terminal panel IPC (one run at a time; independent of chat:stop) ---
+
+ipcMain.handle('terminal:run', async (event, payload = {}) => {
+  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
+  const projectPath = typeof payload.projectPath === 'string' ? payload.projectPath.trim() : '';
+  const command = String(payload.command || '').trim();
+  const cwdOpt = typeof payload.cwd === 'string' && payload.cwd.trim() ? payload.cwd.trim() : undefined;
+  const sender = event.sender;
+
+  if (!sessionId || !projectPath || !command) {
+    return { ok: false, error: '参数无效：需要 sessionId、projectPath、command' };
+  }
+  if (manualTerm) {
+    return { ok: false, error: '已有命令在运行，请先停止或等待结束' };
+  }
+  if (!fs.existsSync(projectPath) || !fs.statSync(projectPath).isDirectory()) {
+    return { ok: false, error: '项目路径无效' };
+  }
+
+  const settings = loadSettings(userDataPath());
+  if (!settings.terminalEnabled) {
+    return { ok: false, error: '终端未启用。请在设置中打开「允许终端」。' };
+  }
+
+  const abort = new AbortController();
+  const signal = abort.signal;
+  const termId = makeTermId();
+
+  const gate = createPermissionGate({
+    permissionMode: PERMISSION_MODES.has(settings.permissionMode)
+      ? settings.permissionMode
+      : 'confirm-writes',
+    terminalEnabled: Boolean(settings.terminalEnabled),
+    terminalRequireConfirm: settings.terminalRequireConfirm !== false,
+    onApprovalNeeded: async (approvalPayload) => {
+      safeSend(sender, 'chat:event', {
+        type: AGENT_EVENTS.APPROVAL_NEEDED,
+        runId: activeRun?.runId ?? null,
+        source: 'user',
+        ...approvalPayload,
+      });
+    },
   });
+
+  manualTerm = { abort, gate, sessionId, sender, termId };
+
+  const emit = (e) => {
+    safeSend(sender, 'chat:event', { runId: null, source: 'user', ...e });
+  };
+
+  try {
+    const auth = await gate.authorize({
+      tool: 'run_terminal',
+      risk: 'terminal',
+      summary: `手动执行: ${command.slice(0, 120)}`,
+      detail: command,
+      path: '.',
+      sessionKey: sessionId,
+      signal,
+    });
+    if (!auth.allowed) {
+      return { ok: false, error: auth.reason || '用户拒绝' };
+    }
+    if (signal.aborted) {
+      return { ok: false, error: '已停止', aborted: true };
+    }
+
+    const cwdDisplay = cwdOpt || projectPath;
+    emit({
+      type: AGENT_EVENTS.TERMINAL_START,
+      termId,
+      command,
+      cwd: cwdDisplay,
+      source: 'user',
+    });
+
+    let result;
+    try {
+      result = await runTerminal(projectPath, command, {
+        cwd: cwdOpt,
+        timeoutMs: settings.terminalTimeoutMs || 60000,
+        signal,
+        onStdout: (chunk) => emit({
+          type: AGENT_EVENTS.TERMINAL_OUTPUT,
+          termId,
+          stream: 'stdout',
+          chunk: String(chunk),
+        }),
+        onStderr: (chunk) => emit({
+          type: AGENT_EVENTS.TERMINAL_OUTPUT,
+          termId,
+          stream: 'stderr',
+          chunk: String(chunk),
+        }),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const aborted = isAbortError(err, signal);
+      emit({
+        type: AGENT_EVENTS.TERMINAL_END,
+        termId,
+        code: -1,
+        ok: false,
+        timedOut: false,
+        aborted,
+        summary: msg,
+      });
+      return { ok: false, error: msg, aborted, termId };
+    }
+
+    emit({
+      type: AGENT_EVENTS.TERMINAL_END,
+      termId,
+      code: result.code,
+      ok: result.ok,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
+      summary: `exit=${result.code}`,
+    });
+    return { ok: true, termId, ...result };
+  } catch (err) {
+    if (isAbortError(err, signal)) {
+      return { ok: false, error: '已停止', aborted: true, termId };
+    }
+    return { ok: false, error: err instanceof Error ? err.message : String(err), termId };
+  } finally {
+    if (manualTerm && manualTerm.termId === termId) {
+      manualTerm = null;
+    }
+  }
+});
+
+ipcMain.handle('terminal:stop', async (_e, payload = {}) => {
+  if (!manualTerm) return { ok: true, stopped: false };
+  if (payload?.sessionId && manualTerm.sessionId !== payload.sessionId) {
+    return { ok: false, error: '会话不匹配' };
+  }
+  abortManualTerm();
+  return { ok: true, stopped: true };
+});
+
+ipcMain.handle('terminal:clear', async () => {
+  // Clear is UI-local; main acknowledges for symmetry / future history wipe.
   return { ok: true };
+});
+
+ipcMain.handle('atRef:complete', async (_e, payload = {}) => {
+  const projectPath = payload.projectPath || payload.project?.path || null;
+  const prefix = payload.prefix != null ? String(payload.prefix) : '';
+  if (!projectPath) return { items: [] };
+  try {
+    const items = completeAtPath(projectPath, prefix, {
+      limit: payload.limit != null ? Number(payload.limit) : undefined,
+    });
+    return { items };
+  } catch (err) {
+    return { items: [], error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('atRef:expand', async (_e, payload = {}) => {
+  const projectPath = payload.projectPath || payload.project?.path || null;
+  const text = payload.text != null ? String(payload.text) : '';
+  try {
+    return expandAtRefs(projectPath, text);
+  } catch (err) {
+    return {
+      contextBlock: null,
+      refs: [],
+      warnings: [err instanceof Error ? err.message : String(err)],
+    };
+  }
 });
 
 ipcMain.handle('chat:send', async (event, payload = {}) => {
@@ -224,6 +489,8 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
     const project = payload.project && payload.project.path
       ? { name: payload.project.name || path.basename(payload.project.path), path: payload.project.path }
       : null;
+    // Expand @refs only on the copy fed to the model (history keeps original).
+    const modelMessages = messagesForModel(messages, project?.path || null);
 
     // Fast path: host list/structure (always real scan)
     if (project?.path && (isListIntent(userText) || isStructureIntent(userText))) {
@@ -237,21 +504,47 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
         const reply = buildTreeReply(project, userText);
         let content = reply.content;
         const applied = [];
+        const fileChanges = [];
         const wantSave = isStructureIntent(userText) || /保存|写入|生成\s*\.md|PROJECT_STRUCTURE/i.test(userText);
         if (wantSave && reply.structureMarkdown) {
           const outName = /保存为\s*([^\s]+)/i.test(userText)
             ? userText.match(/保存为\s*([^\s]+)/i)[1].replace(/[\\/]/g, '')
             : 'PROJECT_STRUCTURE.md';
           try {
-            // Honor permissionMode / allow_session for host structure-save
+            // Honor permissionMode / allow_session for host structure-save;
+            // pass unified diff like agent writes so confirm-writes can show changes.
+            let before = '';
+            try {
+              const existingFull = path.join(project.path, outName);
+              if (fs.existsSync(existingFull) && fs.statSync(existingFull).isFile()) {
+                before = fs.readFileSync(existingFull, 'utf8');
+              }
+            } catch {
+              before = '';
+            }
+            const after = String(reply.structureMarkdown);
+            const computed = computeUnifiedDiff(outName, before, after);
+            const truncated = truncateDiff(computed.text);
+            const diffPayload = {
+              path: outName,
+              text: truncated.text,
+              stats: computed.stats,
+              isBinary: computed.isBinary,
+              truncated: truncated.truncated,
+            };
+            const detailForGate = computed.isBinary
+              ? '(binary or non-text content)'
+              : truncated.text.slice(0, 2000) || String(after).slice(0, 2000);
+
             const auth = await gate.authorize({
               tool: 'write_file',
               risk: 'write',
               summary: `写入 ${outName}`,
-              detail: String(reply.structureMarkdown).slice(0, 2000),
+              detail: detailForGate,
               path: outName,
               sessionKey: payload.sessionId,
               signal,
+              diff: diffPayload,
             });
             if (!auth.allowed) {
               const reason = auth.reason || '用户拒绝';
@@ -260,6 +553,11 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
             } else {
               const w = writeFile(project.path, outName, reply.structureMarkdown);
               applied.push({ path: w.path, ok: true, bytes: w.bytes });
+              fileChanges.push({
+                path: w.path,
+                op: before ? 'write' : 'create',
+                stats: computed.stats,
+              });
               content += `\n\n---\n📁 已写入真实文件：\`${w.path}\`（${w.bytes} bytes）`;
             }
           } catch (e) {
@@ -276,7 +574,14 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
           summary: applied.length ? `listTree + ${applied.length} write(s)` : 'listTree',
         });
         toolEndEmitted = true;
-        const result = { content, applied, hostTool: 'listTree', runId, mode: 'host' };
+        const result = {
+          content,
+          applied,
+          fileChanges,
+          hostTool: 'listTree',
+          runId,
+          mode: 'host',
+        };
         emit({ type: AGENT_EVENTS.DONE, ...result });
         return result;
       } catch (err) {
@@ -304,7 +609,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
       const result = await runAgentLoop({
         project,
         settings,
-        messages: messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
+        messages: modelMessages,
         gate,
         onEvent: emit,
         sessionKey: payload.sessionId,
@@ -313,6 +618,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
       const out = {
         content: result.content,
         applied: result.applied,
+        fileChanges: result.fileChanges || [],
         agentLog: result.agentLog,
         turns: result.turns,
         mode: 'agent',
@@ -340,7 +646,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
         model: settings.model,
         messages: [
           { role: 'system', content: systemParts.join('\n\n') },
-          ...messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
+          ...modelMessages,
         ],
         signal,
       });
@@ -351,6 +657,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
     if (signal.aborted) throwAborted();
 
     let applied = [];
+    const fileChanges = [];
     let displayContent = content;
     // Single-shot write fences must go through the same PermissionGate
     if (project?.path) {
@@ -360,6 +667,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
         sessionKey: payload.sessionId,
         signal,
         onEvent: emit,
+        fileChanges,
       });
       applied = result.applied;
       displayContent = result.displayContent;
@@ -376,7 +684,13 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
     }
 
     emit({ type: AGENT_EVENTS.TEXT_DELTA, text: displayContent });
-    const out = { content: displayContent, applied, mode: settings.mode, runId };
+    const out = {
+      content: displayContent,
+      applied,
+      fileChanges,
+      mode: settings.mode,
+      runId,
+    };
     emit({ type: AGENT_EVENTS.DONE, ...out });
     return out;
   } catch (err) {

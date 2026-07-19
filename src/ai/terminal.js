@@ -64,8 +64,20 @@ function runTerminal(projectRoot, command, opts = {}) {
       try { child.kill(); } catch { /* ignore */ }
     }, timeoutMs);
 
-    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
-    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+    child.stdout.on('data', (d) => {
+      const chunk = d.toString('utf8');
+      stdout += chunk;
+      if (typeof opts.onStdout === 'function') {
+        try { opts.onStdout(chunk); } catch { /* ignore */ }
+      }
+    });
+    child.stderr.on('data', (d) => {
+      const chunk = d.toString('utf8');
+      stderr += chunk;
+      if (typeof opts.onStderr === 'function') {
+        try { opts.onStderr(chunk); } catch { /* ignore */ }
+      }
+    });
 
     child.on('error', (err) => {
       clearTimeout(timer);

@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const {
   listTree,
@@ -5,7 +6,9 @@ const {
   writeFile,
   deletePath,
   searchReplace,
+  previewSearchReplace,
   parseWriteFences,
+  resolveSafe,
 } = require('./project-fs');
 const { runTerminal } = require('./terminal');
 const { chatCompletionMessage } = require('./openai-compatible');
@@ -14,6 +17,10 @@ const { loadProjectInstructions } = require('./project-instructions');
 const { loadGitignoreRules } = require('./gitignore');
 const { riskForTool } = require('./permission');
 const { AGENT_EVENTS } = require('./agent-events');
+const { computeUnifiedDiff, truncateDiff } = require('./diff');
+const { gitStatus, gitDiff, gitCommit } = require('./git');
+
+const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
 const TOOL_DEFS = [
   {
@@ -139,6 +146,44 @@ const TOOL_DEFS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'git_status',
+      description: 'Show git working tree status (branch + changed files).',
+      parameters: { type: 'object', properties: { short: { type: 'boolean' } } },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_diff',
+      description: 'Show git diff for worktree or staged changes. Optional path filter.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          staged: { type: 'boolean' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_commit',
+      description: 'Stage optional paths and create a git commit. Does not push. Does not git add -A unless paths listed.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: { type: 'string' },
+          paths: { type: 'array', items: { type: 'string' } },
+          stage: { type: 'boolean' },
+        },
+        required: ['message'],
+      },
+    },
+  },
 ];
 
 const TOOL_NAMES = TOOL_DEFS.map((t) => t.function.name).join(', ');
@@ -146,13 +191,15 @@ const TOOL_NAMES = TOOL_DEFS.map((t) => t.function.name).join(', ');
 function agentSystemPrompt(project, settings) {
   const parts = [
     '你是 Codex 风格编程 Agent。你可以通过工具在本机真实项目上操作。',
-    '工作流：需要信息时先 list_dir / glob / grep / read_file，再修改；优先 search_replace 做局部修改；新建或整文件重写用 write_file；必要时 run_terminal 验证。',
+    '工作流：需要信息时先 list_dir / glob / grep / read_file，再修改；优先 search_replace 做局部修改；新建或整文件重写用 write_file；提交用 git_status / git_diff / git_commit（不 push）；必要时 run_terminal 验证。',
     '规则：',
     '1. 路径一律相对项目根，禁止访问项目外',
     '2. 不要编造文件内容；先读/搜再改',
     '3. 局部编辑优先 search_replace（要求 old_string 默认唯一匹配）；不要用 write_file 整文件覆盖只改几行的情况',
-    '4. 完成后用中文总结改动',
-    '5. 若无需再调用工具，直接给出最终答复（不要空回复）',
+    '4. git_commit 仅暂存给定 paths（或不带 paths 时只提交已暂存），不会 git add -A，不会 push',
+    '5. 完成后用中文总结改动',
+    '6. 若无需再调用工具，直接给出最终答复（不要空回复）',
+    '7. 用户消息中的 `context:refs` 代码块是用户显式附加的文件内容（@ 引用展开），请优先依据其中内容作答',
     `终端工具: ${settings.terminalEnabled ? '已启用' : '未启用（不要调用 run_terminal）'}`,
   ];
 
@@ -239,6 +286,11 @@ function toolPath(name, args) {
   if (name === 'run_terminal') return undefined;
   if (name === 'grep') return args.path || undefined;
   if (name === 'glob') return undefined;
+  if (name === 'git_status') return undefined;
+  if (name === 'git_commit') {
+    if (Array.isArray(args.paths) && args.paths.length) return args.paths[0];
+    return undefined;
+  }
   return args.path || args.file || undefined;
 }
 
@@ -261,6 +313,12 @@ function toolSummary(name, args) {
       return `删除 ${p || '?'}`;
     case 'run_terminal':
       return `执行: ${String(args.command || '').slice(0, 120)}`;
+    case 'git_status':
+      return 'git status';
+    case 'git_diff':
+      return `git diff${args.staged ? ' --staged' : ''}${args.path ? ` ${args.path}` : ''}`;
+    case 'git_commit':
+      return `git commit: ${String(args.message || '').slice(0, 80)}`;
     default:
       return name;
   }
@@ -275,6 +333,12 @@ function toolDetail(name, args) {
   }
   if (name === 'write_file') {
     return `path=${args.path}\ncontent:\n${String(args.content || '').slice(0, 1500)}`.slice(0, 2000);
+  }
+  if (name === 'git_commit') {
+    return [
+      `message: ${args.message}`,
+      args.paths?.length ? `paths: ${args.paths.join(', ')}` : 'paths: (已暂存 only)',
+    ].join('\n');
   }
   try {
     return JSON.stringify(args).slice(0, 2000);
@@ -293,12 +357,16 @@ function summarizeToolResult(name, parsed) {
   if (name === 'run_terminal') return `exit=${parsed.code}`;
   if (name === 'delete_path') return `deleted ${parsed.path}`;
   if (name === 'read_file') return `read ${parsed.path}`;
+  if (name === 'git_status') return parsed.summary || 'status';
+  if (name === 'git_diff') return parsed.truncated ? 'diff (truncated)' : 'diff';
+  if (name === 'git_commit') return parsed.summary || parsed.commit || 'committed';
   return 'ok';
 }
 
 /**
  * Authorize via PermissionGate when present.
  * Legacy fallback: allow non-terminal; terminal uses confirmTerminal if required.
+ * Forwards optional `diff` (unified diff payload) to gate.authorize.
  */
 async function authorizeTool({
   gate,
@@ -311,6 +379,7 @@ async function authorizeTool({
   path: toolRelPath,
   sessionKey,
   signal,
+  diff,
 }) {
   if (gate && typeof gate.authorize === 'function') {
     return gate.authorize({
@@ -321,6 +390,7 @@ async function authorizeTool({
       path: toolRelPath,
       sessionKey,
       signal,
+      diff,
     });
   }
 
@@ -338,6 +408,114 @@ async function authorizeTool({
     return { allowed: true };
   }
   return { allowed: true };
+}
+
+/**
+ * Build truncated unified-diff payload for permission UI (no disk write).
+ * @returns {{ computed: object, diffPayload: object|null, detailForGate: string }}
+ */
+function buildDiffForAuthorize(rel, before, after, { isDirDelete = false } = {}) {
+  if (isDirDelete) {
+    return {
+      computed: { path: rel, text: '', stats: { additions: 0, deletions: 0 }, isBinary: false },
+      diffPayload: null,
+      detailForGate: `递归删除目录: ${rel}`,
+    };
+  }
+  const computed = computeUnifiedDiff(rel, before, after);
+  if (computed.isBinary) {
+    return {
+      computed,
+      diffPayload: {
+        path: rel,
+        stats: computed.stats,
+        text: '',
+        truncated: false,
+        isBinary: true,
+      },
+      detailForGate: `二进制或无法生成 diff：${rel}`,
+    };
+  }
+  const trunc = truncateDiff(computed.text);
+  return {
+    computed,
+    diffPayload: {
+      path: rel,
+      stats: computed.stats,
+      text: trunc.text,
+      truncated: trunc.truncated,
+      isBinary: false,
+    },
+    detailForGate: trunc.text || `删除: ${rel}`,
+  };
+}
+
+/**
+ * Preview mutating tool effects in memory (no write).
+ * @returns {{ before: string, after: string, op: string, isDirDelete: boolean, previewMeta: object }}
+ */
+function previewMutatingTool(name, args, projectRoot, rel) {
+  if (name === 'search_replace') {
+    const prev = previewSearchReplace(projectRoot, rel, args.old_string, args.new_string, {
+      replaceAll: args.replace_all === true || args.replaceAll === true,
+    });
+    return {
+      before: prev.before,
+      after: prev.after,
+      op: 'write',
+      isDirDelete: false,
+      previewMeta: { replacements: prev.replacements },
+    };
+  }
+  if (name === 'write_file') {
+    let before = '';
+    try {
+      const full = resolveSafe(projectRoot, rel);
+      if (fs.existsSync(full) && fs.statSync(full).isFile()) {
+        before = fs.readFileSync(full, 'utf8');
+      }
+    } catch {
+      before = '';
+    }
+    const after = String(args.content ?? '');
+    return {
+      before,
+      after,
+      op: before ? 'write' : 'create',
+      isDirDelete: false,
+      previewMeta: {},
+    };
+  }
+  if (name === 'delete_path') {
+    const full = resolveSafe(projectRoot, rel);
+    if (!fs.existsSync(full)) {
+      throw new Error(`不存在: ${rel}`);
+    }
+    const st = fs.statSync(full);
+    if (st.isDirectory()) {
+      return {
+        before: '',
+        after: '',
+        op: 'delete',
+        isDirDelete: true,
+        previewMeta: {},
+      };
+    }
+    let before = '';
+    try {
+      before = fs.readFileSync(full, 'utf8');
+    } catch {
+      before = '';
+    }
+    return {
+      before,
+      after: '',
+      op: 'delete',
+      isDirDelete: false,
+      previewMeta: {},
+    };
+  }
+  throw new Error(`非变更工具: ${name}`);
 }
 
 async function executeTool(name, args, ctx) {
@@ -409,8 +587,83 @@ async function executeTool(name, args, ctx) {
       const command = String(args.command || '').trim();
       if (!command) return JSON.stringify({ ok: false, error: 'command 为空' });
       // Authorization is done by PermissionGate in runAgentLoop (no confirmTerminal here).
-      const result = await runTerminal(root, command, {
-        timeoutMs: settings.terminalTimeoutMs || 60000,
+      const termId = `term_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      ctx.onEvent?.({
+        type: AGENT_EVENTS.TERMINAL_START,
+        termId,
+        command,
+        cwd: root,
+        source: 'agent',
+      });
+      // Always emit TERMINAL_END after START (blocked command / spawn throw / abort).
+      let endPayload = {
+        code: -1,
+        ok: false,
+        timedOut: false,
+        aborted: false,
+        summary: 'error',
+      };
+      try {
+        const result = await runTerminal(root, command, {
+          timeoutMs: settings.terminalTimeoutMs || 60000,
+          signal: ctx.signal,
+          onStdout: (chunk) => ctx.onEvent?.({
+            type: AGENT_EVENTS.TERMINAL_OUTPUT,
+            termId,
+            stream: 'stdout',
+            chunk: String(chunk),
+          }),
+          onStderr: (chunk) => ctx.onEvent?.({
+            type: AGENT_EVENTS.TERMINAL_OUTPUT,
+            termId,
+            stream: 'stderr',
+            chunk: String(chunk),
+          }),
+        });
+        endPayload = {
+          code: result.code,
+          ok: result.ok,
+          timedOut: result.timedOut,
+          aborted: result.aborted,
+          summary: `exit=${result.code}`,
+        };
+        return JSON.stringify(result);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const aborted = !!(err && (err.code === 'ABORTED' || err.name === 'AbortError'));
+        endPayload = {
+          code: -1,
+          ok: false,
+          timedOut: false,
+          aborted,
+          summary: msg,
+        };
+        return JSON.stringify({ ok: false, error: msg, aborted });
+      } finally {
+        ctx.onEvent?.({
+          type: AGENT_EVENTS.TERMINAL_END,
+          termId,
+          ...endPayload,
+        });
+      }
+    }
+    if (name === 'git_status') {
+      const result = await gitStatus(root, { signal: ctx.signal });
+      return JSON.stringify(result);
+    }
+    if (name === 'git_diff') {
+      const result = await gitDiff(root, {
+        path: args.path,
+        staged: args.staged === true,
+        signal: ctx.signal,
+      });
+      return JSON.stringify(result);
+    }
+    if (name === 'git_commit') {
+      const result = await gitCommit(root, {
+        message: args.message,
+        paths: args.paths,
+        stage: args.stage,
         signal: ctx.signal,
       });
       return JSON.stringify(result);
@@ -439,10 +692,12 @@ async function executeToolFixed(name, args, ctx) {
       } catch {
         ignoreRules = null;
       }
+      const ignorePrefix = rel === '.' ? '' : rel.replace(/\\/g, '/').replace(/\/+$/, '');
       const t = listTree(absResolved, {
         maxDepth: Number(args.maxDepth) || 6,
         maxEntries: 3000,
         ignoreRules,
+        ignorePrefix,
       });
       return JSON.stringify({
         ok: true,
@@ -506,6 +761,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
   sessionKey,
   signal,
   onEvent,
+  fileChanges,
 }) {
   const ops = parseWriteFences(content);
   if (!ops.length) {
@@ -517,11 +773,23 @@ async function applyWriteFencesWithGate(projectRoot, content, {
     assertNotAborted(signal);
     const risk = 'write';
     const summary = `写入 ${op.path}`;
-    const detail = String(op.content || '').slice(0, 2000);
     onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: 'write_fence', args: { path: op.path } });
     let auth;
     let endEmitted = false;
     try {
+      let before = '';
+      try {
+        const full = resolveSafe(projectRoot, op.path);
+        if (fs.existsSync(full) && fs.statSync(full).isFile()) {
+          before = fs.readFileSync(full, 'utf8');
+        }
+      } catch {
+        before = '';
+      }
+      const after = String(op.content ?? '');
+      const fileOp = before ? 'write' : 'create';
+      const { computed, diffPayload, detailForGate } = buildDiffForAuthorize(op.path, before, after);
+
       try {
         auth = await authorizeTool({
           gate,
@@ -530,10 +798,11 @@ async function applyWriteFencesWithGate(projectRoot, content, {
           name: 'write_file',
           risk,
           summary,
-          detail,
+          detail: detailForGate,
           path: op.path,
           sessionKey,
           signal,
+          diff: diffPayload,
         });
       } catch (err) {
         if (err?.code === 'ABORTED' || err?.name === 'AbortError') throw err;
@@ -556,6 +825,15 @@ async function applyWriteFencesWithGate(projectRoot, content, {
       try {
         const r = writeFile(projectRoot, op.path, op.content);
         applied.push({ path: r.path, ok: true, bytes: r.bytes, mode: 'write_fence' });
+        if (fileChanges) {
+          fileChanges.push({ path: r.path, op: fileOp, stats: computed.stats });
+        }
+        onEvent?.({
+          type: AGENT_EVENTS.FILE_CHANGE,
+          path: r.path,
+          op: fileOp,
+          stats: computed.stats,
+        });
         onEvent?.({
           type: AGENT_EVENTS.TOOL_END,
           tool: 'write_fence',
@@ -681,6 +959,8 @@ async function runAgentLoop({
   const tools = toolsForSettings(settings);
   const agentLog = [];
   const applied = [];
+  /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
+  const fileChanges = [];
 
   /** @type {any[]} */
   let working = [
@@ -768,7 +1048,6 @@ async function runAgentLoop({
 
         const risk = riskForTool(name);
         const summary = toolSummary(name, args);
-        const detail = toolDetail(name, args);
         const relPath = toolPath(name, args);
 
         onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: name, args });
@@ -777,41 +1056,101 @@ async function runAgentLoop({
         let authAllowed = true;
         let authReason;
         let toolEndEmitted = false;
+        let diffStats = null;
+        let fileOp = null;
         try {
-          try {
-            const auth = await authorizeTool({
-              gate: effectiveGate,
-              confirmTerminal,
-              settings,
-              name,
-              risk,
-              summary,
-              detail,
-              path: relPath,
-              sessionKey,
-              signal,
-            });
-            authAllowed = !!auth.allowed;
-            authReason = auth.reason;
-          } catch (err) {
-            if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
-              const e = new Error('已停止');
-              e.code = 'ABORTED';
-              throw e;
-            }
-            authAllowed = false;
-            authReason = err.message || String(err);
+          let detail = toolDetail(name, args);
+          let diffPayload;
+
+          // git_commit: enrich authorize detail with message + intended paths (stage runs after allow)
+          if (name === 'git_commit') {
+            detail = [
+              `message: ${args.message}`,
+              args.paths?.length ? `paths: ${args.paths.join(', ')}` : 'paths: (已暂存 only)',
+            ].join('\n');
           }
 
-          if (!authAllowed) {
-            resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
-          } else {
-            resultStr = await executeToolFixed(name, args, {
-              project,
-              settings,
-              signal,
-              gate: effectiveGate,
-            });
+          // Keep preview for integrity apply (search_replace must write preview.after, not re-run).
+          // Note: between preview and write there is still a TOCTOU window if the file changes externally.
+          let mutatePreview = null;
+
+          if (MUTATING_TOOLS.has(name)) {
+            // Preview before authorize so gate can show unified diff; write only if allowed.
+            try {
+              mutatePreview = previewMutatingTool(name, args, project.path, relPath || '');
+              fileOp = mutatePreview.op;
+              const built = buildDiffForAuthorize(relPath || '', mutatePreview.before, mutatePreview.after, {
+                isDirDelete: mutatePreview.isDirDelete,
+              });
+              diffStats = built.computed.stats;
+              diffPayload = built.diffPayload;
+              detail = built.detailForGate;
+            } catch (err) {
+              if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                const e = new Error('已停止');
+                e.code = 'ABORTED';
+                throw e;
+              }
+              // Preview failure (no match / non-unique / missing) → tool error, skip authorize
+              resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
+              authAllowed = false;
+              authReason = err.message || String(err);
+            }
+          }
+
+          if (resultStr == null) {
+            try {
+              const auth = await authorizeTool({
+                gate: effectiveGate,
+                confirmTerminal,
+                settings,
+                name,
+                risk,
+                summary,
+                detail,
+                path: relPath,
+                sessionKey,
+                signal,
+                diff: diffPayload,
+              });
+              authAllowed = !!auth.allowed;
+              authReason = auth.reason;
+            } catch (err) {
+              if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                const e = new Error('已停止');
+                e.code = 'ABORTED';
+                throw e;
+              }
+              authAllowed = false;
+              authReason = err.message || String(err);
+            }
+
+            if (!authAllowed) {
+              resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
+            } else if (name === 'search_replace' && mutatePreview) {
+              // Apply approved preview.after (do not re-run searchReplace / re-preview).
+              try {
+                const w = writeFile(project.path, relPath || '', mutatePreview.after);
+                const replacements = mutatePreview.previewMeta?.replacements ?? 1;
+                resultStr = JSON.stringify({
+                  ok: true,
+                  path: w.path,
+                  replacements,
+                  bytes: w.bytes,
+                  mode: 'search_replace',
+                });
+              } catch (err) {
+                resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
+              }
+            } else {
+              resultStr = await executeToolFixed(name, args, {
+                project,
+                settings,
+                signal,
+                gate: effectiveGate,
+                onEvent,
+              });
+            }
           }
 
           let parsed;
@@ -828,14 +1167,6 @@ async function runAgentLoop({
             summary: stepSummary,
           });
 
-          onEvent?.({
-            type: AGENT_EVENTS.TOOL_END,
-            tool: name,
-            ok,
-            summary: stepSummary,
-          });
-          toolEndEmitted = true;
-
           if (name === 'write_file' && parsed.ok) {
             applied.push({ path: parsed.path, ok: true, bytes: parsed.bytes });
           }
@@ -851,6 +1182,27 @@ async function runAgentLoop({
           if (name === 'delete_path' && parsed.ok) {
             applied.push({ path: parsed.path, ok: true, bytes: 0, deleted: true });
           }
+
+          // FILE_CHANGE before TOOL_END so UI can show change strip with tool completion.
+          if (MUTATING_TOOLS.has(name) && parsed.ok && diffStats) {
+            const changePath = parsed.path || relPath;
+            const changeOp = fileOp || (name === 'delete_path' ? 'delete' : 'write');
+            fileChanges.push({ path: changePath, op: changeOp, stats: diffStats });
+            onEvent?.({
+              type: AGENT_EVENTS.FILE_CHANGE,
+              path: changePath,
+              op: changeOp,
+              stats: diffStats,
+            });
+          }
+
+          onEvent?.({
+            type: AGENT_EVENTS.TOOL_END,
+            tool: name,
+            ok,
+            summary: stepSummary,
+          });
+          toolEndEmitted = true;
 
           if (tc.id && String(tc.id).startsWith('text')) {
             // text protocol: append as user-visible tool result in chat history
@@ -889,7 +1241,7 @@ async function runAgentLoop({
 
     // Final natural language answer
     let content = msg.content || '';
-    // write fences: authorize each op via gate before apply
+    // write fences: preview diff → authorize → write only if allowed
     const fence = await applyWriteFencesWithGate(project.path, content, {
       gate: effectiveGate,
       confirmTerminal,
@@ -897,6 +1249,7 @@ async function runAgentLoop({
       sessionKey,
       signal,
       onEvent,
+      fileChanges,
     });
     if (fence.applied.length) {
       applied.push(...fence.applied);
@@ -910,6 +1263,7 @@ async function runAgentLoop({
       agentLog,
       turns: turn,
       toolsSupported,
+      fileChanges,
     };
   }
 
@@ -920,7 +1274,7 @@ async function runAgentLoop({
     applied,
     maxTurns
   );
-  return { content, applied, agentLog, turns: maxTurns, toolsSupported };
+  return { content, applied, agentLog, turns: maxTurns, toolsSupported, fileChanges };
 }
 
 function appendAgentFooter(content, agentLog, applied, turns) {

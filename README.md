@@ -12,6 +12,7 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - **斜杠命令**：`/help` `/clear` `/mode` `/new 标题`
 - AI：**本地模拟** 或 **OpenAI 兼容 API**
 - **Phase A Agent 核心**：权限三档、内联审批、grep/glob/search_replace、流式正文 + 工具轨迹
+- **Phase B 工程闭环**：写盘 unified diff 审批、`git_status` / `git_diff` / `git_commit`、底部终端面板、输入框 `@文件` 引用
 
 ## 开发
 
@@ -125,3 +126,48 @@ npm run dist
 - **API 模式 + 已绑定项目 + agentEnabled**：完整多轮工具循环
 - **本地模拟 (local)**：不依赖外网；list 等快路径仍可用
 - **无 stream / 无 tools 网关**：自动降级，保持可用
+
+## Phase B：工程闭环
+
+在 Phase A 权限与工具循环之上，补齐「看 diff → 改文件 → 跑命令 → 本地提交 → 带上下文提问」路径。
+
+### Diff 审批与改动列表
+
+- **`confirm-writes`（默认）**：`write_file` / `search_replace` 在落盘前计算 unified diff，审批卡片展示 diff（过长会截断，行统计仍准确）；点「允许」后才写入。
+- **`full-auto`**：直接写入，本轮结束在聊天区展示 `fileChanges` 改动列表（只读，不再二次审批）。
+- 粒度：**一次工具调用一张卡**（串行 loop，与 Phase A 一致）。
+- `git_commit` 风险等同 **write**（可走「本会话始终允许此类」）。
+
+### Git 工具（无 push）
+
+| 工具 | 风险 | 说明 |
+|------|------|------|
+| `git_status` | read | 工作区状态摘要 |
+| `git_diff` | read | 工作区 / staged / 指定 path 的 diff |
+| `git_commit` | write | 仅暂存给定 `paths`（或不带 paths 时只提交已暂存）；**不会** `git add -A`，**不会** push |
+
+无项目绑定或路径越界会失败；`read-only` 权限下 commit 被拒绝。
+
+### 终端面板
+
+- 聊天区底部 **终端** 面板：折叠状态记在 localStorage。
+- **Agent** 的 `run_terminal` 与 **手动一条** 共用输出区；事件 `terminal-start` / `terminal-output` / `terminal-end`。
+- **无 PTY**：一次性 `spawn`，stdout/stderr 分块推送。
+- **聊天「停止」≠ 终端「停止命令」**：手动命令用面板上的停止；互不误杀。
+- 设置里仍需开启「允许终端」；若「执行前确认」开启，命令会走审批（面板内卡片）。
+
+### `@` 文件引用
+
+在项目会话输入框中：
+
+| 写法 | 效果 |
+|------|------|
+| `@src/ai/agent.js` | 注入该文件（有大小/行数上限） |
+| `@src/ai/agent.js:10-40` | 仅注入行号范围 |
+| `@src/ai/` 或 `@src` | 目录树摘要 + 少量文件头预览 |
+| 多个 `@` | 按出现顺序展开，总预算约 200 KiB |
+
+- 输入 `@` / `@src/` 会弹出路径补全（↑↓ + Enter/Tab；尊重 `.gitignore`）。
+- **发送时** main 侧展开并附加 `context:refs` 代码块给模型；**会话历史只存用户原文**（含 `@`），重载不会再读盘撑爆上下文。
+- 代码围栏与行内 `` `code` `` 内的 `@` 不解析。
+- 无项目绑定：补全禁用；展开跳过并 warning。

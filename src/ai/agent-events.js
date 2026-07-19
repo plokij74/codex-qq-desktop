@@ -9,6 +9,10 @@ const AGENT_EVENTS = {
   DONE: 'done',
   ERROR: 'error',
   ABORTED: 'aborted',
+  FILE_CHANGE: 'file-change',
+  TERMINAL_START: 'terminal-start',
+  TERMINAL_OUTPUT: 'terminal-output',
+  TERMINAL_END: 'terminal-end',
 };
 
 module.exports = { AGENT_EVENTS };

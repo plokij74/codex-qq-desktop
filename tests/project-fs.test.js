@@ -8,6 +8,7 @@ const {
   writeFile,
   readFile,
   searchReplace,
+  previewSearchReplace,
   parseWriteFences,
   applyWriteFences,
   listTree,
@@ -108,6 +109,33 @@ describe('project-fs', () => {
     const r = searchReplace(root, 'a.js', 'OLD', 'cost is $& and $1');
     assert.equal(r.replacements, 1);
     assert.equal(readFile(root, 'a.js').content, 'price = cost is $& and $1;\n');
+  });
+
+  it('previewSearchReplace does not write disk', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pfs-'));
+    const p = path.join(root, 'a.js');
+    fs.writeFileSync(p, 'const x = 1;\n');
+    const r = previewSearchReplace(root, 'a.js', 'const x = 1;', 'const x = 2;');
+    assert.equal(r.after, 'const x = 2;\n');
+    assert.equal(r.before, 'const x = 1;\n');
+    assert.equal(r.replacements, 1);
+    assert.equal(r.path, 'a.js');
+    assert.equal(fs.readFileSync(p, 'utf8'), 'const x = 1;\n');
+  });
+
+  it('previewSearchReplace fails on multiple matches', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pfs-'));
+    writeFile(root, 'a.js', 'foo\nfoo\n');
+    assert.throws(() => previewSearchReplace(root, 'a.js', 'foo', 'bar'), /次|multiple|多/i);
+  });
+
+  it('previewSearchReplace replace_all without write', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pfs-'));
+    writeFile(root, 'a.js', 'foo\nfoo\n');
+    const r = previewSearchReplace(root, 'a.js', 'foo', 'bar', { replaceAll: true });
+    assert.equal(r.replacements, 2);
+    assert.equal(r.after, 'bar\nbar\n');
+    assert.equal(fs.readFileSync(path.join(root, 'a.js'), 'utf8'), 'foo\nfoo\n');
   });
 
   it('readFile offset limit with line numbers', () => {

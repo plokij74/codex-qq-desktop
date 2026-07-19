@@ -1,5 +1,10 @@
-const READ_TOOLS = new Set(['list_dir', 'read_file', 'grep', 'glob']);
-const WRITE_TOOLS = new Set(['write_file', 'search_replace']);
+const READ_TOOLS = new Set([
+  'list_dir', 'read_file', 'grep', 'glob',
+  'git_status', 'git_diff',
+]);
+const WRITE_TOOLS = new Set([
+  'write_file', 'search_replace', 'git_commit',
+]);
 
 /**
  * Session-scoped allow_session memory shared across PermissionGate instances.
@@ -125,6 +130,7 @@ function createPermissionGate({
           summary: payload.summary,
           detail: payload.detail,
           path: payload.path,
+          diff: payload.diff, // may be undefined
         });
       }
       const result = await waitPromise;
@@ -143,7 +149,7 @@ function createPermissionGate({
     }
   }
 
-  async function authorize({ tool, risk, summary, detail, path, sessionKey, signal } = {}) {
+  async function authorize({ tool, risk, summary, detail, path, sessionKey, signal, diff } = {}) {
     const effectiveRisk = risk || riskForTool(tool);
 
     if (signal?.aborted) {
@@ -183,7 +189,7 @@ function createPermissionGate({
     }
 
     const decisionResult = await waitForApproval(
-      { tool, risk: effectiveRisk, summary, detail, path },
+      { tool, risk: effectiveRisk, summary, detail, path, diff },
       signal,
     );
 

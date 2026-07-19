@@ -21,7 +21,9 @@ function resolveSafe(projectRoot, relPath = '.') {
 /**
  * Full directory walk on host (not model hallucination).
  * @param {string} projectRoot
- * @param {{maxDepth?:number,maxEntries?:number,includeSkippedMarkers?:boolean,showDot?:boolean,ignoreRules?:object[]}} opts
+ * @param {{maxDepth?:number,maxEntries?:number,includeSkippedMarkers?:boolean,showDot?:boolean,ignoreRules?:object[],ignorePrefix?:string}} opts
+ *   ignorePrefix: when walking a subdirectory, project-relative path of that dir
+ *   (e.g. "src") so gitignore rules from the project root match correctly.
  */
 function listTree(projectRoot, opts = {}) {
   const maxDepth = opts.maxDepth ?? 10;
@@ -29,6 +31,10 @@ function listTree(projectRoot, opts = {}) {
   const includeSkippedMarkers = opts.includeSkippedMarkers !== false;
   const showDot = opts.showDot === true;
   const ignoreRules = opts.ignoreRules || null;
+  const ignorePrefix = String(opts.ignorePrefix || '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '');
 
   const root = path.resolve(projectRoot);
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
@@ -42,6 +48,12 @@ function listTree(projectRoot, opts = {}) {
 
   function relFromRoot(full) {
     return path.relative(root, full).replace(/\\/g, '/');
+  }
+
+  function ignorePathFor(rel) {
+    if (!ignorePrefix) return rel;
+    if (!rel || rel === '.') return ignorePrefix;
+    return `${ignorePrefix}/${rel}`;
   }
 
   function walk(dir, depth) {
@@ -80,7 +92,7 @@ function listTree(projectRoot, opts = {}) {
       const full = path.join(dir, name);
       const rel = relFromRoot(full);
 
-      if (ignoreRules && isIgnored(rel, ignoreRules)) {
+      if (ignoreRules && isIgnored(ignorePathFor(rel), ignoreRules)) {
         continue;
       }
 
@@ -304,7 +316,12 @@ function streamCollectLines(fullPath, startLine, maxLines) {
   return { lines: selected, totalLines };
 }
 
-function searchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
+/**
+ * Compute search/replace result without writing disk.
+ * Same uniqueness / replaceAll rules as searchReplace.
+ * @returns {{ path: string, before: string, after: string, replacements: number }}
+ */
+function previewSearchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
   const oldS = String(oldString ?? '');
   const newS = String(newString ?? '');
   if (!oldS) throw new Error('old_string 为空');
@@ -330,11 +347,22 @@ function searchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
     const i = text.indexOf(oldS);
     next = text.slice(0, i) + newS + text.slice(i + oldS.length);
   }
-  fs.writeFileSync(full, next, 'utf8');
   return {
     path: relPath.replace(/\\/g, '/'),
+    before: text,
+    after: next,
     replacements: opts.replaceAll ? count : 1,
-    bytes: Buffer.byteLength(next, 'utf8'),
+  };
+}
+
+function searchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
+  const preview = previewSearchReplace(projectRoot, relPath, oldString, newString, opts);
+  const full = resolveSafe(projectRoot, relPath);
+  fs.writeFileSync(full, preview.after, 'utf8');
+  return {
+    path: preview.path,
+    replacements: preview.replacements,
+    bytes: Buffer.byteLength(preview.after, 'utf8'),
   };
 }
 
@@ -425,6 +453,7 @@ module.exports = {
   resolveSafe,
   listTree,
   readFile,
+  previewSearchReplace,
   searchReplace,
   writeFile,
   deletePath,

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const {
   parseTextToolCalls,
   executeToolFixed,
@@ -13,6 +14,21 @@ const {
 const { createPermissionGate } = require('../src/ai/permission');
 const { AGENT_EVENTS } = require('../src/ai/agent-events');
 const { isBlockedCommand, runTerminal } = require('../src/ai/terminal');
+
+let gitAvailable = true;
+try {
+  execFileSync('git', ['--version'], { stdio: 'ignore' });
+} catch {
+  gitAvailable = false;
+}
+
+function initTempRepo() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-git-'));
+  execFileSync('git', ['init'], { cwd: root });
+  execFileSync('git', ['config', 'user.email', 't@t'], { cwd: root });
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: root });
+  return root;
+}
 
 function fullAutoGate(extra = {}) {
   return createPermissionGate({
@@ -40,6 +56,168 @@ describe('agent tools', () => {
     const read = TOOL_DEFS.find((t) => t.function.name === 'read_file');
     assert.ok(read.function.parameters.properties.offset);
     assert.ok(read.function.parameters.properties.limit);
+  });
+
+  it('TOOL_DEFS includes git_status, git_diff, git_commit', () => {
+    const names = TOOL_DEFS.map((t) => t.function.name);
+    assert.ok(names.includes('git_status'));
+    assert.ok(names.includes('git_diff'));
+    assert.ok(names.includes('git_commit'));
+    const commit = TOOL_DEFS.find((t) => t.function.name === 'git_commit');
+    assert.ok(commit.function.parameters.required.includes('message'));
+    assert.ok(commit.function.parameters.properties.paths);
+  });
+
+  it('executeToolFixed git_status / git_diff / git_commit in temp repo', {
+    skip: !gitAvailable,
+  }, async () => {
+    const root = initTempRepo();
+    fs.writeFileSync(path.join(root, 'a.txt'), 'v1\n');
+    execFileSync('git', ['add', 'a.txt'], { cwd: root });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'a.txt'), 'v2\n');
+
+    const ctx = {
+      project: { name: 't', path: root },
+      settings: { terminalEnabled: false },
+      gate: fullAutoGate(),
+    };
+
+    const st = JSON.parse(await executeToolFixed('git_status', {}, ctx));
+    assert.equal(st.ok, true);
+    assert.ok(st.entries.some((e) => e.path === 'a.txt' || e.path.endsWith('a.txt')));
+
+    const d = JSON.parse(await executeToolFixed('git_diff', { path: 'a.txt' }, ctx));
+    assert.equal(d.ok, true);
+    assert.match(d.text, /v2/);
+
+    const c = JSON.parse(await executeToolFixed('git_commit', {
+      message: 'update a via agent',
+      paths: ['a.txt'],
+    }, ctx));
+    assert.equal(c.ok, true, c.error);
+    assert.ok(c.commit);
+  });
+
+  it('runAgentLoop full-auto git_commit via mock model', {
+    skip: !gitAvailable,
+  }, async () => {
+    const root = initTempRepo();
+    fs.writeFileSync(path.join(root, 'note.txt'), 'hello\n');
+    execFileSync('git', ['add', 'note.txt'], { cwd: root });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'note.txt'), 'hello world\n');
+
+    const gate = fullAutoGate();
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_gc',
+            type: 'function',
+            function: {
+              name: 'git_commit',
+              arguments: JSON.stringify({
+                message: 'agent commit note',
+                paths: ['note.txt'],
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '已提交' };
+    };
+
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        agentEnabled: true,
+        permissionMode: 'full-auto',
+      },
+      messages: [{ role: 'user', content: 'commit note' }],
+      gate,
+      chatFn,
+      sessionKey: 'git-commit-loop',
+    });
+
+    assert.ok(result.agentLog.some((s) => s.tool === 'git_commit' && s.ok === true));
+    const log = execFileSync('git', ['log', '-1', '--pretty=%s'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
+    assert.equal(log, 'agent commit note');
+  });
+
+  it('confirm-writes git_commit authorize detail includes message and paths', {
+    skip: !gitAvailable,
+  }, async () => {
+    const root = initTempRepo();
+    fs.writeFileSync(path.join(root, 'x.txt'), 'a\n');
+    execFileSync('git', ['add', 'x.txt'], { cwd: root });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'x.txt'), 'b\n');
+
+    const approvals = [];
+    const gate = {
+      authorize: async (p) => {
+        approvals.push(p);
+        return { allowed: false, reason: '用户拒绝' };
+      },
+    };
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_gc_deny',
+            type: 'function',
+            function: {
+              name: 'git_commit',
+              arguments: JSON.stringify({
+                message: 'should not land',
+                paths: ['x.txt'],
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '已拒绝' };
+    };
+
+    await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        permissionMode: 'confirm-writes',
+      },
+      messages: [{ role: 'user', content: 'commit' }],
+      gate,
+      chatFn,
+      sessionKey: 'git-commit-detail',
+    });
+
+    assert.ok(approvals.length >= 1);
+    assert.equal(approvals[0].tool, 'git_commit');
+    assert.equal(approvals[0].risk, 'write');
+    assert.match(String(approvals[0].detail || ''), /message: should not land/);
+    assert.match(String(approvals[0].detail || ''), /paths: x\.txt/);
+    // deny before stage/commit: still dirty
+    const st = execFileSync('git', ['status', '--porcelain'], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    assert.match(st, /x\.txt/);
   });
 
   it('executeToolFixed list_dir and write_file', async () => {
@@ -199,6 +377,194 @@ describe('agent tools', () => {
 
     assert.equal(fs.readFileSync(path.join(root, 'a.js'), 'utf8'), 'const x = 1;\n');
     assert.ok(result.agentLog.some((s) => s.tool === 'search_replace' && s.ok === false));
+  });
+
+  it('confirm-writes search_replace deny leaves disk unchanged and approval has diff shape', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-diff-deny-'));
+    const filePath = path.join(root, 'a.js');
+    const original = 'const x = 1;\n';
+    fs.writeFileSync(filePath, original);
+
+    const approvals = [];
+    const gate = {
+      authorize: async (p) => {
+        approvals.push(p);
+        return { allowed: false, reason: '用户拒绝' };
+      },
+    };
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_sr',
+            type: 'function',
+            function: {
+              name: 'search_replace',
+              arguments: JSON.stringify({
+                path: 'a.js',
+                old_string: 'const x = 1;',
+                new_string: 'const x = 2;',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '已拒绝' };
+    };
+
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        permissionMode: 'confirm-writes',
+      },
+      messages: [{ role: 'user', content: 'edit' }],
+      gate,
+      chatFn,
+      sessionKey: 'diff-deny',
+    });
+
+    assert.equal(fs.readFileSync(filePath, 'utf8'), original);
+    assert.ok(approvals.length >= 1, 'authorize should be called');
+    const payload = approvals[0];
+    assert.equal(payload.tool, 'search_replace');
+    assert.ok(payload.diff, 'diff payload required');
+    assert.ok(payload.diff.stats && typeof payload.diff.stats.additions === 'number');
+    assert.ok(
+      payload.diff.isBinary === true
+        || typeof payload.diff.text === 'string',
+      'diff must have text or isBinary'
+    );
+    assert.ok(result.agentLog.some((s) => s.tool === 'search_replace' && s.ok === false));
+    assert.ok(Array.isArray(result.fileChanges));
+    assert.equal(result.fileChanges.length, 0);
+  });
+
+  it('confirm-writes search_replace allow applies approved preview.after content', async () => {
+    // Integrity: after allow, agent writes preview.after (not re-run searchReplace).
+    // TOCTOU: external file changes between preview and write are still possible.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-sr-allow-'));
+    const filePath = path.join(root, 'a.js');
+    const original = 'const x = 1;\nconst y = 2;\n';
+    fs.writeFileSync(filePath, original);
+
+    const gate = {
+      authorize: async () => ({ allowed: true }),
+    };
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_sr_allow',
+            type: 'function',
+            function: {
+              name: 'search_replace',
+              arguments: JSON.stringify({
+                path: 'a.js',
+                old_string: 'const x = 1;',
+                new_string: 'const x = 99;',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '已修改' };
+    };
+
+    const events = [];
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        permissionMode: 'confirm-writes',
+      },
+      messages: [{ role: 'user', content: 'edit' }],
+      gate,
+      onEvent: (e) => events.push(e),
+      chatFn,
+      sessionKey: 'sr-allow',
+    });
+
+    assert.equal(fs.readFileSync(filePath, 'utf8'), 'const x = 99;\nconst y = 2;\n');
+    assert.ok(result.agentLog.some((s) => s.tool === 'search_replace' && s.ok === true));
+    assert.ok(result.applied.some((a) => a.path === 'a.js' && a.mode === 'search_replace'));
+    const types = events.map((e) => e.type);
+    const fcIdx = types.findIndex(
+      (t) => t === AGENT_EVENTS.FILE_CHANGE || t === 'file-change'
+    );
+    const teIdx = types.findIndex(
+      (t) => t === AGENT_EVENTS.TOOL_END || t === 'tool-end'
+    );
+    assert.ok(fcIdx >= 0 && teIdx >= 0, 'FILE_CHANGE and TOOL_END expected');
+    assert.ok(fcIdx < teIdx, 'FILE_CHANGE should precede TOOL_END');
+  });
+
+  it('full-auto write emits file-change and returns fileChanges', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-file-change-'));
+    const events = [];
+    const gate = fullAutoGate();
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'new.txt',
+                content: 'hello-phase-b\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '写好了' };
+    };
+
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        agentEnabled: true,
+        permissionMode: 'full-auto',
+      },
+      messages: [{ role: 'user', content: 'write' }],
+      gate,
+      onEvent: (e) => events.push(e),
+      chatFn,
+      sessionKey: 'file-change',
+    });
+
+    assert.equal(fs.readFileSync(path.join(root, 'new.txt'), 'utf8'), 'hello-phase-b\n');
+    const fileChangeEvents = events.filter(
+      (e) => e.type === AGENT_EVENTS.FILE_CHANGE || e.type === 'file-change'
+    );
+    assert.ok(fileChangeEvents.length >= 1, 'FILE_CHANGE event expected');
+    assert.equal(fileChangeEvents[0].path, 'new.txt');
+    assert.ok(['create', 'write'].includes(fileChangeEvents[0].op));
+    assert.ok(fileChangeEvents[0].stats);
+    assert.ok(Array.isArray(result.fileChanges));
+    assert.ok(result.fileChanges.length >= 1);
+    assert.equal(result.fileChanges[0].path, 'new.txt');
+    assert.ok(result.fileChanges[0].stats);
   });
 
   it('write fence deny does not claim 已写入 and does not write disk', async () => {

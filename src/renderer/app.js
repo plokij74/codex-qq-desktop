@@ -1,5 +1,6 @@
 /* Codex QQ Desktop */
 const STORAGE_KEY = 'codex-qq-state-v2';
+const TERM_COLLAPSED_KEY = 'codex-qq-term-collapsed';
 const SEED_KV = [
   '结构确认没问题：','',
   '- `redeem_codes`、`push_tokens` 与 migration 一致。',
@@ -51,12 +52,384 @@ let sending = false;
 /** Active agent/stream run for the current send (event-driven UI). */
 let chatRun = null;
 
+/** Manual / agent terminal panel state (shared output; multi-termId aware). */
+let termState = {
+  /** @type {Map<string, { source: string, command: string }>} */
+  runs: new Map(),
+  stickBottom: true,
+  pendingApproval: null,
+};
+
+function anyTermRunning() {
+  return termState.runs.size > 0;
+}
+
+function hasManualTermRunning() {
+  for (const r of termState.runs.values()) {
+    if (r.source === 'user') return true;
+  }
+  return false;
+}
+
+function manualTermId() {
+  for (const [id, r] of termState.runs.entries()) {
+    if (r.source === 'user') return id;
+  }
+  return null;
+}
+
 function setSending(on) {
   sending = !!on;
   const btn = document.getElementById('btn-send');
   const stop = document.getElementById('btn-stop');
   if (btn) btn.disabled = sending;
   if (stop) stop.classList.toggle('hidden', !sending);
+}
+
+function isTermCollapsed() {
+  try {
+    return localStorage.getItem(TERM_COLLAPSED_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+function setTermCollapsed(collapsed) {
+  try {
+    localStorage.setItem(TERM_COLLAPSED_KEY, collapsed ? '1' : '0');
+  } catch { /* ignore */ }
+  const panel = document.getElementById('terminal-panel');
+  if (panel) panel.classList.toggle('collapsed', !!collapsed);
+}
+
+function updateTermRunningUi() {
+  const anyRunning = anyTermRunning();
+  const manualRunning = hasManualTermRunning();
+  const stopBtn = document.getElementById('btn-term-stop');
+  const runBtn = document.getElementById('btn-term-run');
+  const input = document.getElementById('terminal-input');
+  const toggle = document.getElementById('btn-term-toggle');
+  const status = document.getElementById('term-status');
+  // Stop is only for manual (source=user) runs; agent runs use chat 停止.
+  if (stopBtn) {
+    stopBtn.classList.toggle('hidden', !manualRunning);
+    stopBtn.textContent = '停止命令';
+    stopBtn.disabled = !manualRunning;
+  }
+  // Allow typing/starting another command only when no manual run is active.
+  if (runBtn) runBtn.disabled = manualRunning;
+  if (input) input.disabled = manualRunning;
+  if (toggle) toggle.classList.toggle('is-running', anyRunning);
+  if (status) {
+    status.classList.toggle('is-running', anyRunning);
+    if (!anyRunning && !termState.pendingApproval) {
+      /* leave last status text unless cleared elsewhere */
+    } else if (anyRunning) {
+      const parts = [];
+      for (const r of termState.runs.values()) {
+        const src = r.source === 'agent' ? 'Agent' : '手动';
+        parts.push(`${src}: ${String(r.command || '').slice(0, 40)}`);
+      }
+      status.textContent = '运行中：' + parts.join(' | ');
+      status.classList.remove('is-error');
+    }
+  }
+}
+
+function clearTermApprovalUi() {
+  termState.pendingApproval = null;
+  const box = document.getElementById('term-approval');
+  if (box) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+  }
+}
+
+function renderTermApprovalCard(ev) {
+  const box = document.getElementById('term-approval');
+  if (!box) return;
+  termState.pendingApproval = ev;
+  box.classList.remove('hidden');
+  // Expand panel so user sees approval
+  setTermCollapsed(false);
+  const title = '需要确认：' + (ev.tool || 'run_terminal') + (ev.risk ? '（' + ev.risk + '）' : '');
+  box.innerHTML =
+    '<div class="appr-title">' + escapeHtml(title) + '</div>' +
+    '<div class="appr-summary">' + escapeHtml(ev.summary || ev.detail || '') + '</div>' +
+    '<div class="appr-actions">' +
+      '<button type="button" class="appr-btn" data-decision="allow">允许</button>' +
+      '<button type="button" class="appr-btn appr-deny" data-decision="deny">拒绝</button>' +
+      '<button type="button" class="appr-btn appr-session" data-decision="allow_session">本会话始终允许此类</button>' +
+    '</div>';
+  box.querySelectorAll('.appr-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!termState.pendingApproval) return;
+      box.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await window.codex.approveChat({
+          approvalId: ev.approvalId,
+          decision: btn.dataset.decision,
+        });
+        if (!res?.ok) {
+          box.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = false; });
+          toast(res?.error || '审批失败');
+          return;
+        }
+        // Resolved event also clears; optimistic clear for snappy UI
+        clearTermApprovalUi();
+      } catch (e) {
+        box.querySelectorAll('.appr-btn').forEach((b) => { b.disabled = false; });
+        toast(e?.message || String(e));
+      }
+    });
+  });
+  const status = document.getElementById('term-status');
+  if (status) {
+    status.textContent = '等待确认终端命令…';
+    status.classList.remove('is-error');
+  }
+}
+
+function appendTermLine(text, className) {
+  const out = document.getElementById('terminal-output');
+  if (!out) return;
+  const line = document.createElement('div');
+  line.className = 'term-line' + (className ? ' ' + className : '');
+  line.textContent = text;
+  out.appendChild(line);
+  // Soft cap ~200k chars of textContent
+  while (out.textContent.length > 200000 && out.firstChild) {
+    out.removeChild(out.firstChild);
+  }
+  if (termState.stickBottom) {
+    out.scrollTop = out.scrollHeight;
+  }
+}
+
+function appendTermChunk(stream, chunk) {
+  const out = document.getElementById('terminal-output');
+  if (!out || chunk == null) return;
+  const cls = stream === 'stderr' ? 'term-stderr' : 'term-stdout';
+  // Prefer append to last matching span-less line for fewer nodes; simple: new text node block
+  let last = out.lastElementChild;
+  if (last && last.classList.contains(cls) && last.dataset.open === '1') {
+    last.textContent += String(chunk);
+  } else {
+    last = document.createElement('div');
+    last.className = 'term-line ' + cls;
+    last.dataset.open = '1';
+    last.textContent = String(chunk);
+    out.appendChild(last);
+  }
+  while (out.textContent.length > 200000 && out.firstChild) {
+    out.removeChild(out.firstChild);
+  }
+  if (termState.stickBottom) {
+    out.scrollTop = out.scrollHeight;
+  }
+}
+
+function closeOpenTermChunks() {
+  const out = document.getElementById('terminal-output');
+  if (!out) return;
+  out.querySelectorAll('.term-line[data-open="1"]').forEach((el) => {
+    delete el.dataset.open;
+  });
+}
+
+function handleTerminalPanelEvent(ev) {
+  if (!ev || !ev.type) return false;
+  const type = ev.type;
+  if (type === 'terminal-start') {
+    const termId = ev.termId || `anon_${Date.now()}`;
+    const source = ev.source === 'agent' ? 'agent' : 'user';
+    termState.runs.set(termId, { source, command: String(ev.command || '') });
+    termState.stickBottom = true;
+    clearTermApprovalUi();
+    updateTermRunningUi();
+    setTermCollapsed(false);
+    const src = source === 'agent' ? 'Agent' : '手动';
+    appendTermLine(`$ ${ev.command || ''}`, 'term-meta');
+    if (ev.cwd) appendTermLine(`cwd: ${ev.cwd}  [${src}] termId=${termId}`, 'term-meta');
+    return true;
+  }
+  if (type === 'terminal-output') {
+    // Multi-term: prefix stream when concurrent runs exist; never drop other termIds.
+    const multi = termState.runs.size > 1;
+    const prefix = multi && ev.termId ? `[${String(ev.termId).slice(-6)}] ` : '';
+    const chunk = prefix ? prefix + String(ev.chunk || '') : ev.chunk;
+    appendTermChunk(ev.stream || 'stdout', chunk);
+    return true;
+  }
+  if (type === 'terminal-end') {
+    const termId = ev.termId || null;
+    if (termId) termState.runs.delete(termId);
+    else {
+      // Legacy/no-id: clear all user runs as best effort
+      for (const [id, r] of [...termState.runs.entries()]) {
+        if (r.source === 'user') termState.runs.delete(id);
+      }
+    }
+    closeOpenTermChunks();
+    const fail = ev.ok === false || ev.aborted || ev.timedOut;
+    let summary = ev.summary || `exit=${ev.code}`;
+    if (ev.aborted) summary = '已停止';
+    else if (ev.timedOut) summary = '超时 ' + summary;
+    if (termId) summary = `[${String(termId).slice(-6)}] ${summary}`;
+    appendTermLine(summary, 'term-end' + (fail ? ' is-fail' : ''));
+    updateTermRunningUi();
+    const status = document.getElementById('term-status');
+    if (status && !anyTermRunning()) {
+      status.textContent = summary;
+      status.classList.toggle('is-error', fail);
+      status.classList.remove('is-running');
+    }
+    return true;
+  }
+  // Manual-terminal approval when no chatRun (or source user)
+  if (type === 'approval-needed' && (ev.source === 'user' || !chatRun || chatRun.finalized)) {
+    // If chatRun is active and this is agent approval, let chat handler take it
+    if (chatRun && !chatRun.finalized && ev.source !== 'user') return false;
+    renderTermApprovalCard(ev);
+    return true;
+  }
+  if (type === 'approval-resolved' && termState.pendingApproval
+    && String(termState.pendingApproval.approvalId) === String(ev.approvalId)) {
+    clearTermApprovalUi();
+    return true;
+  }
+  return false;
+}
+
+async function runManualTerminal() {
+  if (hasManualTermRunning()) {
+    toast('已有手动命令在运行');
+    return;
+  }
+  const input = document.getElementById('terminal-input');
+  const command = (input?.value || '').trim();
+  if (!command) return;
+
+  const session = activeSession();
+  const proj = sessionProject(session);
+  if (!session || !proj?.path) {
+    toast('请先打开已绑定目录的项目会话');
+    return;
+  }
+
+  let settings;
+  try {
+    settings = await window.codex.getSettings();
+  } catch (e) {
+    toast(e?.message || String(e));
+    return;
+  }
+  if (!settings.terminalEnabled) {
+    toast('请先在设置中开启「允许终端命令」');
+    return;
+  }
+
+  if (!window.codex?.runTerminal) {
+    toast('终端 API 不可用');
+    return;
+  }
+
+  setTermCollapsed(false);
+  // Optimistic placeholder until terminal-start (deny path has no start).
+  const pendingId = `pending_user_${Date.now().toString(36)}`;
+  termState.runs.set(pendingId, { source: 'user', command });
+  updateTermRunningUi();
+
+  try {
+    const res = await window.codex.runTerminal({
+      sessionId: session.id,
+      projectPath: proj.path,
+      command,
+    });
+    // Drop optimistic pending once real start arrived (or on failure without start).
+    termState.runs.delete(pendingId);
+    if (res && res.ok === false && !res.aborted) {
+      // Events may already have painted end; ensure UI not stuck if no START was emitted (deny)
+      if (!hasManualTermRunning()) {
+        updateTermRunningUi();
+        appendTermLine(res.error || '执行失败', 'term-end is-fail');
+        const status = document.getElementById('term-status');
+        if (status) {
+          status.textContent = res.error || '执行失败';
+          status.classList.add('is-error');
+        }
+        toast(res.error || '执行失败');
+      }
+    } else if (input) {
+      input.value = '';
+    }
+    updateTermRunningUi();
+  } catch (e) {
+    termState.runs.delete(pendingId);
+    // Clear stuck manual runs without term end
+    for (const [id, r] of [...termState.runs.entries()]) {
+      if (r.source === 'user' && String(id).startsWith('pending_')) termState.runs.delete(id);
+    }
+    updateTermRunningUi();
+    const msg = (e?.message || String(e)).replace(/^Error invoking remote method '[^']+':\s*/i, '').replace(/^Error:\s*/i, '');
+    appendTermLine(msg, 'term-end is-fail');
+    toast(msg);
+  } finally {
+    termState.runs.delete(pendingId);
+    updateTermRunningUi();
+  }
+}
+
+async function stopManualTerminal() {
+  try {
+    if (window.codex?.stopTerminal) {
+      await window.codex.stopTerminal({ sessionId: activeSession()?.id });
+    }
+  } catch (e) {
+    toast(e?.message || String(e));
+  }
+}
+
+function clearTerminalOutput() {
+  const out = document.getElementById('terminal-output');
+  if (out) out.innerHTML = '';
+  if (window.codex?.clearTerminal) {
+    window.codex.clearTerminal().catch(() => {});
+  }
+}
+
+function bindTerminalPanel() {
+  const panel = document.getElementById('terminal-panel');
+  if (!panel) return;
+  setTermCollapsed(isTermCollapsed());
+
+  document.getElementById('btn-term-toggle')?.addEventListener('click', () => {
+    const collapsed = panel.classList.contains('collapsed');
+    setTermCollapsed(!collapsed);
+  });
+  document.getElementById('btn-term-clear')?.addEventListener('click', () => {
+    clearTerminalOutput();
+  });
+  document.getElementById('btn-term-stop')?.addEventListener('click', () => {
+    stopManualTerminal();
+  });
+  document.getElementById('btn-term-run')?.addEventListener('click', () => {
+    runManualTerminal().catch((e) => toast(e?.message || String(e)));
+  });
+  document.getElementById('terminal-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      runManualTerminal().catch((err) => toast(err?.message || String(err)));
+    }
+  });
+  const out = document.getElementById('terminal-output');
+  if (out) {
+    out.addEventListener('scroll', () => {
+      const nearBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+      termState.stickBottom = nearBottom;
+    });
+  }
+  updateTermRunningUi();
 }
 
 /** Local cancel token for friend mock / short delays */
@@ -182,6 +555,37 @@ function renderMarkdownLite(text) {
   }).join('');
 }
 function peerName(peerId) { return FRIENDS.find((f) => f.id === peerId)?.name || 'Codex 小蓝'; }
+function fileChangesStripHtml(changes) {
+  if (!Array.isArray(changes) || !changes.length) return '';
+  const n = changes.length;
+  const pathsHtml = changes
+    .map((c) => {
+      const op = c.op ? '<span class="file-change-op">' + escapeHtml(String(c.op)) + '</span> ' : '';
+      return '<li>' + op + escapeHtml(String(c.path || '')) + '</li>';
+    })
+    .join('');
+  return (
+    '<div class="file-changes-strip">' +
+      '<button type="button" class="file-changes-toggle" aria-expanded="false">本轮改动 (' + n + ')</button>' +
+      '<ul class="file-changes-list is-collapsed">' + pathsHtml + '</ul>' +
+    '</div>'
+  );
+}
+
+function bindFileChangesToggles(root) {
+  if (!root) return;
+  root.querySelectorAll('.file-changes-strip').forEach((strip) => {
+    const btn = strip.querySelector('.file-changes-toggle');
+    const listEl = strip.querySelector('.file-changes-list');
+    if (!btn || !listEl || btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', () => {
+      const open = listEl.classList.toggle('is-collapsed') === false;
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  });
+}
+
 function renderMessages() {
   const list = document.getElementById('message-list'); if (!list) return;
   const session = activeSession(); const msgs = session?.messages || [];
@@ -192,8 +596,10 @@ function renderMessages() {
     const roleClass = msg.role === 'user' ? 'msg-user' : 'msg-assistant';
     const errClass = msg.error ? ' msg-error' : '';
     const who = msg.role === 'user' ? '我' : botName;
-    return '<div class="msg '+roleClass+errClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+renderMarkdownLite(msg.content)+'</div></div>';
+    const strip = msg.role === 'assistant' ? fileChangesStripHtml(msg.fileChanges) : '';
+    return '<div class="msg '+roleClass+errClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+strip+renderMarkdownLite(msg.content)+'</div></div>';
   }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '');
+  bindFileChangesToggles(list);
   if (liveRun && chatRun.el) {
     list.appendChild(chatRun.el);
   }
@@ -236,6 +642,7 @@ function createAssistantRunPlaceholder(sessionId) {
     textBuffer: '',
     contentFinal: null,
     applied: null,
+    fileChanges: [],
     doneEvent: false,
     invokeDone: false,
     finalized: false,
@@ -280,17 +687,83 @@ function decisionLabel(decision) {
   return decision || '';
 }
 
+function buildApprovalBodyHtml(ev) {
+  const diff = ev.diff;
+  const detail = ev.detail || '';
+  if (diff?.isBinary) {
+    return '<div class="appr-diff-note">二进制文件，无文本 diff</div>';
+  }
+  if (diff?.text) {
+    let html = '<pre class="appr-diff">' + escapeHtml(String(diff.text)) + '</pre>';
+    if (diff.truncated) {
+      const a = diff.stats && diff.stats.additions != null ? diff.stats.additions : 0;
+      const d = diff.stats && diff.stats.deletions != null ? diff.stats.deletions : 0;
+      html += '<div class="appr-diff-note">（diff 已截断，+' + a + '/-' + d + '）</div>';
+    }
+    return html;
+  }
+  if (detail) {
+    return '<pre class="appr-detail">' + escapeHtml(detail) + '</pre>';
+  }
+  return '';
+}
+
+function mergeFileChangeEntry(list, entry) {
+  if (!entry || !entry.path) return;
+  const path = String(entry.path);
+  const existing = list.find((c) => c.path === path);
+  if (existing) {
+    if (entry.op) existing.op = entry.op;
+    if (entry.stats) existing.stats = entry.stats;
+    return;
+  }
+  list.push({ path, op: entry.op || 'write', stats: entry.stats || null });
+}
+
+function renderFileChangesStrip() {
+  if (!chatRun?.el) return;
+  const changes = Array.isArray(chatRun.fileChanges) ? chatRun.fileChanges : [];
+  if (!changes.length) return;
+  const bubble = chatRun.el.querySelector('.bubble') || chatRun.el;
+  let strip = chatRun.el.querySelector('.file-changes-strip');
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.className = 'file-changes-strip';
+    // Prefer under timeline (before stream body)
+    if (chatRun.timelineEl && chatRun.timelineEl.parentNode === bubble) {
+      const after = chatRun.timelineEl.nextSibling;
+      bubble.insertBefore(strip, after);
+    } else if (chatRun.streamEl && chatRun.streamEl.parentNode === bubble) {
+      bubble.insertBefore(strip, chatRun.streamEl);
+    } else {
+      bubble.appendChild(strip);
+    }
+  }
+  const n = changes.length;
+  const pathsHtml = changes
+    .map((c) => {
+      const op = c.op ? '<span class="file-change-op">' + escapeHtml(String(c.op)) + '</span> ' : '';
+      return '<li>' + op + escapeHtml(String(c.path)) + '</li>';
+    })
+    .join('');
+  strip.innerHTML =
+    '<button type="button" class="file-changes-toggle" aria-expanded="false">本轮改动 (' + n + ')</button>' +
+    '<ul class="file-changes-list is-collapsed">' + pathsHtml + '</ul>';
+  bindFileChangesToggles(strip);
+  scrollToBottom();
+}
+
 function renderApprovalCard(ev) {
   if (!chatRun?.timelineEl) return;
   const card = document.createElement('div');
   card.className = 'approval-card';
   card.dataset.approvalId = ev.approvalId || '';
   const title = '需要确认：' + (ev.tool || '操作') + (ev.risk ? '（' + ev.risk + '）' : '');
-  const detail = ev.detail || '';
+  const body = buildApprovalBodyHtml(ev);
   card.innerHTML =
     '<div class="appr-title">' + escapeHtml(title) + '</div>' +
     '<div class="appr-summary">' + escapeHtml(ev.summary || ev.path || '') + '</div>' +
-    (detail ? '<pre class="appr-detail">' + escapeHtml(detail) + '</pre>' : '') +
+    body +
     '<div class="appr-actions">' +
       '<button type="button" class="appr-btn" data-decision="allow">允许</button>' +
       '<button type="button" class="appr-btn appr-deny" data-decision="deny">拒绝</button>' +
@@ -364,10 +837,14 @@ function finalizeChatRun(opts = {}) {
   }
   disableApprovalCards(chatRun.el);
 
+  const fileChanges = Array.isArray(chatRun.fileChanges) && chatRun.fileChanges.length
+    ? chatRun.fileChanges.slice()
+    : undefined;
   session.messages.push({
     role: 'assistant',
     content,
     error: Boolean(error && !aborted),
+    ...(fileChanges ? { fileChanges } : {}),
   });
   session.updatedAt = Date.now();
   chatRun.finalized = true;
@@ -381,7 +858,12 @@ function finalizeChatRun(opts = {}) {
 }
 
 function handleChatEvent(ev) {
-  if (!ev || !chatRun || chatRun.finalized) return;
+  if (!ev) return;
+  // Terminal panel events (agent + manual) always go to the shared panel.
+  // Manual approvals may also land here without an active chatRun.
+  if (handleTerminalPanelEvent(ev)) return;
+
+  if (!chatRun || chatRun.finalized) return;
   // Route by active run once runId is known; accept first event to bind runId
   if (chatRun.runId && ev.runId && chatRun.runId !== ev.runId) return;
   if (chatRun.sessionId !== activeSessionId && chatRun.sessionId !== activeSession()?.id) {
@@ -423,6 +905,15 @@ function handleChatEvent(ev) {
     setRunStatus('生成中…');
     return;
   }
+  if (type === 'file-change') {
+    if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
+    mergeFileChangeEntry(chatRun.fileChanges, {
+      path: ev.path,
+      op: ev.op,
+      stats: ev.stats,
+    });
+    return;
+  }
   if (type === 'turn-end') {
     return;
   }
@@ -430,6 +921,13 @@ function handleChatEvent(ev) {
     chatRun.doneEvent = true;
     if (ev.content != null) chatRun.contentFinal = String(ev.content);
     if (ev.applied) chatRun.applied = ev.applied;
+    if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
+    if (Array.isArray(ev.fileChanges) && ev.fileChanges.length) {
+      for (const fc of ev.fileChanges) mergeFileChangeEntry(chatRun.fileChanges, fc);
+    }
+    if (chatRun.fileChanges.length) {
+      renderFileChangesStrip();
+    }
     if (chatRun.streamEl) {
       chatRun.streamEl.classList.remove('is-streaming');
       if (chatRun.contentFinal != null) {
@@ -741,6 +1239,224 @@ function insertAtCursor(textarea, text) {
   const v = textarea.value; textarea.value = v.slice(0, start) + text + v.slice(end);
   const pos = start + text.length; textarea.selectionStart = textarea.selectionEnd = pos;
 }
+
+/* ========== @ 路径补全 ========== */
+let atCompleteState = {
+  open: false,
+  items: [],
+  index: 0,
+  tokenStart: 0,
+  tokenEnd: 0,
+  prefix: '',
+  reqId: 0,
+};
+let atCompleteTimer = null;
+
+function ensureAtCompletePopup() {
+  let el = document.getElementById('at-complete-popup');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'at-complete-popup';
+  el.className = 'at-complete-popup hidden';
+  el.setAttribute('role', 'listbox');
+  el.setAttribute('aria-label', '@ 路径补全');
+  const composer = document.querySelector('.composer');
+  if (composer) {
+    if (getComputedStyle(composer).position === 'static') {
+      composer.style.position = 'relative';
+    }
+    composer.appendChild(el);
+  } else {
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function hideAtComplete() {
+  atCompleteState.open = false;
+  atCompleteState.items = [];
+  atCompleteState.index = 0;
+  const el = document.getElementById('at-complete-popup');
+  if (el) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+  }
+}
+
+/**
+ * Detect @token at cursor: @ + path chars (no space). Stops at :line-range.
+ * @returns {{ start: number, end: number, prefix: string } | null}
+ */
+function findAtTokenAtCursor(text, cursor) {
+  if (cursor == null || cursor < 0) return null;
+  let i = cursor - 1;
+  while (i >= 0) {
+    const ch = text[i];
+    if (/\s/.test(ch) || ch === '`' || ch === '"' || ch === "'" || ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}' || ch === ',' || ch === ';' || ch === '!' || ch === '?') {
+      break;
+    }
+    i -= 1;
+  }
+  const start = i + 1;
+  if (start >= cursor) return null;
+  if (text[start] !== '@') return null;
+  // skip email-like: word@path without space — require start-of-text or whitespace before @
+  if (start > 0 && !/\s/.test(text[start - 1])) return null;
+  const body = text.slice(start + 1, cursor);
+  // no range complete (foo:1-10)
+  if (body.includes(':')) return null;
+  // allow empty prefix after @
+  if (!/^[\w./\\%-]*$/.test(body)) return null;
+  return { start, end: cursor, prefix: body.replace(/\\/g, '/') };
+}
+
+function renderAtCompletePopup() {
+  const el = ensureAtCompletePopup();
+  if (!atCompleteState.open || !atCompleteState.items.length) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+  el.classList.remove('hidden');
+  el.innerHTML = atCompleteState.items.map((item, i) => {
+    const kind = item.type === 'dir' ? '目录' : '文件';
+    const active = i === atCompleteState.index ? ' is-active' : '';
+    return (
+      '<button type="button" class="at-complete-item' + active + '" data-idx="' + i + '" role="option" aria-selected="' +
+      (i === atCompleteState.index ? 'true' : 'false') + '">' +
+      '<span class="at-complete-path">' + escapeHtml(item.path) + (item.type === 'dir' ? '/' : '') + '</span>' +
+      '<span class="at-complete-kind">' + kind + '</span>' +
+      '</button>'
+    );
+  }).join('');
+  el.querySelectorAll('.at-complete-item').forEach((btn) => {
+    btn.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const idx = Number(btn.dataset.idx);
+      applyAtComplete(idx);
+    });
+  });
+  const active = el.querySelector('.at-complete-item.is-active');
+  if (active && typeof active.scrollIntoView === 'function') {
+    active.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function applyAtComplete(idx) {
+  const item = atCompleteState.items[idx];
+  const input = document.getElementById('chat-input');
+  if (!item || !input) {
+    hideAtComplete();
+    return;
+  }
+  const insert = '@' + item.path + (item.type === 'dir' ? '/' : '');
+  const v = input.value;
+  const before = v.slice(0, atCompleteState.tokenStart);
+  const after = v.slice(atCompleteState.tokenEnd);
+  input.value = before + insert + after;
+  const pos = before.length + insert.length;
+  input.selectionStart = input.selectionEnd = pos;
+  input.focus();
+  hideAtComplete();
+  // dir: keep completing for nested paths
+  if (item.type === 'dir') {
+    scheduleAtCompleteRefresh();
+  }
+}
+
+async function refreshAtComplete() {
+  const input = document.getElementById('chat-input');
+  if (!input || !window.codex?.atRefComplete) {
+    hideAtComplete();
+    return;
+  }
+  const text = input.value || '';
+  const cursor = input.selectionStart ?? text.length;
+  const token = findAtTokenAtCursor(text, cursor);
+  if (!token) {
+    hideAtComplete();
+    return;
+  }
+  const session = activeSession();
+  const proj = sessionProject(session);
+  if (!proj?.path) {
+    hideAtComplete();
+    return;
+  }
+  const reqId = ++atCompleteState.reqId;
+  atCompleteState.tokenStart = token.start;
+  atCompleteState.tokenEnd = token.end;
+  atCompleteState.prefix = token.prefix;
+  try {
+    const res = await window.codex.atRefComplete({
+      projectPath: proj.path,
+      prefix: token.prefix,
+    });
+    if (reqId !== atCompleteState.reqId) return;
+    const items = Array.isArray(res?.items) ? res.items : [];
+    if (!items.length) {
+      hideAtComplete();
+      return;
+    }
+    atCompleteState.open = true;
+    atCompleteState.items = items;
+    atCompleteState.index = 0;
+    renderAtCompletePopup();
+  } catch {
+    if (reqId === atCompleteState.reqId) hideAtComplete();
+  }
+}
+
+function scheduleAtCompleteRefresh() {
+  if (atCompleteTimer) clearTimeout(atCompleteTimer);
+  atCompleteTimer = setTimeout(() => {
+    atCompleteTimer = null;
+    refreshAtComplete().catch(() => {});
+  }, 100);
+}
+
+function onAtCompleteKeydown(e) {
+  if (!atCompleteState.open || !atCompleteState.items.length) return false;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    atCompleteState.index = (atCompleteState.index + 1) % atCompleteState.items.length;
+    renderAtCompletePopup();
+    return true;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    atCompleteState.index = (atCompleteState.index - 1 + atCompleteState.items.length) % atCompleteState.items.length;
+    renderAtCompletePopup();
+    return true;
+  }
+  if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+    e.preventDefault();
+    applyAtComplete(atCompleteState.index);
+    return true;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    hideAtComplete();
+    return true;
+  }
+  return false;
+}
+
+function bindAtComplete() {
+  const input = document.getElementById('chat-input');
+  if (!input) return;
+  input.addEventListener('input', () => scheduleAtCompleteRefresh());
+  input.addEventListener('click', () => scheduleAtCompleteRefresh());
+  input.addEventListener('keyup', (e) => {
+    if (['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(e.key)) return;
+    scheduleAtCompleteRefresh();
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#at-complete-popup') && e.target !== input) {
+      hideAtComplete();
+    }
+  });
+}
 function renderAttachPreview() {
   const box = document.getElementById('attach-preview');
   if (!pendingAttaches.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
@@ -820,6 +1536,7 @@ async function saveSettingsFromForm() {
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
   await window.codex.saveSettings(partial); closeSettings(); await updateStatusBar(); toast('设置已保存');
+  // Refresh terminal input enablement hint via status only; gate still enforces at run time.
 }
 async function sendMessage() {
   if (sending) return;
@@ -834,7 +1551,7 @@ async function sendMessage() {
   }
   session.messages.push({ role: 'user', content: text }); session.updatedAt = Date.now();
   sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
-  input.value = ''; pendingAttaches = []; renderAttachPreview(); setSending(true); saveState();
+  input.value = ''; pendingAttaches = []; renderAttachPreview(); hideAtComplete(); setSending(true); saveState();
   if (session.peer && session.peer !== 'codex') {
     renderMessages(); renderLeftDynamic();
     const token = { aborted: false };
@@ -878,6 +1595,11 @@ async function sendMessage() {
         chatRun.contentFinal = String(invokeResult.content);
       }
       if (!chatRun.applied && invokeResult.applied) chatRun.applied = invokeResult.applied;
+      if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
+      if (Array.isArray(invokeResult.fileChanges) && invokeResult.fileChanges.length) {
+        for (const fc of invokeResult.fileChanges) mergeFileChangeEntry(chatRun.fileChanges, fc);
+      }
+      if (chatRun.fileChanges.length) renderFileChangesStrip();
       // Prefer event content already set; ensure final content exists
       const content = chatRun.contentFinal != null ? chatRun.contentFinal : (invokeResult.content || chatRun.textBuffer || '');
       finalizeChatRun({ content, applied: chatRun.applied || invokeResult.applied });
@@ -923,7 +1645,10 @@ async function sendMessage() {
 function bindEvents() {
   document.getElementById('btn-send').addEventListener('click', sendMessage);
   document.getElementById('btn-stop')?.addEventListener('click', () => { stopGenerating(); });
-  document.getElementById('chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+  document.getElementById('chat-input').addEventListener('keydown', (e) => {
+    if (onAtCompleteKeydown(e)) return;
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
   document.getElementById('btn-settings').addEventListener('click', () => openSettings().catch((e) => alert(e.message)));
   document.getElementById('btn-settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('btn-settings-save').addEventListener('click', () => saveSettingsFromForm().catch((e) => alert(e.message)));
@@ -959,7 +1684,9 @@ function boot() {
   loadState();
   renderEmojiPanel();
   bindEvents();
-  // One global chat:event listener; routes by active chatRun / runId
+  bindTerminalPanel();
+  bindAtComplete();
+  // One global chat:event listener; routes by active chatRun / runId (+ terminal-*)
   if (window.codex?.onChatEvent) {
     window.codex.onChatEvent((ev) => {
       try { handleChatEvent(ev); } catch (e) { console.error('chat event handler', e); }

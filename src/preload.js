@@ -17,4 +17,11 @@ contextBridge.exposeInMainWorld('codex', {
   readFile: (projectPath, rel) => ipcRenderer.invoke('project:readFile', projectPath, rel),
   writeFile: (projectPath, rel, content) => ipcRenderer.invoke('project:writeFile', projectPath, rel, content),
   deletePath: (projectPath, rel) => ipcRenderer.invoke('project:deletePath', projectPath, rel),
+  gitStatus: (projectPath) => ipcRenderer.invoke('git:status', { projectPath }),
+  gitDiff: (projectPath, opts) => ipcRenderer.invoke('git:diff', { projectPath, ...opts }),
+  runTerminal: (payload) => ipcRenderer.invoke('terminal:run', payload),
+  stopTerminal: (payload) => ipcRenderer.invoke('terminal:stop', payload || {}),
+  clearTerminal: () => ipcRenderer.invoke('terminal:clear'),
+  atRefComplete: (payload) => ipcRenderer.invoke('atRef:complete', payload || {}),
+  atRefExpand: (payload) => ipcRenderer.invoke('atRef:expand', payload || {}),
 });
