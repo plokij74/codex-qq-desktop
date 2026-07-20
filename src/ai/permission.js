@@ -1,6 +1,9 @@
+const { normalizeAgentMode, isPlanBlockedRisk } = require('./agent-mode');
+
 const READ_TOOLS = new Set([
   'list_dir', 'read_file', 'grep', 'glob',
   'git_status', 'git_diff',
+  'submit_plan',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit',
@@ -71,8 +74,10 @@ function createPermissionGate({
   permissionMode = 'confirm-writes',
   terminalEnabled = false,
   terminalRequireConfirm = true,
+  agentMode = 'agent',
   onApprovalNeeded,
 } = {}) {
+  const gateAgentMode = normalizeAgentMode(agentMode);
   /** @type {Map<string, { resolve: (v: any) => void, reject: (e: Error) => void }>} */
   const pending = new Map();
 
@@ -149,11 +154,21 @@ function createPermissionGate({
     }
   }
 
-  async function authorize({ tool, risk, summary, detail, path, sessionKey, signal, diff } = {}) {
+  async function authorize({
+    tool, risk, summary, detail, path, sessionKey, signal, diff, agentMode: callAgentMode,
+  } = {}) {
     const effectiveRisk = risk || riskForTool(tool);
+    const mode = normalizeAgentMode(
+      callAgentMode != null ? callAgentMode : gateAgentMode,
+    );
 
     if (signal?.aborted) {
       throw makeAbortedError();
+    }
+
+    // Plan mode second gate: never write/delete/terminal
+    if (mode === 'plan' && isPlanBlockedRisk(effectiveRisk)) {
+      return { allowed: false, reason: '当前为计划模式，仅允许只读与提交计划' };
     }
 
     // Terminal disabled always denies terminal tools

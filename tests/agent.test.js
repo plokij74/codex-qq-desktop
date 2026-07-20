@@ -689,6 +689,185 @@ describe('agent tools', () => {
     assert.ok(on.some((t) => t.function.name === 'run_terminal'));
   });
 
+  it('toolsForSettings plan exposes submit_plan not write_file', () => {
+    const plan = toolsForSettings({ terminalEnabled: true }, { agentMode: 'plan' })
+      .map((t) => t.function.name);
+    assert.ok(plan.includes('submit_plan'));
+    assert.ok(plan.includes('read_file'));
+    assert.ok(plan.includes('git_status'));
+    assert.ok(!plan.includes('write_file'));
+    assert.ok(!plan.includes('search_replace'));
+    assert.ok(!plan.includes('run_terminal'));
+    assert.ok(!plan.includes('git_commit'));
+    const agent = toolsForSettings({ terminalEnabled: false }, { agentMode: 'agent' })
+      .map((t) => t.function.name);
+    assert.ok(!agent.includes('submit_plan'));
+    assert.ok(agent.includes('write_file'));
+  });
+
+  it('plan mode submit_plan emits plan-ready', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-plan-'));
+    fs.writeFileSync(path.join(root, 'a.js'), 'x\n');
+    const events = [];
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'c1',
+            type: 'function',
+            function: {
+              name: 'submit_plan',
+              arguments: JSON.stringify({
+                title: '改 a',
+                markdown: '1. 修改 a.js\n2. 跑测试\n3. 完成目标说明',
+                steps: ['改 a', '测试'],
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '计划已交，等待批准' };
+    };
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        permissionMode: 'full-auto',
+      },
+      messages: [{ role: 'user', content: '规划一下' }],
+      gate: createPermissionGate({
+        permissionMode: 'full-auto',
+        agentMode: 'plan',
+        terminalEnabled: false,
+        onApprovalNeeded: async () => {},
+      }),
+      agentMode: 'plan',
+      onEvent: (e) => events.push(e),
+      chatFn,
+      sessionKey: 'plan1',
+    });
+    assert.ok(events.some((e) => e.type === AGENT_EVENTS.PLAN_READY || e.type === 'plan-ready'));
+    const ready = events.find((e) => e.type === AGENT_EVENTS.PLAN_READY || e.type === 'plan-ready');
+    assert.ok(ready.planId);
+    assert.match(String(ready.markdown || ''), /修改 a\.js/);
+    assert.match(result.content, /计划|批准/);
+    assert.equal(fs.readFileSync(path.join(root, 'a.js'), 'utf8'), 'x\n');
+  });
+
+  it('plan mode write_file tool_call does not write disk', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-plan-write-'));
+    fs.writeFileSync(path.join(root, 'a.js'), 'original\n');
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'cw',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({ path: 'a.js', content: 'HACKED\n' }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '无法写入' };
+    };
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: false,
+        maxAgentTurns: 4,
+        permissionMode: 'full-auto',
+      },
+      messages: [{ role: 'user', content: '改文件' }],
+      gate: createPermissionGate({
+        permissionMode: 'full-auto',
+        agentMode: 'plan',
+        terminalEnabled: false,
+        onApprovalNeeded: async () => {},
+      }),
+      agentMode: 'plan',
+      chatFn,
+      sessionKey: 'plan-write',
+    });
+    assert.equal(fs.readFileSync(path.join(root, 'a.js'), 'utf8'), 'original\n');
+    // write_file is not registered in plan tools; text protocol / unexpected name should fail authorize or unknown
+    const writeSteps = result.agentLog.filter((s) => s.tool === 'write_file');
+    if (writeSteps.length) {
+      assert.ok(writeSteps.every((s) => s.ok === false));
+    }
+  });
+
+  it('after write, prompts verify before done when verifyCommand set', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-verify-'));
+    fs.writeFileSync(path.join(root, 'a.js'), 'v1\n');
+    const events = [];
+    let turn = 0;
+    const chatFn = async (opts) => {
+      turn += 1;
+      // After write, model tries to finish; loop should inject verify prompt and call again
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'cw',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({ path: 'a.js', content: 'v2\n' }),
+            },
+          }],
+        };
+      }
+      if (turn === 2) {
+        // first final without terminal → should be prompted and continue
+        return { role: 'assistant', content: '改完了' };
+      }
+      // After soft-verify user prompt, model answers without running terminal
+      return { role: 'assistant', content: '跳过验证说明' };
+    };
+    const result = await runAgentLoop({
+      project: { name: 't', path: root },
+      settings: {
+        terminalEnabled: true,
+        maxAgentTurns: 8,
+        permissionMode: 'full-auto',
+        verifyCommand: 'npm test',
+        verifyBeforeDone: true,
+        terminalRequireConfirm: false,
+      },
+      messages: [{ role: 'user', content: '改 a' }],
+      gate: createPermissionGate({
+        permissionMode: 'full-auto',
+        terminalEnabled: true,
+        terminalRequireConfirm: false,
+        agentMode: 'agent',
+        onApprovalNeeded: async () => {},
+      }),
+      agentMode: 'agent',
+      onEvent: (e) => events.push(e),
+      chatFn,
+      sessionKey: 'verify1',
+    });
+    assert.ok(turn >= 3, 'expected verify soft-gate extra turn, turns=' + turn);
+    assert.equal(fs.readFileSync(path.join(root, 'a.js'), 'utf8'), 'v2\n');
+    assert.ok(
+      events.some((e) => e.type === AGENT_EVENTS.VERIFY_RESULT || e.type === 'verify-result'),
+      'expected verify-result event',
+    );
+    assert.match(result.content, /改完了|跳过|验证/);
+  });
+
   it('blocks dangerous terminal patterns', () => {
     assert.equal(isBlockedCommand('rm -rf /'), true);
     assert.equal(isBlockedCommand('npm test'), false);

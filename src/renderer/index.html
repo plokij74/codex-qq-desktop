@@ -77,6 +77,10 @@
               <button type="button" class="tool-btn" id="btn-emoji" title="表情">😊 表情</button>
               <button type="button" class="tool-btn" id="btn-image" title="图片">🖼 图片</button>
               <button type="button" class="tool-btn" id="btn-attach" title="附件">📎 附加</button>
+              <div class="agent-mode-toggle" id="agent-mode-toggle" title="会话模式：计划只读 / 执行可改">
+                <button type="button" data-mode="plan" class="mode-btn">计划</button>
+                <button type="button" data-mode="agent" class="mode-btn is-active">执行</button>
+              </div>
               <input type="file" id="file-image" accept="image/*" hidden />
               <input type="file" id="file-attach" hidden />
             </div>
@@ -200,7 +204,19 @@
         <label class="field"><span>最大 Agent 轮数</span><input id="set-agent-turns" type="number" min="0" max="50" value="8" title="0 表示不限制轮数" /></label>
         <label class="switch-row"><input type="checkbox" id="set-terminal-enabled" /> <span>允许终端命令（默认关）</span></label>
         <label class="switch-row"><input type="checkbox" id="set-terminal-confirm" checked /> <span>全自动时终端仍需确认</span></label>
-        <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。</small>
+        <label class="field">
+          <span>新建会话默认模式</span>
+          <select id="set-default-agent-mode">
+            <option value="agent" selected>执行（agent）</option>
+            <option value="plan">计划（plan）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>验证命令</span>
+          <input id="set-verify-command" type="text" placeholder="空=自动探测 npm test；none 禁用" />
+        </label>
+        <label class="switch-row"><input type="checkbox" id="set-verify-before-done" checked /> <span>有写盘时收工前提示跑验证</span></label>
+        <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。计划模式只读 + submit_plan。</small>
       </div>
       <div class="modal-actions">
         <button type="button" id="btn-settings-cancel" class="btn-secondary">取消</button>

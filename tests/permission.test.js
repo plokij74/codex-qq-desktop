@@ -27,6 +27,45 @@ describe('permission', () => {
     assert.equal(riskForTool('git_commit'), 'write');
   });
 
+  it('riskForTool submit_plan is read', () => {
+    assert.equal(riskForTool('submit_plan'), 'read');
+  });
+
+  it('plan mode denies write even in full-auto', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      terminalEnabled: true,
+      agentMode: 'plan',
+      onApprovalNeeded: async () => {},
+    });
+    const r = await gate.authorize({ tool: 'write_file', risk: 'write', sessionKey: 's' });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /计划模式/);
+  });
+
+  it('plan mode allows read', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      agentMode: 'plan',
+      onApprovalNeeded: async () => {},
+    });
+    const r = await gate.authorize({ tool: 'read_file', risk: 'read', sessionKey: 's' });
+    assert.equal(r.allowed, true);
+  });
+
+  it('per-call agentMode plan overrides gate default agent', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      agentMode: 'agent',
+      onApprovalNeeded: async () => {},
+    });
+    const r = await gate.authorize({
+      tool: 'write_file', risk: 'write', sessionKey: 's', agentMode: 'plan',
+    });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /计划模式/);
+  });
+
   it('AGENT_EVENTS includes Phase B event names', () => {
     assert.equal(AGENT_EVENTS.FILE_CHANGE, 'file-change');
     assert.equal(AGENT_EVENTS.TERMINAL_START, 'terminal-start');

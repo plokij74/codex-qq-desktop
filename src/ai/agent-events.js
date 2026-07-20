@@ -13,6 +13,10 @@ const AGENT_EVENTS = {
   TERMINAL_START: 'terminal-start',
   TERMINAL_OUTPUT: 'terminal-output',
   TERMINAL_END: 'terminal-end',
+  PLAN_READY: 'plan-ready',
+  PLAN_APPROVED: 'plan-approved',
+  PLAN_REJECTED: 'plan-rejected',
+  VERIFY_RESULT: 'verify-result',
 };
 
 module.exports = { AGENT_EVENTS };

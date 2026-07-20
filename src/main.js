@@ -21,8 +21,13 @@ const {
 const { gitStatus, gitDiff } = require('./ai/git');
 const { expandAtRefs, completeAtPath } = require('./ai/at-ref');
 const { computeUnifiedDiff, truncateDiff } = require('./ai/diff');
+const {
+  normalizeAgentMode,
+  buildApproveExecutionMessage,
+} = require('./ai/agent-mode');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
+const AGENT_MODES = new Set(['plan', 'agent']);
 
 /**
  * Clone messages for the model; expand @refs on the last user message only.
@@ -60,6 +65,12 @@ function messagesForModel(messages, projectPath) {
 let activeRun = null;
 
 /**
+ * Pending plan per session (from submit_plan / plan-ready).
+ * @type {Map<string, { planId: string, title?: string, markdown: string, steps?: string[], sessionId: string }>}
+ */
+const pendingPlansBySession = new Map();
+
+/**
  * Manual terminal run (panel). Independent from activeRun / chat:stop.
  * @type {{ abort: AbortController, gate: ReturnType<typeof createPermissionGate>, sessionId: string, sender: Electron.WebContents, termId: string } | null}
  */
@@ -82,6 +93,9 @@ function toPublicSettings(s) {
     terminalEnabled: Boolean(s.terminalEnabled),
     terminalRequireConfirm: s.terminalRequireConfirm !== false,
     terminalTimeoutMs: s.terminalTimeoutMs ?? 60000,
+    defaultAgentMode: AGENT_MODES.has(s.defaultAgentMode) ? s.defaultAgentMode : 'agent',
+    verifyCommand: s.verifyCommand != null ? String(s.verifyCommand) : '',
+    verifyBeforeDone: s.verifyBeforeDone !== false,
   };
 }
 
@@ -169,7 +183,7 @@ ipcMain.handle('settings:get', async () => toPublicSettings(loadSettings(userDat
 ipcMain.handle('settings:save', async (_e, partial = {}) => {
   const nextPartial = { ...partial };
   if (!nextPartial.apiKey) delete nextPartial.apiKey;
-  for (const k of ['agentEnabled', 'terminalEnabled', 'terminalRequireConfirm']) {
+  for (const k of ['agentEnabled', 'terminalEnabled', 'terminalRequireConfirm', 'verifyBeforeDone']) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
   if ('maxAgentTurns' in nextPartial) {
@@ -181,6 +195,12 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     if (!PERMISSION_MODES.has(nextPartial.permissionMode)) {
       delete nextPartial.permissionMode;
     }
+  }
+  if ('defaultAgentMode' in nextPartial) {
+    nextPartial.defaultAgentMode = normalizeAgentMode(nextPartial.defaultAgentMode);
+  }
+  if ('verifyCommand' in nextPartial) {
+    nextPartial.verifyCommand = String(nextPartial.verifyCommand ?? '');
   }
   return toPublicSettings(saveSettings(userDataPath(), nextPartial));
 });
@@ -447,14 +467,24 @@ ipcMain.handle('atRef:expand', async (_e, payload = {}) => {
   }
 });
 
-ipcMain.handle('chat:send', async (event, payload = {}) => {
-  // Stop any previous run before starting a new one.
-  abortActiveRun();
+/**
+ * Shared chat run entry for chat:send and chat:approvePlan.
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @param {object} payload
+ * @param {{ stopPrevious?: boolean }} [opts]
+ */
+async function startChatRun(event, payload = {}, opts = {}) {
+  const stopPrevious = opts.stopPrevious !== false;
+  if (stopPrevious) {
+    abortActiveRun();
+  }
 
   const runId = makeRunId();
   const abort = new AbortController();
   const signal = abort.signal;
   const sender = event.sender;
+  const agentMode = normalizeAgentMode(payload.agentMode);
+  const sessionId = payload.sessionId || '';
 
   const settings = loadSettings(userDataPath());
   const gate = createPermissionGate({
@@ -463,6 +493,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
       : 'confirm-writes',
     terminalEnabled: Boolean(settings.terminalEnabled),
     terminalRequireConfirm: settings.terminalRequireConfirm !== false,
+    agentMode,
     onApprovalNeeded: async (approvalPayload) => {
       safeSend(sender, 'chat:event', {
         type: AGENT_EVENTS.APPROVAL_NEEDED,
@@ -475,7 +506,16 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
   activeRun = { abort, gate, runId, sender };
 
   const emit = (e) => {
-    safeSend(sender, 'chat:event', { runId, ...e });
+    if (e && e.type === AGENT_EVENTS.PLAN_READY && sessionId) {
+      pendingPlansBySession.set(sessionId, {
+        planId: e.planId,
+        title: e.title,
+        markdown: e.markdown,
+        steps: e.steps,
+        sessionId,
+      });
+    }
+    safeSend(sender, 'chat:event', { runId, sessionId, ...e });
   };
 
   try {
@@ -492,7 +532,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
     // Expand @refs only on the copy fed to the model (history keeps original).
     const modelMessages = messagesForModel(messages, project?.path || null);
 
-    // Fast path: host list/structure (always real scan)
+    // Fast path: host list/structure (always real scan) — skip in plan mode for structure-save writes
     if (project?.path && (isListIntent(userText) || isStructureIntent(userText))) {
       emit({
         type: AGENT_EVENTS.TOOL_START,
@@ -542,9 +582,10 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
               summary: `写入 ${outName}`,
               detail: detailForGate,
               path: outName,
-              sessionKey: payload.sessionId,
+              sessionKey: sessionId,
               signal,
               diff: diffPayload,
+              agentMode,
             });
             if (!auth.allowed) {
               const reason = auth.reason || '用户拒绝';
@@ -581,6 +622,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
           hostTool: 'listTree',
           runId,
           mode: 'host',
+          agentMode,
         };
         emit({ type: AGENT_EVENTS.DONE, ...result });
         return result;
@@ -612,8 +654,9 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
         messages: modelMessages,
         gate,
         onEvent: emit,
-        sessionKey: payload.sessionId,
+        sessionKey: sessionId,
         signal,
+        agentMode,
       });
       const out = {
         content: result.content,
@@ -622,6 +665,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
         agentLog: result.agentLog,
         turns: result.turns,
         mode: 'agent',
+        agentMode,
         runId,
       };
       emit({ type: AGENT_EVENTS.DONE, ...out });
@@ -664,10 +708,11 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
       const result = await applyWriteFencesWithGate(project.path, content, {
         gate,
         settings,
-        sessionKey: payload.sessionId,
+        sessionKey: sessionId,
         signal,
         onEvent: emit,
         fileChanges,
+        agentMode,
       });
       applied = result.applied;
       displayContent = result.displayContent;
@@ -689,6 +734,7 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
       applied,
       fileChanges,
       mode: settings.mode,
+      agentMode,
       runId,
     };
     emit({ type: AGENT_EVENTS.DONE, ...out });
@@ -708,4 +754,91 @@ ipcMain.handle('chat:send', async (event, payload = {}) => {
       activeRun = null;
     }
   }
+}
+
+ipcMain.handle('chat:send', async (event, payload = {}) => startChatRun(event, payload));
+
+ipcMain.handle('chat:approvePlan', async (event, payload = {}) => {
+  const sessionId = payload.sessionId;
+  const planId = payload.planId;
+  if (!sessionId || !planId) {
+    return { ok: false, error: '缺少 sessionId 或 planId' };
+  }
+  const pending = pendingPlansBySession.get(sessionId);
+  if (!pending || pending.planId !== planId) {
+    return { ok: false, error: '计划不存在或已更新' };
+  }
+  if (activeRun) {
+    return { ok: false, error: '请先停止当前生成再批准执行' };
+  }
+
+  const content = buildApproveExecutionMessage({
+    title: pending.title,
+    markdown: pending.markdown,
+  });
+  const userMessage = { role: 'user', content };
+
+  safeSend(event.sender, 'chat:event', {
+    type: AGENT_EVENTS.PLAN_APPROVED,
+    planId,
+    sessionId,
+  });
+
+  // Clear pending so stale approve cannot re-run the same plan card.
+  pendingPlansBySession.delete(sessionId);
+
+  const baseMessages = Array.isArray(payload.messages) ? payload.messages : [];
+  const messages = [...baseMessages, userMessage];
+
+  try {
+    const result = await startChatRun(event, {
+      ...payload,
+      agentMode: 'agent',
+      messages,
+      sessionId,
+    }, { stopPrevious: false });
+    return {
+      ok: true,
+      agentMode: 'agent',
+      userMessage,
+      result,
+    };
+  } catch (err) {
+    if (isAbortError(err)) {
+      return {
+        ok: false,
+        aborted: true,
+        error: '已停止',
+        agentMode: 'agent',
+        userMessage,
+      };
+    }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      agentMode: 'agent',
+      userMessage,
+    };
+  }
+});
+
+ipcMain.handle('chat:rejectPlan', async (event, payload = {}) => {
+  const sessionId = payload.sessionId;
+  const planId = payload.planId;
+  if (!sessionId) {
+    return { ok: false, error: '缺少 sessionId' };
+  }
+  const pending = pendingPlansBySession.get(sessionId);
+  if (pending && planId && pending.planId !== planId) {
+    return { ok: false, error: '计划不存在或已更新' };
+  }
+  if (pending) {
+    pendingPlansBySession.delete(sessionId);
+    safeSend(event.sender, 'chat:event', {
+      type: AGENT_EVENTS.PLAN_REJECTED,
+      planId: pending.planId,
+      sessionId,
+    });
+  }
+  return { ok: true };
 });

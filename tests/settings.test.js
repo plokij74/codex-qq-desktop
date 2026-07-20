@@ -38,4 +38,23 @@ describe('settings', () => {
     saveSettings(dir, { permissionMode: 'read-only' });
     assert.equal(loadSettings(dir).permissionMode, 'read-only');
   });
+
+  it('defaults Phase C.1 orchestration settings', () => {
+    assert.equal(DEFAULT_SETTINGS.defaultAgentMode, 'agent');
+    assert.equal(DEFAULT_SETTINGS.verifyCommand, '');
+    assert.equal(DEFAULT_SETTINGS.verifyBeforeDone, true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const s = loadSettings(dir);
+    assert.equal(s.defaultAgentMode, 'agent');
+    assert.equal(s.verifyCommand, '');
+    assert.equal(s.verifyBeforeDone, true);
+  });
+
+  it('AGENT_EVENTS includes plan and verify names', () => {
+    const { AGENT_EVENTS } = require('../src/ai/agent-events');
+    assert.equal(AGENT_EVENTS.PLAN_READY, 'plan-ready');
+    assert.equal(AGENT_EVENTS.VERIFY_RESULT, 'verify-result');
+    assert.equal(AGENT_EVENTS.PLAN_APPROVED, 'plan-approved');
+    assert.equal(AGENT_EVENTS.PLAN_REJECTED, 'plan-rejected');
+  });
 });

@@ -882,6 +882,121 @@ html, body {
   font-size: 11px;
   color: #567;
 }
+
+/* Phase C.1 plan / agent mode toggle */
+.agent-mode-toggle {
+  display: inline-flex;
+  margin-left: 8px;
+  border: 1px solid #6a93b8;
+  border-radius: 3px;
+  overflow: hidden;
+  vertical-align: middle;
+}
+.agent-mode-toggle .mode-btn {
+  border: 0;
+  background: linear-gradient(#f4f9ff, #d7e8f8);
+  color: #234;
+  font-size: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+.agent-mode-toggle .mode-btn + .mode-btn {
+  border-left: 1px solid #6a93b8;
+}
+.agent-mode-toggle .mode-btn.is-active {
+  background: linear-gradient(#7ec2f5, #3d8fd9 55%, #2f7fcb);
+  color: #fff;
+  font-weight: 600;
+}
+.agent-mode-toggle .mode-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Plan card */
+.plan-card {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid #6a93b8;
+  border-radius: 4px;
+  background: linear-gradient(180deg, #f7fbff 0%, #e6f0fa 100%);
+  user-select: text;
+}
+.plan-card.resolved {
+  opacity: 0.85;
+  border-color: #9ab;
+}
+.plan-card .plan-title {
+  font-weight: 700;
+  color: #1f4f80;
+  margin-bottom: 4px;
+}
+.plan-card .plan-body {
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow: auto;
+  margin-bottom: 6px;
+}
+.plan-card .plan-steps {
+  margin: 0 0 8px 18px;
+  padding: 0;
+  font-size: 12px;
+}
+.plan-card .plan-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.plan-card .plan-btn {
+  border: 1px solid #3a7ec2;
+  border-radius: 3px;
+  background: linear-gradient(#8ec8f7, #4a9adf);
+  color: #fff;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.plan-card .plan-btn.plan-reject {
+  border-color: #a06060;
+  background: linear-gradient(#f0d0d0, #d08080 55%, #b06060);
+}
+.plan-card .plan-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.plan-card .plan-result {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #567;
+}
+
+/* Verify strip */
+.verify-strip {
+  margin: 6px 0 2px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-size: 12px;
+  border: 1px solid #8aabcc;
+  background: #f0f6fc;
+}
+.verify-strip.is-ok {
+  border-color: #5a9a6a;
+  background: #e8f7ec;
+  color: #1a5a2a;
+}
+.verify-strip.is-fail {
+  border-color: #b07070;
+  background: #fceeee;
+  color: #6a2020;
+}
+.verify-strip.is-skip {
+  border-color: #c0a060;
+  background: #fff8e8;
+  color: #6a5010;
+}
+
 .msg-assistant .bubble.has-run {
   min-width: 220px;
   max-width: 100%;

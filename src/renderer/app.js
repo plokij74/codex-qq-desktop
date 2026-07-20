@@ -48,6 +48,8 @@ let projects = [];
 let activeSessionId = '';
 let currentView = 'chat';
 let sending = false;
+/** Seeds agentMode for newly created sessions (from settings.defaultAgentMode). */
+let defaultAgentModeSeed = 'agent';
 
 /** Active agent/stream run for the current send (event-driven UI). */
 let chatRun = null;
@@ -84,6 +86,38 @@ function setSending(on) {
   const stop = document.getElementById('btn-stop');
   if (btn) btn.disabled = sending;
   if (stop) stop.classList.toggle('hidden', !sending);
+  updateAgentModeToggle();
+}
+
+function normalizeSessionAgentMode(value) {
+  return value === 'plan' ? 'plan' : 'agent';
+}
+
+function sessionAgentMode(session = activeSession()) {
+  return normalizeSessionAgentMode(session?.agentMode);
+}
+
+function updateAgentModeToggle() {
+  const wrap = document.getElementById('agent-mode-toggle');
+  if (!wrap) return;
+  const mode = sessionAgentMode();
+  wrap.querySelectorAll('.mode-btn').forEach((btn) => {
+    const m = btn.getAttribute('data-mode');
+    btn.classList.toggle('is-active', m === mode);
+    btn.disabled = !!sending;
+  });
+}
+
+function setSessionAgentMode(mode) {
+  if (sending) {
+    toast('生成中无法切换模式，请先停止');
+    return;
+  }
+  const s = activeSession();
+  if (!s) return;
+  s.agentMode = normalizeSessionAgentMode(mode);
+  saveState();
+  updateAgentModeToggle();
 }
 
 function isTermCollapsed() {
@@ -484,9 +518,9 @@ function defaultProjects() {
 }
 function defaultSessions() {
   return [
-    { id: 'task_kv', title: '优化 KV 读写成本', kind: 'task', peer: 'codex', projectId: null, pinned: true, messages: [{ role: 'assistant', content: SEED_KV }], updatedAt: Date.now() },
-    { id: 'task_wechat', title: '微信发送 hello world', kind: 'task', peer: 'codex', projectId: null, pinned: false, messages: [{ role: 'assistant', content: '这个任务可以拆成：\n\n1. 确认接口\n2. 写最小发送脚本\n3. 配 token\n\n把代码或报错贴过来。' }], updatedAt: Date.now() - 1000 },
-    { id: 'chat_randy', title: 'Randy Lu', kind: 'friend', peer: 'randy', projectId: null, pinned: false, messages: [{ role: 'assistant', content: '（模拟好友）在的，有事直接说。' }], updatedAt: Date.now() - 2000 },
+    { id: 'task_kv', title: '优化 KV 读写成本', kind: 'task', peer: 'codex', projectId: null, pinned: true, agentMode: 'agent', messages: [{ role: 'assistant', content: SEED_KV }], updatedAt: Date.now() },
+    { id: 'task_wechat', title: '微信发送 hello world', kind: 'task', peer: 'codex', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '这个任务可以拆成：\n\n1. 确认接口\n2. 写最小发送脚本\n3. 配 token\n\n把代码或报错贴过来。' }], updatedAt: Date.now() - 1000 },
+    { id: 'chat_randy', title: 'Randy Lu', kind: 'friend', peer: 'randy', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '（模拟好友）在的，有事直接说。' }], updatedAt: Date.now() - 2000 },
   ];
 }
 function loadState() {
@@ -494,7 +528,12 @@ function loadState() {
     const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('codex-qq-sessions-v1');
     if (!raw) { sessions = defaultSessions(); projects = defaultProjects(); activeSessionId = sessions[0].id; return; }
     const data = JSON.parse(raw);
-    sessions = Array.isArray(data.sessions) && data.sessions.length ? data.sessions.map((s) => ({ pinned: false, projectId: null, ...s })) : defaultSessions();
+    sessions = Array.isArray(data.sessions) && data.sessions.length
+      ? data.sessions.map((s) => {
+        const mode = normalizeSessionAgentMode(s.agentMode);
+        return { pinned: false, projectId: null, ...s, agentMode: mode };
+      })
+      : defaultSessions();
     projects = Array.isArray(data.projects) && data.projects.length ? data.projects : defaultProjects();
     activeSessionId = data.activeSessionId && sessions.some((s) => s.id === data.activeSessionId) ? data.activeSessionId : sessions[0].id;
     if (data.pluginState) pluginState = { ...pluginState, ...data.pluginState };
@@ -643,6 +682,8 @@ function createAssistantRunPlaceholder(sessionId) {
     contentFinal: null,
     applied: null,
     fileChanges: [],
+    pendingPlanId: null,
+    verifyState: null,
     doneEvent: false,
     invokeDone: false,
     finalized: false,
@@ -650,6 +691,216 @@ function createAssistantRunPlaceholder(sessionId) {
     aborted: false,
   };
   return chatRun;
+}
+
+function renderPlanCard(ev) {
+  if (!chatRun?.timelineEl || !ev) return;
+  chatRun.pendingPlanId = ev.planId;
+  // Invalidate previous unresolved plan cards
+  chatRun.el.querySelectorAll('.plan-card:not(.resolved)').forEach((c) => {
+    c.classList.add('resolved');
+    const actions = c.querySelector('.plan-actions');
+    if (actions) actions.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+    let res = c.querySelector('.plan-result');
+    if (!res) {
+      res = document.createElement('div');
+      res.className = 'plan-result';
+      c.appendChild(res);
+    }
+    res.textContent = '已被更新计划替代';
+  });
+
+  const card = document.createElement('div');
+  card.className = 'plan-card';
+  card.dataset.planId = ev.planId || '';
+  const title = ev.title || '实施计划';
+  let stepsHtml = '';
+  if (Array.isArray(ev.steps) && ev.steps.length) {
+    stepsHtml = '<ol class="plan-steps">'
+      + ev.steps.map((s) => '<li>' + escapeHtml(String(s)) + '</li>').join('')
+      + '</ol>';
+  }
+  card.innerHTML =
+    '<div class="plan-title">' + escapeHtml(title) + '</div>'
+    + '<div class="plan-body">' + escapeHtml(String(ev.markdown || '')) + '</div>'
+    + stepsHtml
+    + '<div class="plan-actions">'
+    + '<button type="button" class="plan-btn plan-approve">批准执行</button>'
+    + '<button type="button" class="plan-btn plan-reject">驳回</button>'
+    + '</div>';
+
+  const approveBtn = card.querySelector('.plan-approve');
+  const rejectBtn = card.querySelector('.plan-reject');
+  approveBtn.addEventListener('click', () => approvePlanFromCard(card, ev));
+  rejectBtn.addEventListener('click', async () => {
+    if (card.classList.contains('resolved')) return;
+    approveBtn.disabled = true;
+    rejectBtn.disabled = true;
+    try {
+      if (window.codex?.rejectPlan) {
+        await window.codex.rejectPlan({
+          sessionId: chatRun?.sessionId || activeSessionId,
+          planId: ev.planId,
+        });
+      }
+    } catch { /* ignore */ }
+    card.classList.add('resolved');
+    const res = document.createElement('div');
+    res.className = 'plan-result';
+    res.textContent = '已驳回';
+    card.appendChild(res);
+    toast('已驳回计划');
+  });
+
+  chatRun.timelineEl.appendChild(card);
+  scrollToBottom();
+}
+
+async function approvePlanFromCard(card, planEv) {
+  if (!chatRun || chatRun.finalized || card.classList.contains('resolved')) return;
+  if (sending && chatRun && !chatRun.finalized) {
+    // still in same run that produced the plan — wait for finalize first is safer;
+    // allow approve after plan-ready while invoke may still be open? Spec: if activeRun, main rejects.
+    // After plan submit model often continues to final text; user may click after done.
+  }
+  const session = sessions.find((s) => s.id === chatRun.sessionId) || activeSession();
+  if (!session) return;
+
+  const btns = card.querySelectorAll('button');
+  btns.forEach((b) => { b.disabled = true; });
+
+  // If still streaming this plan-producing run, stop first so approve can start new run
+  if (sending) {
+    try { await window.codex.stopChat(); } catch { /* ignore */ }
+    // small yield for main to clear activeRun
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  const history = session.messages
+    .filter((m) => !m.error)
+    .map((m) => ({ role: m.role, content: m.content }));
+  // Include live assistant buffer if not yet finalized into messages
+  if (chatRun && !chatRun.finalized) {
+    const partial = chatRun.contentFinal || chatRun.textBuffer;
+    if (partial) history.push({ role: 'assistant', content: String(partial) });
+  }
+
+  const proj = sessionProject(session);
+  setSending(true);
+  try {
+    const res = await window.codex.approvePlan({
+      sessionId: session.id,
+      planId: planEv.planId,
+      messages: history,
+      project: proj?.path ? { name: proj.name, path: proj.path } : null,
+    });
+    if (!res?.ok && !res?.userMessage) {
+      btns.forEach((b) => { b.disabled = false; });
+      toast(res?.error || '批准失败');
+      setSending(false);
+      return;
+    }
+
+    session.agentMode = 'agent';
+    updateAgentModeToggle();
+    card.classList.add('resolved');
+    let resultEl = card.querySelector('.plan-result');
+    if (!resultEl) {
+      resultEl = document.createElement('div');
+      resultEl.className = 'plan-result';
+      card.appendChild(resultEl);
+    }
+    resultEl.textContent = '已批准，正在执行…';
+
+    if (res.userMessage) {
+      session.messages.push({
+        role: res.userMessage.role || 'user',
+        content: res.userMessage.content,
+      });
+    }
+    session.updatedAt = Date.now();
+    saveState();
+
+    // Finalize previous plan-run bubble if still open
+    if (chatRun && !chatRun.finalized) {
+      chatRun.invokeDone = true;
+      finalizeChatRun({
+        content: chatRun.contentFinal || chatRun.textBuffer || '计划已提交',
+        applied: chatRun.applied,
+      });
+    }
+
+    // New agent run placeholder
+    createAssistantRunPlaceholder(session.id);
+    renderMessages();
+    renderLeftDynamic();
+
+    const invokeResult = res.result;
+    if (chatRun && !chatRun.finalized) {
+      chatRun.invokeDone = true;
+      if (invokeResult) {
+        if (chatRun.contentFinal == null && invokeResult.content != null) {
+          chatRun.contentFinal = String(invokeResult.content);
+        }
+        if (!chatRun.applied && invokeResult.applied) chatRun.applied = invokeResult.applied;
+        if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
+        if (Array.isArray(invokeResult.fileChanges)) {
+          for (const fc of invokeResult.fileChanges) mergeFileChangeEntry(chatRun.fileChanges, fc);
+        }
+        if (chatRun.fileChanges.length) renderFileChangesStrip();
+        const content = chatRun.contentFinal != null
+          ? chatRun.contentFinal
+          : (invokeResult.content || chatRun.textBuffer || '');
+        finalizeChatRun({ content, applied: chatRun.applied || invokeResult.applied });
+      } else if (res.aborted) {
+        finalizeChatRun({ aborted: true, content: chatRun.contentFinal || chatRun.textBuffer || '' });
+      } else if (res.error) {
+        finalizeChatRun({
+          error: true,
+          errorMessage: res.error,
+          content: chatRun.contentFinal || chatRun.textBuffer || '',
+        });
+      } else if (chatRun.doneEvent) {
+        finalizeChatRun({ content: chatRun.contentFinal || chatRun.textBuffer || '' });
+      }
+    }
+  } catch (err) {
+    btns.forEach((b) => { b.disabled = false; });
+    toast(err?.message || String(err));
+  } finally {
+    setSending(false);
+    saveState();
+    renderMessages();
+    renderLeftDynamic();
+  }
+}
+
+function renderVerifyStrip(ev) {
+  if (!chatRun?.el || !ev) return;
+  chatRun.verifyState = ev;
+  const bubble = chatRun.el.querySelector('.bubble') || chatRun.el;
+  let strip = chatRun.el.querySelector('.verify-strip');
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.className = 'verify-strip';
+    if (chatRun.streamEl && chatRun.streamEl.parentNode === bubble) {
+      bubble.insertBefore(strip, chatRun.streamEl.nextSibling);
+    } else {
+      bubble.appendChild(strip);
+    }
+  }
+  strip.classList.remove('is-ok', 'is-fail', 'is-skip');
+  const cmd = ev.command ? '（' + String(ev.command) + '）' : '';
+  if (ev.skipped) {
+    strip.classList.add('is-skip');
+    strip.textContent = '⚠ 未验证' + cmd + (ev.summary ? ' — ' + ev.summary : '');
+  } else if (ev.ok) {
+    strip.classList.add('is-ok');
+    strip.textContent = '✅ 验证通过' + cmd;
+  } else {
+    strip.classList.add('is-fail');
+    strip.textContent = '❌ 验证失败' + cmd + (ev.summary ? ' — ' + ev.summary : '');
+  }
 }
 
 function appendTimelineRow(kind, tool, summary, ok) {
@@ -914,6 +1165,23 @@ function handleChatEvent(ev) {
     });
     return;
   }
+  if (type === 'plan-ready') {
+    renderPlanCard(ev);
+    setRunStatus('计划已提交，等待批准…');
+    return;
+  }
+  if (type === 'plan-approved') {
+    setRunStatus('计划已批准，执行中…');
+    return;
+  }
+  if (type === 'plan-rejected') {
+    setRunStatus('');
+    return;
+  }
+  if (type === 'verify-result') {
+    renderVerifyStrip(ev);
+    return;
+  }
   if (type === 'turn-end') {
     return;
   }
@@ -1113,10 +1381,14 @@ function openProjectChat(projectId) {
     const tip = p.path
       ? ('已连接真实目录：\n`' + p.path + '`\n\n你可以像 Codex 一样让我改代码，例如：\n- 列出文件\n- 读取 package.json\n- 新建 README.md 并写介绍')
       : ('项目「' + p.name + '」尚未绑定真实目录。\n\n请右键 → **绑定真实目录**。');
-    session = { id: uid('ps'), title: p.name, kind: 'project', peer: 'codex', projectId: p.id, pinned: false, messages: [{ role: 'assistant', content: tip }], updatedAt: Date.now() };
+    session = {
+      id: uid('ps'), title: p.name, kind: 'project', peer: 'codex', projectId: p.id, pinned: false,
+      agentMode: defaultAgentModeSeed,
+      messages: [{ role: 'assistant', content: tip }], updatedAt: Date.now(),
+    };
     sessions.unshift(session);
   }
-  activeSessionId = session.id; saveState(); setView('chat');
+  activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle();
 }
 function renderFriends() {
   const ul = document.getElementById('friend-list');
@@ -1165,25 +1437,31 @@ function setView(view) {
 function showChatView() {
   document.getElementById('view-chat').classList.remove('hidden');
   document.getElementById('view-work').classList.add('hidden');
-  updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar();
+  updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
 }
 function switchSession(id) {
   if (!sessions.some((s) => s.id === id)) return;
-  activeSessionId = id; saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar();
+  activeSessionId = id; saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
 }
 function openFriendChat(friendId) {
   const friend = FRIENDS.find((f) => f.id === friendId); if (!friend) return;
   let session = sessions.find((s) => s.kind === 'friend' && s.peer === friendId);
   if (!session) {
-    session = { id: uid('friend'), title: friend.name, kind: 'friend', peer: friendId, projectId: null, pinned: false,
-      messages: [{ role: 'assistant', content: friend.kind === 'bot' ? '在呢。直接说需求，或先绑定真实项目再让我改代码。' : ('（模拟）' + friend.name + '：你好。') }], updatedAt: Date.now() };
+    session = {
+      id: uid('friend'), title: friend.name, kind: 'friend', peer: friendId, projectId: null, pinned: false,
+      agentMode: defaultAgentModeSeed,
+      messages: [{ role: 'assistant', content: friend.kind === 'bot' ? '在呢。直接说需求，或先绑定真实项目再让我改代码。' : ('（模拟）' + friend.name + '：你好。') }], updatedAt: Date.now(),
+    };
     sessions.unshift(session);
   }
-  activeSessionId = session.id; saveState(); setView('chat'); toast('已打开与 ' + friend.name + ' 的会话');
+  activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle(); toast('已打开与 ' + friend.name + ' 的会话');
 }
 function ensureTaskAndAsk(title, firstUserMessage) {
-  const session = { id: uid('task'), title, kind: 'task', peer: 'codex', projectId: null, pinned: false, messages: [], updatedAt: Date.now() };
-  sessions.unshift(session); activeSessionId = session.id; saveState(); setView('chat');
+  const session = {
+    id: uid('task'), title, kind: 'task', peer: 'codex', projectId: null, pinned: false,
+    agentMode: defaultAgentModeSeed, messages: [], updatedAt: Date.now(),
+  };
+  sessions.unshift(session); activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle();
   document.getElementById('chat-input').value = firstUserMessage; sendMessage();
 }
 function openTaskModal() {
@@ -1196,9 +1474,12 @@ function createTaskFromModal() {
   const title = document.getElementById('task-title').value.trim();
   const brief = document.getElementById('task-brief').value.trim();
   if (!title) return toast('请填写任务标题');
-  const session = { id: uid('task'), title, kind: 'task', peer: 'codex', projectId: sessionProject()?.id || null, pinned: false,
-    messages: [{ role: 'assistant', content: '新任务「' + title + '」已创建。' + (brief ? ('\n\n说明：' + brief + '\n\n') : '\n\n') + '继续补充细节即可。' }], updatedAt: Date.now() };
-  sessions.unshift(session); activeSessionId = session.id; saveState(); closeTaskModal(); setView('chat'); toast('任务已创建');
+  const session = {
+    id: uid('task'), title, kind: 'task', peer: 'codex', projectId: sessionProject()?.id || null, pinned: false,
+    agentMode: defaultAgentModeSeed,
+    messages: [{ role: 'assistant', content: '新任务「' + title + '」已创建。' + (brief ? ('\n\n说明：' + brief + '\n\n') : '\n\n') + '继续补充细节即可。' }], updatedAt: Date.now(),
+  };
+  sessions.unshift(session); activeSessionId = session.id; saveState(); closeTaskModal(); setView('chat'); updateAgentModeToggle(); toast('任务已创建');
   if (brief) document.getElementById('chat-input').value = brief;
 }
 function showWorkView(view) {
@@ -1520,6 +1801,12 @@ async function openSettings() {
   if (te) te.checked = Boolean(settings.terminalEnabled);
   const tc = document.getElementById('set-terminal-confirm');
   if (tc) tc.checked = settings.terminalRequireConfirm !== false;
+  const dam = document.getElementById('set-default-agent-mode');
+  if (dam) dam.value = settings.defaultAgentMode === 'plan' ? 'plan' : 'agent';
+  const vc = document.getElementById('set-verify-command');
+  if (vc) vc.value = settings.verifyCommand || '';
+  const vbd = document.getElementById('set-verify-before-done');
+  if (vbd) vbd.checked = settings.verifyBeforeDone !== false;
   document.getElementById('settings-modal').classList.remove('hidden');
 }
 function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
@@ -1533,9 +1820,14 @@ async function saveSettingsFromForm() {
     maxAgentTurns: Number(document.getElementById('set-agent-turns')?.value || 8),
     terminalEnabled: Boolean(document.getElementById('set-terminal-enabled')?.checked),
     terminalRequireConfirm: document.getElementById('set-terminal-confirm')?.checked !== false,
+    defaultAgentMode: document.getElementById('set-default-agent-mode')?.value === 'plan' ? 'plan' : 'agent',
+    verifyCommand: document.getElementById('set-verify-command')?.value?.trim() || '',
+    verifyBeforeDone: document.getElementById('set-verify-before-done')?.checked !== false,
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
-  await window.codex.saveSettings(partial); closeSettings(); await updateStatusBar(); toast('设置已保存');
+  await window.codex.saveSettings(partial);
+  defaultAgentModeSeed = partial.defaultAgentMode === 'plan' ? 'plan' : 'agent';
+  closeSettings(); await updateStatusBar(); toast('设置已保存');
   // Refresh terminal input enablement hint via status only; gate still enforces at run time.
 }
 async function sendMessage() {
@@ -1579,6 +1871,7 @@ async function sendMessage() {
       messages: session.messages.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })),
       project: proj?.path ? { name: proj.name, path: proj.path } : null,
       sessionId: session.id,
+      agentMode: sessionAgentMode(session),
     };
     invokeResult = await window.codex.sendChat(payload);
   } catch (err) {
@@ -1645,6 +1938,11 @@ async function sendMessage() {
 function bindEvents() {
   document.getElementById('btn-send').addEventListener('click', sendMessage);
   document.getElementById('btn-stop')?.addEventListener('click', () => { stopGenerating(); });
+  document.getElementById('agent-mode-toggle')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.mode-btn');
+    if (!btn || btn.disabled) return;
+    setSessionAgentMode(btn.getAttribute('data-mode'));
+  });
   document.getElementById('chat-input').addEventListener('keydown', (e) => {
     if (onAtCompleteKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
@@ -1693,8 +1991,15 @@ function boot() {
     });
   }
   setView('chat');
+  updateAgentModeToggle();
   updateStatusBar();
   updateClock();
   setInterval(updateClock, 30000);
+  // Load defaultAgentMode seed for new sessions (non-blocking)
+  if (window.codex?.getSettings) {
+    window.codex.getSettings().then((s) => {
+      defaultAgentModeSeed = s?.defaultAgentMode === 'plan' ? 'plan' : 'agent';
+    }).catch(() => {});
+  }
 }
 boot();

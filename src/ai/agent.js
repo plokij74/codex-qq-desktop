@@ -19,6 +19,13 @@ const { riskForTool } = require('./permission');
 const { AGENT_EVENTS } = require('./agent-events');
 const { computeUnifiedDiff, truncateDiff } = require('./diff');
 const { gitStatus, gitDiff, gitCommit } = require('./git');
+const {
+  normalizeAgentMode,
+  filterToolsForMode,
+  makePlanId,
+  truncatePlanMarkdown,
+} = require('./agent-mode');
+const { resolveVerifyCommand } = require('./verify');
 
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
@@ -184,11 +191,41 @@ const TOOL_DEFS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'submit_plan',
+      description:
+        'Submit a structured implementation plan for user approval. Plan mode only. Does not write files. Call when research is done.',
+      parameters: {
+        type: 'object',
+        properties: {
+          markdown: {
+            type: 'string',
+            description: 'Full plan body in markdown (required, min ~10 chars)',
+          },
+          title: { type: 'string', description: 'Short plan title' },
+          steps: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional ordered step list for UI',
+          },
+        },
+        required: ['markdown'],
+      },
+    },
+  },
 ];
 
 const TOOL_NAMES = TOOL_DEFS.map((t) => t.function.name).join(', ');
 
-function agentSystemPrompt(project, settings) {
+/**
+ * @param {object} project
+ * @param {object} settings
+ * @param {{ agentMode?: string, verifyCmd?: string|null }} [opts]
+ */
+function agentSystemPrompt(project, settings, opts = {}) {
+  const mode = normalizeAgentMode(opts.agentMode);
   const parts = [
     '你是 Codex 风格编程 Agent。你可以通过工具在本机真实项目上操作。',
     '工作流：需要信息时先 list_dir / glob / grep / read_file，再修改；优先 search_replace 做局部修改；新建或整文件重写用 write_file；提交用 git_status / git_diff / git_commit（不 push）；必要时 run_terminal 验证。',
@@ -202,6 +239,19 @@ function agentSystemPrompt(project, settings) {
     '7. 用户消息中的 `context:refs` 代码块是用户显式附加的文件内容（@ 引用展开），请优先依据其中内容作答',
     `终端工具: ${settings.terminalEnabled ? '已启用' : '未启用（不要调用 run_terminal）'}`,
   ];
+
+  if (mode === 'plan') {
+    parts.push('');
+    parts.push('【当前为计划模式 plan】');
+    parts.push('- 只能只读调研（list_dir / read_file / grep / glob / git_status / git_diff）');
+    parts.push('- 禁止写文件、删除、终端、git_commit；不要声称已改文件');
+    parts.push('- 调研完成后必须调用 submit_plan 提交结构化计划（含目标、步骤、涉及路径、风险、建议验证方式）');
+    parts.push('- 用户批准前不要假设会执行；批准后会切入 agent 模式');
+  } else if (opts.verifyCmd) {
+    parts.push('');
+    parts.push(`【验证】完成代码修改后应使用 run_terminal 执行约定验证命令：\`${opts.verifyCmd}\``);
+    parts.push('若命令失败，根据输出修复或说明阻塞原因。');
+  }
 
   if (project?.path) {
     parts.push(`当前工作项目：${project.name || path.basename(project.path)}`);
@@ -236,9 +286,17 @@ function agentSystemPrompt(project, settings) {
   return parts.join('\n');
 }
 
-function toolsForSettings(settings) {
-  if (settings.terminalEnabled) return TOOL_DEFS;
-  return TOOL_DEFS.filter((t) => t.function.name !== 'run_terminal');
+/**
+ * @param {object} settings
+ * @param {{ agentMode?: string }} [opts]
+ */
+function toolsForSettings(settings, opts = {}) {
+  const agentMode = normalizeAgentMode(opts.agentMode);
+  let tools = TOOL_DEFS.slice();
+  if (!settings.terminalEnabled) {
+    tools = tools.filter((t) => t.function.name !== 'run_terminal');
+  }
+  return filterToolsForMode(tools, agentMode);
 }
 
 function parseArgs(raw) {
@@ -319,6 +377,8 @@ function toolSummary(name, args) {
       return `git diff${args.staged ? ' --staged' : ''}${args.path ? ` ${args.path}` : ''}`;
     case 'git_commit':
       return `git commit: ${String(args.message || '').slice(0, 80)}`;
+    case 'submit_plan':
+      return `提交计划${args.title ? `: ${String(args.title).slice(0, 60)}` : ''}`;
     default:
       return name;
   }
@@ -340,6 +400,12 @@ function toolDetail(name, args) {
       args.paths?.length ? `paths: ${args.paths.join(', ')}` : 'paths: (已暂存 only)',
     ].join('\n');
   }
+  if (name === 'submit_plan') {
+    return [
+      args.title ? `title: ${args.title}` : '',
+      String(args.markdown || '').slice(0, 1500),
+    ].filter(Boolean).join('\n').slice(0, 2000);
+  }
   try {
     return JSON.stringify(args).slice(0, 2000);
   } catch {
@@ -360,6 +426,7 @@ function summarizeToolResult(name, parsed) {
   if (name === 'git_status') return parsed.summary || 'status';
   if (name === 'git_diff') return parsed.truncated ? 'diff (truncated)' : 'diff';
   if (name === 'git_commit') return parsed.summary || parsed.commit || 'committed';
+  if (name === 'submit_plan') return parsed.planId ? `plan ${parsed.planId}` : 'plan submitted';
   return 'ok';
 }
 
@@ -380,6 +447,7 @@ async function authorizeTool({
   sessionKey,
   signal,
   diff,
+  agentMode,
 }) {
   if (gate && typeof gate.authorize === 'function') {
     return gate.authorize({
@@ -391,6 +459,7 @@ async function authorizeTool({
       sessionKey,
       signal,
       diff,
+      agentMode,
     });
   }
 
@@ -668,6 +737,36 @@ async function executeTool(name, args, ctx) {
       });
       return JSON.stringify(result);
     }
+    if (name === 'submit_plan') {
+      const rawMd = String(args.markdown ?? '');
+      if (rawMd.trim().length < 10) {
+        return JSON.stringify({
+          ok: false,
+          error: '计划 markdown 过短（至少约 10 个字符）',
+        });
+      }
+      const { text: markdown, truncated } = truncatePlanMarkdown(rawMd);
+      const title = args.title != null ? String(args.title).trim() : '';
+      let steps = [];
+      if (Array.isArray(args.steps)) {
+        steps = args.steps.map((s) => String(s)).filter(Boolean).slice(0, 50);
+      }
+      const planId = makePlanId();
+      ctx.onEvent?.({
+        type: AGENT_EVENTS.PLAN_READY,
+        planId,
+        title: title || undefined,
+        markdown,
+        steps: steps.length ? steps : undefined,
+        truncated: truncated || undefined,
+      });
+      return JSON.stringify({
+        ok: true,
+        planId,
+        message: '计划已提交，等待用户批准执行',
+        truncated: truncated || undefined,
+      });
+    }
     return JSON.stringify({ ok: false, error: '未知工具: ' + name });
   } catch (err) {
     return JSON.stringify({ ok: false, error: err.message || String(err) });
@@ -762,6 +861,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
   signal,
   onEvent,
   fileChanges,
+  agentMode,
 }) {
   const ops = parseWriteFences(content);
   if (!ops.length) {
@@ -803,6 +903,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
           sessionKey,
           signal,
           diff: diffPayload,
+          agentMode,
         });
       } catch (err) {
         if (err?.code === 'ABORTED' || err?.name === 'AbortError') throw err;
@@ -944,11 +1045,13 @@ async function runAgentLoop({
   sessionKey,
   chatFn,
   confirmTerminal, // legacy optional; prefer gate
+  agentMode,
 }) {
   if (!project?.path) {
     throw new Error('Agent 需要绑定真实项目目录');
   }
 
+  const mode = normalizeAgentMode(agentMode);
   const effectiveGate = resolveGate({ gate });
   const chat = typeof chatFn === 'function' ? chatFn : chatCompletionMessage;
 
@@ -956,7 +1059,16 @@ async function runAgentLoop({
   // 0 = unlimited; otherwise clamp 1..50 for safety when user sets a number
   const unlimited = rawTurns === 0;
   const maxTurns = unlimited ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(50, rawTurns || 8));
-  const tools = toolsForSettings(settings);
+
+  const verifyCmd = settings.verifyBeforeDone === false
+    ? null
+    : resolveVerifyCommand(project.path, settings);
+  let verifyPrompted = false;
+  let verifyRepairPrompted = false;
+  let verifySucceeded = false;
+  let verifyLastFailed = false;
+
+  const tools = toolsForSettings(settings, { agentMode: mode });
   const agentLog = [];
   const applied = [];
   /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
@@ -964,7 +1076,10 @@ async function runAgentLoop({
 
   /** @type {any[]} */
   let working = [
-    { role: 'system', content: agentSystemPrompt(project, settings) },
+    {
+      role: 'system',
+      content: agentSystemPrompt(project, settings, { agentMode: mode, verifyCmd }),
+    },
     ...messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
   ];
 
@@ -1112,6 +1227,7 @@ async function runAgentLoop({
                 sessionKey,
                 signal,
                 diff: diffPayload,
+                agentMode: mode,
               });
               authAllowed = !!auth.allowed;
               authReason = auth.reason;
@@ -1183,6 +1299,35 @@ async function runAgentLoop({
             applied.push({ path: parsed.path, ok: true, bytes: 0, deleted: true });
           }
 
+          // Track verify success when agent runs the exact verify command.
+          if (name === 'run_terminal' && verifyCmd) {
+            const cmd = String(args.command || '').trim();
+            if (cmd === verifyCmd) {
+              const codeOk = parsed.code == null || Number(parsed.code) === 0;
+              const termOk = parsed.ok !== false && codeOk && !parsed.aborted && !parsed.error;
+              if (termOk) {
+                verifySucceeded = true;
+                verifyLastFailed = false;
+                onEvent?.({
+                  type: AGENT_EVENTS.VERIFY_RESULT,
+                  command: verifyCmd,
+                  ok: true,
+                  code: parsed.code != null ? Number(parsed.code) : 0,
+                  summary: stepSummary,
+                });
+              } else {
+                verifyLastFailed = true;
+                onEvent?.({
+                  type: AGENT_EVENTS.VERIFY_RESULT,
+                  command: verifyCmd,
+                  ok: false,
+                  code: parsed.code != null ? Number(parsed.code) : -1,
+                  summary: stepSummary || parsed.error || '验证失败',
+                });
+              }
+            }
+          }
+
           // FILE_CHANGE before TOOL_END so UI can show change strip with tool completion.
           if (MUTATING_TOOLS.has(name) && parsed.ok && diffStats) {
             const changePath = parsed.path || relPath;
@@ -1239,9 +1384,10 @@ async function runAgentLoop({
       continue;
     }
 
-    // Final natural language answer
+    // Final natural language answer (maybe soft-verify first)
     let content = msg.content || '';
     // write fences: preview diff → authorize → write only if allowed
+    // Pass agentMode so plan mode cannot land fence writes.
     const fence = await applyWriteFencesWithGate(project.path, content, {
       gate: effectiveGate,
       confirmTerminal,
@@ -1250,10 +1396,75 @@ async function runAgentLoop({
       signal,
       onEvent,
       fileChanges,
+      agentMode: mode,
     });
     if (fence.applied.length) {
       applied.push(...fence.applied);
       content = fence.displayContent;
+    }
+
+    const hadSuccessfulWrite = applied.some((a) => a && a.ok && !a.error)
+      || fileChanges.length > 0;
+
+    // Soft verify gate (agent only; never blocks done permanently)
+    if (
+      mode === 'agent'
+      && verifyCmd
+      && settings.verifyBeforeDone !== false
+      && hadSuccessfulWrite
+      && settings.terminalEnabled
+      && !verifySucceeded
+      && (unlimited || turn < maxTurns)
+    ) {
+      if (!verifyPrompted) {
+        verifyPrompted = true;
+        working.push({ role: 'assistant', content: content || '(完成修改)' });
+        working.push({
+          role: 'user',
+          content:
+            `请立即使用 run_terminal 执行项目验证命令（不要改命令）：\n${verifyCmd}\n根据输出修复问题或总结结果。`,
+        });
+        continue;
+      }
+      if (!verifyRepairPrompted && verifyLastFailed) {
+        verifyRepairPrompted = true;
+        working.push({ role: 'assistant', content: content || '(验证未通过)' });
+        working.push({
+          role: 'user',
+          content:
+            `验证命令未通过。请根据失败输出尽量修复，并再次 run_terminal：\n${verifyCmd}\n若无法修复请说明原因。`,
+        });
+        continue;
+      }
+      // Allow done with incomplete verify
+      onEvent?.({
+        type: AGENT_EVENTS.VERIFY_RESULT,
+        command: verifyCmd,
+        ok: false,
+        skipped: true,
+        summary: '未完成验证',
+      });
+    } else if (
+      mode === 'agent'
+      && hadSuccessfulWrite
+      && settings.verifyBeforeDone !== false
+      && !settings.terminalEnabled
+      && verifyCmd
+      && !verifySucceeded
+    ) {
+      onEvent?.({
+        type: AGENT_EVENTS.VERIFY_RESULT,
+        command: verifyCmd,
+        ok: false,
+        skipped: true,
+        summary: '终端未启用，跳过验证',
+      });
+    } else if (
+      mode === 'agent'
+      && hadSuccessfulWrite
+      && verifySucceeded
+    ) {
+      // already emitted VERIFY_RESULT ok on tool end
     }
 
     content = appendAgentFooter(content, agentLog, applied, unlimited ? '∞' : turn);
@@ -1264,6 +1475,7 @@ async function runAgentLoop({
       turns: turn,
       toolsSupported,
       fileChanges,
+      agentMode: mode,
     };
   }
 

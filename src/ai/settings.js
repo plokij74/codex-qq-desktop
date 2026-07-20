@@ -14,6 +14,10 @@ const DEFAULT_SETTINGS = {
   terminalEnabled: false,
   terminalRequireConfirm: true,
   terminalTimeoutMs: 60000,
+  // Phase C.1 orchestration
+  defaultAgentMode: 'agent', // plan | agent — only seeds new sessions
+  verifyCommand: '', // empty = auto-detect; 'none' or '-' disables
+  verifyBeforeDone: true,
 };
 
 function getSettingsPath(userDataPath) {
