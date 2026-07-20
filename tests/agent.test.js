@@ -682,15 +682,15 @@ describe('agent tools', () => {
     assert.match(result.content, /partial-full-answer/);
   });
 
-  it('toolsForSettings hides run_terminal when disabled', () => {
-    const off = toolsForSettings({ terminalEnabled: false });
+  it('toolsForSettings hides run_terminal when disabled', async () => {
+    const off = await toolsForSettings({ terminalEnabled: false });
     assert.ok(!off.some((t) => t.function.name === 'run_terminal'));
-    const on = toolsForSettings({ terminalEnabled: true });
+    const on = await toolsForSettings({ terminalEnabled: true });
     assert.ok(on.some((t) => t.function.name === 'run_terminal'));
   });
 
-  it('toolsForSettings plan exposes submit_plan not write_file', () => {
-    const plan = toolsForSettings({ terminalEnabled: true }, { agentMode: 'plan' })
+  it('toolsForSettings plan exposes submit_plan not write_file', async () => {
+    const plan = (await toolsForSettings({ terminalEnabled: true }, { agentMode: 'plan' }))
       .map((t) => t.function.name);
     assert.ok(plan.includes('submit_plan'));
     assert.ok(plan.includes('read_file'));
@@ -699,10 +699,49 @@ describe('agent tools', () => {
     assert.ok(!plan.includes('search_replace'));
     assert.ok(!plan.includes('run_terminal'));
     assert.ok(!plan.includes('git_commit'));
-    const agent = toolsForSettings({ terminalEnabled: false }, { agentMode: 'agent' })
+    const agent = (await toolsForSettings({ terminalEnabled: false }, { agentMode: 'agent' }))
       .map((t) => t.function.name);
     assert.ok(!agent.includes('submit_plan'));
     assert.ok(agent.includes('write_file'));
+  });
+
+  it('toolsForSettings agent includes builtin reads', async () => {
+    const names = (await toolsForSettings({ terminalEnabled: false }, { agentMode: 'agent' }))
+      .map((t) => t.function.name);
+    assert.ok(names.includes('read_file'));
+    assert.ok(names.includes('list_dir'));
+    assert.ok(names.includes('grep'));
+    assert.ok(!names.includes('run_terminal'));
+  });
+
+  it('toolsForSettings exploreReadonly filters to read-only set', async () => {
+    const names = (await toolsForSettings(
+      { terminalEnabled: true },
+      { agentMode: 'agent', subagentDepth: 1 }
+    )).map((t) => t.function.name);
+    for (const n of ['list_dir', 'read_file', 'grep', 'glob', 'git_status', 'git_diff']) {
+      assert.ok(names.includes(n), `expected ${n}`);
+    }
+    assert.ok(!names.includes('write_file'));
+    assert.ok(!names.includes('run_terminal'));
+    assert.ok(!names.includes('git_commit'));
+  });
+
+  it('toolsForSettings includes list_skills when skills enabled', async () => {
+    const names = (await toolsForSettings(
+      { terminalEnabled: false, skillsEnabled: true },
+      { agentMode: 'agent' },
+    )).map((t) => t.function.name);
+    assert.ok(names.includes('list_skills'));
+    assert.ok(names.includes('use_skill'));
+  });
+
+  it('toolsForSettings omits skills when disabled', async () => {
+    const names = (await toolsForSettings(
+      { terminalEnabled: false, skillsEnabled: false },
+      { agentMode: 'agent' },
+    )).map((t) => t.function.name);
+    assert.ok(!names.includes('list_skills'));
   });
 
   it('plan mode submit_plan emits plan-ready', async () => {

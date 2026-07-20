@@ -4,6 +4,7 @@ const READ_TOOLS = new Set([
   'list_dir', 'read_file', 'grep', 'glob',
   'git_status', 'git_diff',
   'submit_plan',
+  'list_skills', 'use_skill', 'spawn_explore',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit',
@@ -19,10 +20,12 @@ const WRITE_TOOLS = new Set([
 const globalSessionAllows = new Map();
 
 function riskForTool(toolName) {
-  if (READ_TOOLS.has(toolName)) return 'read';
-  if (WRITE_TOOLS.has(toolName)) return 'write';
-  if (toolName === 'delete_path') return 'delete';
-  if (toolName === 'run_terminal') return 'terminal';
+  const name = String(toolName || '');
+  if (name.startsWith('mcp_')) return 'mcp';
+  if (READ_TOOLS.has(name)) return 'read';
+  if (WRITE_TOOLS.has(name)) return 'write';
+  if (name === 'delete_path') return 'delete';
+  if (name === 'run_terminal') return 'terminal';
   return 'write';
 }
 

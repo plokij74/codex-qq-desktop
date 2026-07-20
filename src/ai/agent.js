@@ -26,6 +26,7 @@ const {
   truncatePlanMarkdown,
 } = require('./agent-mode');
 const { resolveVerifyCommand } = require('./verify');
+const { createDefaultRegistry: buildDefaultRegistry } = require('./providers');
 
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
@@ -222,10 +223,41 @@ const TOOL_NAMES = TOOL_DEFS.map((t) => t.function.name).join(', ');
 /**
  * @param {object} project
  * @param {object} settings
- * @param {{ agentMode?: string, verifyCmd?: string|null }} [opts]
+ * @param {{ agentMode?: string, verifyCmd?: string|null, subagentDepth?: number, exploreReadonly?: boolean }} [opts]
  */
 function agentSystemPrompt(project, settings, opts = {}) {
+  const depth = Number(opts.subagentDepth) || 0;
+  const exploreReadonly = !!opts.exploreReadonly || depth >= 1;
   const mode = normalizeAgentMode(opts.agentMode);
+
+  // Nested explore sub-agent: short readonly research prompt only.
+  if (depth >= 1 || exploreReadonly) {
+    const parts = [
+      '你是只读调研子 Agent（explore）。只能使用 list_dir / read_file / grep / glob / git_status / git_diff。',
+      '禁止写文件、删除、终端、git_commit、submit_plan、spawn_explore、skills。',
+      '围绕用户给出的 goal 做代码库调研，完成后用中文给出简洁结论（关键路径、发现、不确定点）。',
+      '不要编造文件内容；先搜/读再总结。路径一律相对项目根。',
+    ];
+    if (project?.path) {
+      parts.push(`当前工作项目：${project.name || path.basename(project.path)}`);
+      parts.push(`项目根目录（真实路径）: ${project.path}`);
+      try {
+        const ignoreRules = loadGitignoreRules(project.path);
+        const t = listTree(project.path, {
+          maxDepth: 3,
+          maxEntries: 80,
+          ignoreRules,
+        });
+        parts.push('');
+        parts.push(`简要目录树（maxDepth=3, maxEntries=80, 扫描 ${t.count} 项, 截断=${t.truncated}）:`);
+        parts.push(t.treeText);
+      } catch (e) {
+        parts.push(`目录树读取失败: ${e.message}`);
+      }
+    }
+    return parts.join('\n');
+  }
+
   const parts = [
     '你是 Codex 风格编程 Agent。你可以通过工具在本机真实项目上操作。',
     '工作流：需要信息时先 list_dir / glob / grep / read_file，再修改；优先 search_replace 做局部修改；新建或整文件重写用 write_file；提交用 git_status / git_diff / git_commit（不 push）；必要时 run_terminal 验证。',
@@ -251,6 +283,11 @@ function agentSystemPrompt(project, settings, opts = {}) {
     parts.push('');
     parts.push(`【验证】完成代码修改后应使用 run_terminal 执行约定验证命令：\`${opts.verifyCmd}\``);
     parts.push('若命令失败，根据输出修复或说明阻塞原因。');
+  }
+
+  if (settings?.subagentEnabled !== false && mode === 'agent') {
+    parts.push('');
+    parts.push('【子 Agent】复杂调研可用 spawn_explore(goal, maxTurns?) 派发只读 explore 子 Agent，会返回 summary；勿嵌套 spawn。');
   }
 
   if (project?.path) {
@@ -287,15 +324,43 @@ function agentSystemPrompt(project, settings, opts = {}) {
 }
 
 /**
- * @param {object} settings
- * @param {{ agentMode?: string }} [opts]
+ * Default ToolProvider registry (builtin + skills + explore + mcp).
+ * Lazy deps avoid cycles: providers never require agent at load time.
+ * runAgentLoop is a function declaration (hoisted) so it is safe here.
  */
-function toolsForSettings(settings, opts = {}) {
+function createDefaultRegistry() {
+  return buildDefaultRegistry({
+    getToolDefs: () => TOOL_DEFS,
+    executeTool: executeToolFixed,
+    runLoop: runAgentLoop,
+  });
+}
+
+/**
+ * Collect tools from registry then filter by agent mode.
+ * @param {object} settings
+ * @param {{
+ *   agentMode?: string,
+ *   subagentDepth?: number,
+ *   exploreReadonly?: boolean,
+ *   project?: object|null,
+ *   extensions?: object,
+ *   registry?: object,
+ * }} [opts]
+ * @returns {Promise<Array>}
+ */
+async function toolsForSettings(settings, opts = {}) {
   const agentMode = normalizeAgentMode(opts.agentMode);
-  let tools = TOOL_DEFS.slice();
-  if (!settings.terminalEnabled) {
-    tools = tools.filter((t) => t.function.name !== 'run_terminal');
-  }
+  const registry = opts.registry || createDefaultRegistry();
+  const ctx = {
+    settings,
+    agentMode,
+    subagentDepth: Number(opts.subagentDepth) || 0,
+    exploreReadonly: !!opts.exploreReadonly,
+    project: opts.project || null,
+    extensions: opts.extensions || {},
+  };
+  const tools = await registry.collectTools(ctx);
   return filterToolsForMode(tools, agentMode);
 }
 
@@ -379,6 +444,8 @@ function toolSummary(name, args) {
       return `git commit: ${String(args.message || '').slice(0, 80)}`;
     case 'submit_plan':
       return `提交计划${args.title ? `: ${String(args.title).slice(0, 60)}` : ''}`;
+    case 'spawn_explore':
+      return `子 Agent 调研: ${String(args.goal || '').slice(0, 80)}`;
     default:
       return name;
   }
@@ -427,6 +494,10 @@ function summarizeToolResult(name, parsed) {
   if (name === 'git_diff') return parsed.truncated ? 'diff (truncated)' : 'diff';
   if (name === 'git_commit') return parsed.summary || parsed.commit || 'committed';
   if (name === 'submit_plan') return parsed.planId ? `plan ${parsed.planId}` : 'plan submitted';
+  if (name === 'spawn_explore') {
+    if (parsed.ok === false) return parsed.error || 'explore failed';
+    return parsed.summary ? String(parsed.summary).slice(0, 120) : `turns=${parsed.turns ?? '?'}`;
+  }
   return 'ok';
 }
 
@@ -1046,14 +1117,20 @@ async function runAgentLoop({
   chatFn,
   confirmTerminal, // legacy optional; prefer gate
   agentMode,
+  subagentDepth = 0,
+  registry: registryOpt,
+  extensions: extensionsOpt,
 }) {
   if (!project?.path) {
     throw new Error('Agent 需要绑定真实项目目录');
   }
 
   const mode = normalizeAgentMode(agentMode);
+  const depth = Number(subagentDepth) || 0;
   const effectiveGate = resolveGate({ gate });
   const chat = typeof chatFn === 'function' ? chatFn : chatCompletionMessage;
+  const registry = registryOpt || createDefaultRegistry();
+  const extensions = extensionsOpt || {};
 
   const rawTurns = Number(settings.maxAgentTurns);
   // 0 = unlimited; otherwise clamp 1..50 for safety when user sets a number
@@ -1068,25 +1145,60 @@ async function runAgentLoop({
   let verifySucceeded = false;
   let verifyLastFailed = false;
 
-  const tools = toolsForSettings(settings, { agentMode: mode });
-  const agentLog = [];
-  const applied = [];
-  /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
-  const fileChanges = [];
+  const runCtx = {
+    project,
+    settings,
+    agentMode: mode,
+    subagentDepth: depth,
+    exploreReadonly: depth >= 1,
+    gate: effectiveGate,
+    onEvent,
+    signal,
+    sessionKey,
+    extensions,
+    registry,
+  };
 
-  /** @type {any[]} */
-  let working = [
-    {
-      role: 'system',
-      content: agentSystemPrompt(project, settings, { agentMode: mode, verifyCmd }),
-    },
-    ...messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
-  ];
+  try {
+    await registry.onRunStart(runCtx);
 
-  let toolsSupported = true;
-  let streamFailedOnce = false;
+    const tools = await toolsForSettings(settings, {
+      agentMode: mode,
+      subagentDepth: depth,
+      exploreReadonly: depth >= 1,
+      project,
+      extensions,
+      registry,
+    });
+    const agentLog = [];
+    const applied = [];
+    /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
+    const fileChanges = [];
 
-  for (let turn = 1; unlimited || turn <= maxTurns; turn++) {
+    let systemContent = agentSystemPrompt(project, settings, {
+      agentMode: mode,
+      verifyCmd,
+      subagentDepth: depth,
+      exploreReadonly: depth >= 1,
+    });
+    const fragments = await registry.systemFragments(runCtx);
+    if (fragments && String(fragments).trim()) {
+      systemContent = `${systemContent}\n\n${String(fragments).trim()}`;
+    }
+
+    /** @type {any[]} */
+    let working = [
+      {
+        role: 'system',
+        content: systemContent,
+      },
+      ...messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
+    ];
+
+    let toolsSupported = true;
+    let streamFailedOnce = false;
+
+    for (let turn = 1; unlimited || turn <= maxTurns; turn++) {
     assertNotAborted(signal);
     let msg;
     try {
@@ -1259,7 +1371,8 @@ async function runAgentLoop({
                 resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
               }
             } else {
-              resultStr = await executeToolFixed(name, args, {
+              resultStr = await registry.execute(name, args, {
+                ...runCtx,
                 project,
                 settings,
                 signal,
@@ -1487,6 +1600,9 @@ async function runAgentLoop({
     maxTurns
   );
   return { content, applied, agentLog, turns: maxTurns, toolsSupported, fileChanges };
+  } finally {
+    await registry.onRunEnd(runCtx);
+  }
 }
 
 function appendAgentFooter(content, agentLog, applied, turns) {
@@ -1514,6 +1630,7 @@ module.exports = {
   toolsForSettings,
   TOOL_DEFS,
   executeToolFixed,
+  createDefaultRegistry,
   assertNotAborted,
   riskForTool,
   authorizeTool,

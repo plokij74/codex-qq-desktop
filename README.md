@@ -205,4 +205,27 @@ npm run dist
 
 ### 本阶段明确不做
 
-MCP、子 Agent、Skills / Hooks、多计划版本树、未验证时硬挡 `git_commit`。
+多计划版本树、未验证时硬挡 `git_commit`、Hooks。Skills / explore 子 Agent / MCP 见 **Phase C.2**。
+
+## Phase C.2：平台化（Skills + explore + MCP）
+
+### Skills
+
+- 目录：项目 `.codex/skills/<id>/SKILL.md`、userData `skills/`、内置 `src/skills/`
+- 工具：`list_skills` / `use_skill`；斜杠 `/skills`、`/skill <name>`
+- 设置：`skillsEnabled`（默认开）
+
+### explore 子 Agent
+
+- 工具：`spawn_explore`（仅执行模式）；只读六件套；默认 4 轮，最多 8
+- 设置：`subagentEnabled`（默认开）
+
+### MCP（stdio）
+
+- 设置：`mcpEnabled`（默认关）+ `mcpServers` JSON
+- 每次 Agent run 连接，结束断开；工具名 `mcp_<server>_<tool>`；权限同写操作
+- 仅 stdio；无 SSE/HTTP
+
+### 后续
+
+- C.3 Hooks · C.4 更强子 Agent · C.5 MCP/Skills 增强

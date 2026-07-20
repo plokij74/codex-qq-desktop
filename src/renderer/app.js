@@ -1182,6 +1182,14 @@ function handleChatEvent(ev) {
     renderVerifyStrip(ev);
     return;
   }
+  if (type === 'subagent-start') {
+    setRunStatus('子 Agent 调研中: ' + String(ev.goal || '').slice(0, 60));
+    return;
+  }
+  if (type === 'subagent-end') {
+    setRunStatus(ev.ok ? '子 Agent 完成' : ('子 Agent 失败: ' + (ev.error || '')));
+    return;
+  }
   if (type === 'turn-end') {
     return;
   }
@@ -1769,7 +1777,10 @@ function buildOutgoingText(raw) {
 function handleSlashCommand(text) {
   const cmd = text.trim(); const lower = cmd.toLowerCase();
   if (lower === '/help') {
-    activeSession().messages.push({ role: 'assistant', content: '命令：/help /clear /mode /new 标题 /ls\n任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）' });
+    activeSession().messages.push({
+      role: 'assistant',
+      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name>\n任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）',
+    });
     saveState(); renderMessages(); return true;
   }
   if (lower === '/clear') { clearCurrentChat(); return true; }
@@ -1779,6 +1790,32 @@ function handleSlashCommand(text) {
   }
   if (lower === '/ls' || lower === '/tree') { document.getElementById('chat-input').value = '列出文件'; sendMessage(); return true; }
   if (lower.startsWith('/new ')) { document.getElementById('task-title').value = cmd.slice(5).trim() || '未命名任务'; document.getElementById('task-brief').value = ''; createTaskFromModal(); return true; }
+  if (lower === '/skills') {
+    const proj = sessionProject(activeSession());
+    window.codex.listSkills({ projectPath: proj?.path || null }).then((r) => {
+      const lines = (r.skills || []).map((s) => `- **${s.name}** (${s.source}): ${s.description || ''}`);
+      activeSession().messages.push({
+        role: 'assistant',
+        content: lines.length ? ('可用 Skills：\n' + lines.join('\n')) : '暂无 Skills。',
+      });
+      saveState(); renderMessages();
+    }).catch((e) => toast(e.message || String(e)));
+    return true;
+  }
+  if (lower.startsWith('/skill ')) {
+    const name = cmd.slice(7).trim();
+    const proj = sessionProject(activeSession());
+    window.codex.getSkill({ name, projectPath: proj?.path || null }).then((r) => {
+      if (!r.ok) {
+        toast(r.error || '未找到 skill');
+        return;
+      }
+      document.getElementById('chat-input').value =
+        `请按技能 ${r.name} 执行：\n\n${r.body}`;
+      sendMessage();
+    }).catch((e) => toast(e.message || String(e)));
+    return true;
+  }
   return false;
 }
 function clearCurrentChat() {
@@ -1807,10 +1844,36 @@ async function openSettings() {
   if (vc) vc.value = settings.verifyCommand || '';
   const vbd = document.getElementById('set-verify-before-done');
   if (vbd) vbd.checked = settings.verifyBeforeDone !== false;
+  const se = document.getElementById('set-skills-enabled');
+  if (se) se.checked = settings.skillsEnabled !== false;
+  const sub = document.getElementById('set-subagent-enabled');
+  if (sub) sub.checked = settings.subagentEnabled !== false;
+  const mcpEn = document.getElementById('set-mcp-enabled');
+  if (mcpEn) mcpEn.checked = Boolean(settings.mcpEnabled);
+  const mcpServersEl = document.getElementById('set-mcp-servers');
+  if (mcpServersEl) {
+    const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
+    mcpServersEl.value = servers.length ? JSON.stringify(servers, null, 2) : '';
+  }
   document.getElementById('settings-modal').classList.remove('hidden');
 }
 function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
 async function saveSettingsFromForm() {
+  const mcpRaw = document.getElementById('set-mcp-servers')?.value?.trim() || '';
+  let mcpServers = [];
+  if (mcpRaw) {
+    try {
+      const parsed = JSON.parse(mcpRaw);
+      if (!Array.isArray(parsed)) {
+        toast('MCP 服务器 JSON 必须是数组');
+        return;
+      }
+      mcpServers = parsed;
+    } catch {
+      toast('MCP 服务器 JSON 无效，已中止保存');
+      return;
+    }
+  }
   const partial = {
     mode: document.getElementById('set-mode').value,
     baseUrl: document.getElementById('set-base-url').value.trim(),
@@ -1823,6 +1886,10 @@ async function saveSettingsFromForm() {
     defaultAgentMode: document.getElementById('set-default-agent-mode')?.value === 'plan' ? 'plan' : 'agent',
     verifyCommand: document.getElementById('set-verify-command')?.value?.trim() || '',
     verifyBeforeDone: document.getElementById('set-verify-before-done')?.checked !== false,
+    skillsEnabled: document.getElementById('set-skills-enabled')?.checked !== false,
+    subagentEnabled: document.getElementById('set-subagent-enabled')?.checked !== false,
+    mcpEnabled: Boolean(document.getElementById('set-mcp-enabled')?.checked),
+    mcpServers,
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
   await window.codex.saveSettings(partial);

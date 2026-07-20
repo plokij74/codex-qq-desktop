@@ -31,6 +31,43 @@ describe('permission', () => {
     assert.equal(riskForTool('submit_plan'), 'read');
   });
 
+  it('riskForTool maps skills and spawn_explore to read', () => {
+    assert.equal(riskForTool('list_skills'), 'read');
+    assert.equal(riskForTool('use_skill'), 'read');
+    assert.equal(riskForTool('spawn_explore'), 'read');
+  });
+
+  it('riskForTool maps mcp_ prefix to mcp', () => {
+    assert.equal(riskForTool('mcp_git_status'), 'mcp');
+    assert.equal(riskForTool('mcp_server_tool_name'), 'mcp');
+  });
+
+  it('plan mode denies mcp risk even in full-auto', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      agentMode: 'plan',
+      onApprovalNeeded: async () => {},
+    });
+    const r = await gate.authorize({ tool: 'mcp_x_y', risk: 'mcp', sessionKey: 's' });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /计划模式/);
+  });
+
+  it('confirm-writes treats mcp like write (needs approval)', async () => {
+    let called = false;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      agentMode: 'agent',
+      onApprovalNeeded: async (p) => {
+        called = true;
+        gate.resolveApproval(p.approvalId, 'allow');
+      },
+    });
+    const r = await gate.authorize({ tool: 'mcp_a_b', risk: 'mcp', sessionKey: 's-mcp' });
+    assert.equal(r.allowed, true);
+    assert.equal(called, true);
+  });
+
   it('plan mode denies write even in full-auto', async () => {
     const gate = createPermissionGate({
       permissionMode: 'full-auto',

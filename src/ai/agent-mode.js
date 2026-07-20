@@ -1,6 +1,6 @@
 /** Phase C.1 plan | agent mode helpers */
 
-const PLAN_BLOCKED_RISKS = new Set(['write', 'delete', 'terminal']);
+const PLAN_BLOCKED_RISKS = new Set(['write', 'delete', 'terminal', 'mcp']);
 
 const PLAN_HIDDEN_TOOLS = new Set([
   'search_replace',
@@ -8,6 +8,7 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'delete_path',
   'git_commit',
   'run_terminal',
+  'spawn_explore',
 ]);
 
 const PLAN_MARKDOWN_MAX = 32 * 1024;
@@ -41,7 +42,10 @@ function filterToolsForMode(toolDefs, agentMode) {
   if (mode === 'plan') {
     return list.filter((t) => {
       const name = t?.function?.name;
-      return name && !PLAN_HIDDEN_TOOLS.has(name);
+      if (!name) return false;
+      if (PLAN_HIDDEN_TOOLS.has(name)) return false;
+      if (String(name).startsWith('mcp_')) return false;
+      return true;
     });
   }
   return list.filter((t) => t?.function?.name !== 'submit_plan');

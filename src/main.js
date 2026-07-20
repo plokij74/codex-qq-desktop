@@ -25,6 +25,7 @@ const {
   normalizeAgentMode,
   buildApproveExecutionMessage,
 } = require('./ai/agent-mode');
+const { discoverSkills, loadSkillBody } = require('./ai/skills-loader');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
@@ -80,6 +81,10 @@ function userDataPath() {
   return app.getPath('userData');
 }
 
+function bundledSkillsDir() {
+  return path.join(__dirname, 'skills');
+}
+
 function toPublicSettings(s) {
   return {
     mode: s.mode,
@@ -96,7 +101,31 @@ function toPublicSettings(s) {
     defaultAgentMode: AGENT_MODES.has(s.defaultAgentMode) ? s.defaultAgentMode : 'agent',
     verifyCommand: s.verifyCommand != null ? String(s.verifyCommand) : '',
     verifyBeforeDone: s.verifyBeforeDone !== false,
+    skillsEnabled: s.skillsEnabled !== false,
+    subagentEnabled: s.subagentEnabled !== false,
+    mcpEnabled: Boolean(s.mcpEnabled),
+    mcpServers: sanitizeMcpServers(s.mcpServers),
   };
+}
+
+function sanitizeMcpServers(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const name = String(item.name || '').trim();
+    const command = String(item.command || '').trim();
+    if (!/^[a-zA-Z0-9_-]+$/.test(name) || !command) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const entry = { name, command };
+    if (Array.isArray(item.args)) entry.args = item.args.map(String);
+    if (item.env && typeof item.env === 'object') entry.env = item.env;
+    if (item.cwd) entry.cwd = String(item.cwd);
+    out.push(entry);
+  }
+  return out;
 }
 
 function isAbortError(err, signal) {
@@ -183,7 +212,15 @@ ipcMain.handle('settings:get', async () => toPublicSettings(loadSettings(userDat
 ipcMain.handle('settings:save', async (_e, partial = {}) => {
   const nextPartial = { ...partial };
   if (!nextPartial.apiKey) delete nextPartial.apiKey;
-  for (const k of ['agentEnabled', 'terminalEnabled', 'terminalRequireConfirm', 'verifyBeforeDone']) {
+  for (const k of [
+    'agentEnabled',
+    'terminalEnabled',
+    'terminalRequireConfirm',
+    'verifyBeforeDone',
+    'skillsEnabled',
+    'subagentEnabled',
+    'mcpEnabled',
+  ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
   if ('maxAgentTurns' in nextPartial) {
@@ -202,7 +239,34 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
   if ('verifyCommand' in nextPartial) {
     nextPartial.verifyCommand = String(nextPartial.verifyCommand ?? '');
   }
+  if ('mcpServers' in nextPartial) {
+    nextPartial.mcpServers = sanitizeMcpServers(nextPartial.mcpServers);
+  }
   return toPublicSettings(saveSettings(userDataPath(), nextPartial));
+});
+
+ipcMain.handle('skills:list', async (_e, payload = {}) => {
+  const skills = discoverSkills({
+    projectPath: payload.projectPath || null,
+    userDataPath: userDataPath(),
+    bundledDir: bundledSkillsDir(),
+  });
+  return {
+    ok: true,
+    skills: skills.map((s) => ({ name: s.name, description: s.description, source: s.source })),
+  };
+});
+
+ipcMain.handle('skills:get', async (_e, payload = {}) => {
+  const skills = discoverSkills({
+    projectPath: payload.projectPath || null,
+    userDataPath: userDataPath(),
+    bundledDir: bundledSkillsDir(),
+  });
+  const name = String(payload.name || '').trim().toLowerCase();
+  const meta = skills.find((s) => s.name === name);
+  if (!meta) return { ok: false, error: '未找到 skill: ' + name };
+  return loadSkillBody(meta);
 });
 
 ipcMain.handle('dialog:selectDirectory', async () => {
@@ -657,6 +721,9 @@ async function startChatRun(event, payload = {}, opts = {}) {
         sessionKey: sessionId,
         signal,
         agentMode,
+        extensions: {
+          userDataPath: userDataPath(),
+        },
       });
       const out = {
         content: result.content,

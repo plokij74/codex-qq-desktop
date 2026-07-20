@@ -997,6 +997,16 @@ html, body {
   color: #6a5010;
 }
 
+.subagent-strip {
+  margin: 6px 0 2px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-size: 12px;
+  border: 1px solid #8a9bcc;
+  background: #eef2fc;
+  color: #243a6a;
+}
+
 .msg-assistant .bubble.has-run {
   min-width: 220px;
   max-width: 100%;

@@ -24,6 +24,26 @@ describe('agent-mode', () => {
     assert.equal(isPlanBlockedRisk('read'), false);
   });
 
+  it('isPlanBlockedRisk includes mcp', () => {
+    assert.equal(isPlanBlockedRisk('mcp'), true);
+  });
+
+  it('filterToolsForMode plan hides spawn_explore and mcp_*', () => {
+    const defs = [
+      { function: { name: 'read_file' } },
+      { function: { name: 'spawn_explore' } },
+      { function: { name: 'mcp_demo_ping' } },
+      { function: { name: 'submit_plan' } },
+      { function: { name: 'list_skills' } },
+    ];
+    const plan = filterToolsForMode(defs, 'plan').map((t) => t.function.name);
+    assert.ok(plan.includes('read_file'));
+    assert.ok(plan.includes('submit_plan'));
+    assert.ok(plan.includes('list_skills'));
+    assert.ok(!plan.includes('spawn_explore'));
+    assert.ok(!plan.includes('mcp_demo_ping'));
+  });
+
   it('filterToolsForMode plan hides writes and keeps submit_plan', () => {
     const defs = [
       { function: { name: 'read_file' } },

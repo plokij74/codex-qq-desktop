@@ -26,4 +26,6 @@ contextBridge.exposeInMainWorld('codex', {
   clearTerminal: () => ipcRenderer.invoke('terminal:clear'),
   atRefComplete: (payload) => ipcRenderer.invoke('atRef:complete', payload || {}),
   atRefExpand: (payload) => ipcRenderer.invoke('atRef:expand', payload || {}),
+  listSkills: (payload) => ipcRenderer.invoke('skills:list', payload || {}),
+  getSkill: (payload) => ipcRenderer.invoke('skills:get', payload || {}),
 });

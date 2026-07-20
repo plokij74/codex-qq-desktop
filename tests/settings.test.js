@@ -57,4 +57,23 @@ describe('settings', () => {
     assert.equal(AGENT_EVENTS.PLAN_APPROVED, 'plan-approved');
     assert.equal(AGENT_EVENTS.PLAN_REJECTED, 'plan-rejected');
   });
+
+  it('defaults Phase C.2 platform settings', () => {
+    const { DEFAULT_SETTINGS } = require('../src/ai/settings');
+    assert.equal(DEFAULT_SETTINGS.skillsEnabled, true);
+    assert.equal(DEFAULT_SETTINGS.subagentEnabled, true);
+    assert.equal(DEFAULT_SETTINGS.mcpEnabled, false);
+    assert.deepEqual(DEFAULT_SETTINGS.mcpServers, []);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const s = require('../src/ai/settings').loadSettings(dir);
+    assert.equal(s.skillsEnabled, true);
+    assert.equal(s.mcpEnabled, false);
+  });
+
+  it('AGENT_EVENTS includes subagent and mcp names', () => {
+    const { AGENT_EVENTS } = require('../src/ai/agent-events');
+    assert.equal(AGENT_EVENTS.SUBAGENT_START, 'subagent-start');
+    assert.equal(AGENT_EVENTS.SUBAGENT_END, 'subagent-end');
+    assert.equal(AGENT_EVENTS.MCP_STATUS, 'mcp-status');
+  });
 });

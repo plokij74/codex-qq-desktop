@@ -18,6 +18,11 @@ const DEFAULT_SETTINGS = {
   defaultAgentMode: 'agent', // plan | agent — only seeds new sessions
   verifyCommand: '', // empty = auto-detect; 'none' or '-' disables
   verifyBeforeDone: true,
+  // Phase C.2 platform
+  skillsEnabled: true,
+  subagentEnabled: true,
+  mcpEnabled: false,
+  mcpServers: [], // { name, command, args?, env?, cwd? }[]
 };
 
 function getSettingsPath(userDataPath) {

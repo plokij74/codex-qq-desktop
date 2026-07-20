@@ -17,6 +17,9 @@ const AGENT_EVENTS = {
   PLAN_APPROVED: 'plan-approved',
   PLAN_REJECTED: 'plan-rejected',
   VERIFY_RESULT: 'verify-result',
+  SUBAGENT_START: 'subagent-start',
+  SUBAGENT_END: 'subagent-end',
+  MCP_STATUS: 'mcp-status',
 };
 
 module.exports = { AGENT_EVENTS };

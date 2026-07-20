@@ -216,7 +216,14 @@
           <input id="set-verify-command" type="text" placeholder="空=自动探测 npm test；none 禁用" />
         </label>
         <label class="switch-row"><input type="checkbox" id="set-verify-before-done" checked /> <span>有写盘时收工前提示跑验证</span></label>
-        <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。计划模式只读 + submit_plan。</small>
+        <label class="switch-row"><input type="checkbox" id="set-skills-enabled" checked /> <span>启用 Skills（/skills、use_skill）</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-subagent-enabled" checked /> <span>启用 Explore 子 Agent（spawn_explore）</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-mcp-enabled" /> <span>启用 MCP（stdio）</span></label>
+        <label class="field">
+          <span>MCP 服务器 JSON</span>
+          <textarea id="set-mcp-servers" rows="5" placeholder='[{"name":"demo","command":"npx","args":["-y","@modelcontextprotocol/server-everything"]}]'></textarea>
+        </label>
+        <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。计划模式只读 + submit_plan。MCP 仅 agent 模式、非子 Agent 时连接。</small>
       </div>
       <div class="modal-actions">
         <button type="button" id="btn-settings-cancel" class="btn-secondary">取消</button>
