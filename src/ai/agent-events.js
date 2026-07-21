@@ -20,6 +20,8 @@ const AGENT_EVENTS = {
   SUBAGENT_START: 'subagent-start',
   SUBAGENT_END: 'subagent-end',
   MCP_STATUS: 'mcp-status',
+  HOOK_START: 'hook-start',
+  HOOK_END: 'hook-end',
 };
 
 module.exports = { AGENT_EVENTS };

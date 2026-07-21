@@ -76,4 +76,17 @@ describe('settings', () => {
     assert.equal(AGENT_EVENTS.SUBAGENT_END, 'subagent-end');
     assert.equal(AGENT_EVENTS.MCP_STATUS, 'mcp-status');
   });
+
+  it('defaults Phase C.3 hooksEnabled', () => {
+    const { DEFAULT_SETTINGS, loadSettings } = require('../src/ai/settings');
+    assert.equal(DEFAULT_SETTINGS.hooksEnabled, true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    assert.equal(loadSettings(dir).hooksEnabled, true);
+  });
+
+  it('AGENT_EVENTS includes hook names', () => {
+    const { AGENT_EVENTS } = require('../src/ai/agent-events');
+    assert.equal(AGENT_EVENTS.HOOK_START, 'hook-start');
+    assert.equal(AGENT_EVENTS.HOOK_END, 'hook-end');
+  });
 });

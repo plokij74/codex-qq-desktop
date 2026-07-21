@@ -23,6 +23,8 @@ const DEFAULT_SETTINGS = {
   subagentEnabled: true,
   mcpEnabled: false,
   mcpServers: [], // { name, command, args?, env?, cwd? }[]
+  // Phase C.3 hooks
+  hooksEnabled: true,
 };
 
 function getSettingsPath(userDataPath) {
