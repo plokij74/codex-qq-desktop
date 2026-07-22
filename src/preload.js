@@ -28,4 +28,5 @@ contextBridge.exposeInMainWorld('codex', {
   atRefExpand: (payload) => ipcRenderer.invoke('atRef:expand', payload || {}),
   listSkills: (payload) => ipcRenderer.invoke('skills:list', payload || {}),
   getSkill: (payload) => ipcRenderer.invoke('skills:get', payload || {}),
+  hooksSummary: (payload) => ipcRenderer.invoke('hooks:summary', payload || {}),
 });

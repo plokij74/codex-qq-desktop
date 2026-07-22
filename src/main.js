@@ -26,6 +26,7 @@ const {
   buildApproveExecutionMessage,
 } = require('./ai/agent-mode');
 const { discoverSkills, loadSkillBody } = require('./ai/skills-loader');
+const { loadHooks } = require('./ai/hooks-loader');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
@@ -105,6 +106,7 @@ function toPublicSettings(s) {
     subagentEnabled: s.subagentEnabled !== false,
     mcpEnabled: Boolean(s.mcpEnabled),
     mcpServers: sanitizeMcpServers(s.mcpServers),
+    hooksEnabled: s.hooksEnabled !== false,
   };
 }
 
@@ -220,6 +222,7 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     'skillsEnabled',
     'subagentEnabled',
     'mcpEnabled',
+    'hooksEnabled',
   ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
@@ -267,6 +270,22 @@ ipcMain.handle('skills:get', async (_e, payload = {}) => {
   const meta = skills.find((s) => s.name === name);
   if (!meta) return { ok: false, error: '未找到 skill: ' + name };
   return loadSkillBody(meta);
+});
+
+ipcMain.handle('hooks:summary', async (_e, payload = {}) => {
+  const settings = loadSettings(userDataPath());
+  const projectPath = payload.projectPath ? String(payload.projectPath) : null;
+  const resolved = loadHooks({
+    userDataPath: userDataPath(),
+    projectPath,
+  });
+  return {
+    enabled: settings.hooksEnabled !== false,
+    userPath: resolved.userPath,
+    projectPath: resolved.projectPath,
+    countsByEvent: resolved.countsByEvent,
+    errors: resolved.errors,
+  };
 });
 
 ipcMain.handle('dialog:selectDirectory', async () => {
