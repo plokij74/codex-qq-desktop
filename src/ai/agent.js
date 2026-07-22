@@ -27,6 +27,8 @@ const {
 } = require('./agent-mode');
 const { resolveVerifyCommand } = require('./verify');
 const { createDefaultRegistry: buildDefaultRegistry } = require('./providers');
+const { loadHooks } = require('./hooks-loader');
+const { createHooksRunner } = require('./hooks-runner');
 
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
@@ -1159,85 +1161,82 @@ async function runAgentLoop({
     registry,
   };
 
+  const userDataPath = extensions.userDataPath || null;
+  let hooksRunner = null;
+  let stopReason = 'done';
+
   try {
     await registry.onRunStart(runCtx);
 
-    const tools = await toolsForSettings(settings, {
-      agentMode: mode,
-      subagentDepth: depth,
-      exploreReadonly: depth >= 1,
-      project,
-      extensions,
-      registry,
-    });
-    const agentLog = [];
-    const applied = [];
-    /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
-    const fileChanges = [];
-
-    let systemContent = agentSystemPrompt(project, settings, {
-      agentMode: mode,
-      verifyCmd,
-      subagentDepth: depth,
-      exploreReadonly: depth >= 1,
-    });
-    const fragments = await registry.systemFragments(runCtx);
-    if (fragments && String(fragments).trim()) {
-      systemContent = `${systemContent}\n\n${String(fragments).trim()}`;
-    }
-
-    /** @type {any[]} */
-    let working = [
-      {
-        role: 'system',
-        content: systemContent,
-      },
-      ...messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
-    ];
-
-    let toolsSupported = true;
-    let streamFailedOnce = false;
-
-    for (let turn = 1; unlimited || turn <= maxTurns; turn++) {
-    assertNotAborted(signal);
-    let msg;
-    try {
-      const called = await callModelTurn({
-        chatFn: chat,
+    if (depth === 0 && settings.hooksEnabled !== false && userDataPath) {
+      const resolved = loadHooks({ userDataPath, projectPath: project.path });
+      hooksRunner = createHooksRunner({
+        hooks: resolved,
+        projectPath: project.path,
+        userDataPath,
         settings,
-        working,
-        tools,
-        toolsSupported,
-        fetchFn,
-        signal,
+        sessionKey,
+        agentMode: mode,
+        subagentDepth: depth,
         onEvent,
-        streamFailedOnce,
+        signal,
       });
-      msg = called.msg;
-      streamFailedOnce = called.streamFailedOnce;
-    } catch (err) {
-      if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
-        const e = new Error('已停止');
-        e.code = 'ABORTED';
-        throw e;
+      await hooksRunner.runLifecycle('SessionStart');
+      const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+      await hooksRunner.runLifecycle('UserPromptSubmit', {
+        promptPreview: lastUser ? String(lastUser.content || '') : '',
+      });
+    }
+    // stash on runCtx for tool path (Task 5)
+    runCtx.hooksRunner = hooksRunner;
+
+    try {
+      const tools = await toolsForSettings(settings, {
+        agentMode: mode,
+        subagentDepth: depth,
+        exploreReadonly: depth >= 1,
+        project,
+        extensions,
+        registry,
+      });
+      const agentLog = [];
+      const applied = [];
+      /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
+      const fileChanges = [];
+
+      let systemContent = agentSystemPrompt(project, settings, {
+        agentMode: mode,
+        verifyCmd,
+        subagentDepth: depth,
+        exploreReadonly: depth >= 1,
+      });
+      const fragments = await registry.systemFragments(runCtx);
+      if (fragments && String(fragments).trim()) {
+        systemContent = `${systemContent}\n\n${String(fragments).trim()}`;
       }
-      // Some gateways reject tools — retry once without tools
-      if (toolsSupported && /tools|tool_choice|unsupported|400/i.test(String(err.message))) {
-        toolsSupported = false;
+
+      /** @type {any[]} */
+      let working = [
+        {
+          role: 'system',
+          content: systemContent,
+        },
+        ...messages.map((m) => ({ role: m.role, content: String(m.content || '') })),
+      ];
+
+      let toolsSupported = true;
+      let streamFailedOnce = false;
+
+      for (let turn = 1; unlimited || turn <= maxTurns; turn++) {
+      assertNotAborted(signal);
+      let msg;
+      try {
         const called = await callModelTurn({
           chatFn: chat,
           settings,
-          working: [
-            ...working,
-            {
-              role: 'system',
-              content:
-                '当前 API 不支持 tools。请用文本协议调用工具：\n```tool list_dir\n{"path":"."}\n```\n可用: '
-                + TOOL_NAMES,
-            },
-          ],
+          working,
           tools,
-          toolsSupported: false,
+          toolsSupported,
           fetchFn,
           signal,
           onEvent,
@@ -1245,362 +1244,404 @@ async function runAgentLoop({
         });
         msg = called.msg;
         streamFailedOnce = called.streamFailedOnce;
-      } else {
-        throw err;
-      }
-    }
-
-    let toolCalls = msg.tool_calls;
-    if (!toolCalls?.length) {
-      const textCalls = parseTextToolCalls(msg.content);
-      if (textCalls.length) toolCalls = textCalls;
-    }
-
-    if (toolCalls?.length) {
-      // store assistant message
-      if (msg.tool_calls?.length) {
-        working.push({
-          role: 'assistant',
-          content: msg.content || null,
-          tool_calls: msg.tool_calls,
-        });
-      } else {
-        working.push({ role: 'assistant', content: msg.content || '(调用工具)' });
-      }
-
-      for (const tc of toolCalls) {
-        const name = tc.function?.name || tc.name;
-        const args = parseArgs(tc.function?.arguments ?? tc.arguments);
-        assertNotAborted(signal);
-
-        const risk = riskForTool(name);
-        const summary = toolSummary(name, args);
-        const relPath = toolPath(name, args);
-
-        onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: name, args });
-
-        let resultStr;
-        let authAllowed = true;
-        let authReason;
-        let toolEndEmitted = false;
-        let diffStats = null;
-        let fileOp = null;
-        try {
-          let detail = toolDetail(name, args);
-          let diffPayload;
-
-          // git_commit: enrich authorize detail with message + intended paths (stage runs after allow)
-          if (name === 'git_commit') {
-            detail = [
-              `message: ${args.message}`,
-              args.paths?.length ? `paths: ${args.paths.join(', ')}` : 'paths: (已暂存 only)',
-            ].join('\n');
-          }
-
-          // Keep preview for integrity apply (search_replace must write preview.after, not re-run).
-          // Note: between preview and write there is still a TOCTOU window if the file changes externally.
-          let mutatePreview = null;
-
-          if (MUTATING_TOOLS.has(name)) {
-            // Preview before authorize so gate can show unified diff; write only if allowed.
-            try {
-              mutatePreview = previewMutatingTool(name, args, project.path, relPath || '');
-              fileOp = mutatePreview.op;
-              const built = buildDiffForAuthorize(relPath || '', mutatePreview.before, mutatePreview.after, {
-                isDirDelete: mutatePreview.isDirDelete,
-              });
-              diffStats = built.computed.stats;
-              diffPayload = built.diffPayload;
-              detail = built.detailForGate;
-            } catch (err) {
-              if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
-                const e = new Error('已停止');
-                e.code = 'ABORTED';
-                throw e;
-              }
-              // Preview failure (no match / non-unique / missing) → tool error, skip authorize
-              resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
-              authAllowed = false;
-              authReason = err.message || String(err);
-            }
-          }
-
-          if (resultStr == null) {
-            try {
-              const auth = await authorizeTool({
-                gate: effectiveGate,
-                confirmTerminal,
-                settings,
-                name,
-                risk,
-                summary,
-                detail,
-                path: relPath,
-                sessionKey,
-                signal,
-                diff: diffPayload,
-                agentMode: mode,
-              });
-              authAllowed = !!auth.allowed;
-              authReason = auth.reason;
-            } catch (err) {
-              if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
-                const e = new Error('已停止');
-                e.code = 'ABORTED';
-                throw e;
-              }
-              authAllowed = false;
-              authReason = err.message || String(err);
-            }
-
-            if (!authAllowed) {
-              resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
-            } else if (name === 'search_replace' && mutatePreview) {
-              // Apply approved preview.after (do not re-run searchReplace / re-preview).
-              try {
-                const w = writeFile(project.path, relPath || '', mutatePreview.after);
-                const replacements = mutatePreview.previewMeta?.replacements ?? 1;
-                resultStr = JSON.stringify({
-                  ok: true,
-                  path: w.path,
-                  replacements,
-                  bytes: w.bytes,
-                  mode: 'search_replace',
-                });
-              } catch (err) {
-                resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
-              }
-            } else {
-              resultStr = await registry.execute(name, args, {
-                ...runCtx,
-                project,
-                settings,
-                signal,
-                gate: effectiveGate,
-                onEvent,
-              });
-            }
-          }
-
-          let parsed;
-          try { parsed = JSON.parse(resultStr); } catch { parsed = { raw: resultStr }; }
-
-          const ok = parsed.ok !== false;
-          const stepSummary = summarizeToolResult(name, parsed);
-
-          agentLog.push({
-            turn,
-            tool: name,
-            args,
-            ok,
-            summary: stepSummary,
+      } catch (err) {
+        if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+          const e = new Error('已停止');
+          e.code = 'ABORTED';
+          throw e;
+        }
+        // Some gateways reject tools — retry once without tools
+        if (toolsSupported && /tools|tool_choice|unsupported|400/i.test(String(err.message))) {
+          toolsSupported = false;
+          const called = await callModelTurn({
+            chatFn: chat,
+            settings,
+            working: [
+              ...working,
+              {
+                role: 'system',
+                content:
+                  '当前 API 不支持 tools。请用文本协议调用工具：\n```tool list_dir\n{"path":"."}\n```\n可用: '
+                  + TOOL_NAMES,
+              },
+            ],
+            tools,
+            toolsSupported: false,
+            fetchFn,
+            signal,
+            onEvent,
+            streamFailedOnce,
           });
-
-          if (name === 'write_file' && parsed.ok) {
-            applied.push({ path: parsed.path, ok: true, bytes: parsed.bytes });
-          }
-          if (name === 'search_replace' && parsed.ok) {
-            applied.push({
-              path: parsed.path,
-              ok: true,
-              bytes: parsed.bytes,
-              mode: 'search_replace',
-              replacements: parsed.replacements,
-            });
-          }
-          if (name === 'delete_path' && parsed.ok) {
-            applied.push({ path: parsed.path, ok: true, bytes: 0, deleted: true });
-          }
-
-          // Track verify success when agent runs the exact verify command.
-          if (name === 'run_terminal' && verifyCmd) {
-            const cmd = String(args.command || '').trim();
-            if (cmd === verifyCmd) {
-              const codeOk = parsed.code == null || Number(parsed.code) === 0;
-              const termOk = parsed.ok !== false && codeOk && !parsed.aborted && !parsed.error;
-              if (termOk) {
-                verifySucceeded = true;
-                verifyLastFailed = false;
-                onEvent?.({
-                  type: AGENT_EVENTS.VERIFY_RESULT,
-                  command: verifyCmd,
-                  ok: true,
-                  code: parsed.code != null ? Number(parsed.code) : 0,
-                  summary: stepSummary,
-                });
-              } else {
-                verifyLastFailed = true;
-                onEvent?.({
-                  type: AGENT_EVENTS.VERIFY_RESULT,
-                  command: verifyCmd,
-                  ok: false,
-                  code: parsed.code != null ? Number(parsed.code) : -1,
-                  summary: stepSummary || parsed.error || '验证失败',
-                });
-              }
-            }
-          }
-
-          // FILE_CHANGE before TOOL_END so UI can show change strip with tool completion.
-          if (MUTATING_TOOLS.has(name) && parsed.ok && diffStats) {
-            const changePath = parsed.path || relPath;
-            const changeOp = fileOp || (name === 'delete_path' ? 'delete' : 'write');
-            fileChanges.push({ path: changePath, op: changeOp, stats: diffStats });
-            onEvent?.({
-              type: AGENT_EVENTS.FILE_CHANGE,
-              path: changePath,
-              op: changeOp,
-              stats: diffStats,
-            });
-          }
-
-          onEvent?.({
-            type: AGENT_EVENTS.TOOL_END,
-            tool: name,
-            ok,
-            summary: stepSummary,
-          });
-          toolEndEmitted = true;
-
-          if (tc.id && String(tc.id).startsWith('text')) {
-            // text protocol: append as user-visible tool result in chat history
-            working.push({
-              role: 'user',
-              content: `【工具 ${name} 结果】\n` + resultStr.slice(0, 12000),
-            });
-          } else {
-            working.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              content: resultStr.slice(0, 50000),
-            });
-          }
-        } catch (err) {
-          // Abort (or unexpected throw) after TOOL_START: always emit TOOL_END first
-          if (!toolEndEmitted) {
-            const aborted = err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted;
-            onEvent?.({
-              type: AGENT_EVENTS.TOOL_END,
-              tool: name,
-              ok: false,
-              summary: aborted ? '已停止' : (err.message || String(err)),
-            });
-          }
-          if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
-            const e = new Error('已停止');
-            e.code = 'ABORTED';
-            throw e;
-          }
+          msg = called.msg;
+          streamFailedOnce = called.streamFailedOnce;
+        } else {
           throw err;
         }
       }
-      continue;
-    }
 
-    // Final natural language answer (maybe soft-verify first)
-    let content = msg.content || '';
-    // write fences: preview diff → authorize → write only if allowed
-    // Pass agentMode so plan mode cannot land fence writes.
-    const fence = await applyWriteFencesWithGate(project.path, content, {
-      gate: effectiveGate,
-      confirmTerminal,
-      settings,
-      sessionKey,
-      signal,
-      onEvent,
-      fileChanges,
-      agentMode: mode,
-    });
-    if (fence.applied.length) {
-      applied.push(...fence.applied);
-      content = fence.displayContent;
-    }
+      let toolCalls = msg.tool_calls;
+      if (!toolCalls?.length) {
+        const textCalls = parseTextToolCalls(msg.content);
+        if (textCalls.length) toolCalls = textCalls;
+      }
 
-    const hadSuccessfulWrite = applied.some((a) => a && a.ok && !a.error)
-      || fileChanges.length > 0;
+      if (toolCalls?.length) {
+        // store assistant message
+        if (msg.tool_calls?.length) {
+          working.push({
+            role: 'assistant',
+            content: msg.content || null,
+            tool_calls: msg.tool_calls,
+          });
+        } else {
+          working.push({ role: 'assistant', content: msg.content || '(调用工具)' });
+        }
 
-    // Soft verify gate (agent only; never blocks done permanently)
-    if (
-      mode === 'agent'
-      && verifyCmd
-      && settings.verifyBeforeDone !== false
-      && hadSuccessfulWrite
-      && settings.terminalEnabled
-      && !verifySucceeded
-      && (unlimited || turn < maxTurns)
-    ) {
-      if (!verifyPrompted) {
-        verifyPrompted = true;
-        working.push({ role: 'assistant', content: content || '(完成修改)' });
-        working.push({
-          role: 'user',
-          content:
-            `请立即使用 run_terminal 执行项目验证命令（不要改命令）：\n${verifyCmd}\n根据输出修复问题或总结结果。`,
-        });
+        for (const tc of toolCalls) {
+          const name = tc.function?.name || tc.name;
+          const args = parseArgs(tc.function?.arguments ?? tc.arguments);
+          assertNotAborted(signal);
+
+          const risk = riskForTool(name);
+          const summary = toolSummary(name, args);
+          const relPath = toolPath(name, args);
+
+          onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: name, args });
+
+          let resultStr;
+          let authAllowed = true;
+          let authReason;
+          let toolEndEmitted = false;
+          let diffStats = null;
+          let fileOp = null;
+          try {
+            let detail = toolDetail(name, args);
+            let diffPayload;
+
+            // git_commit: enrich authorize detail with message + intended paths (stage runs after allow)
+            if (name === 'git_commit') {
+              detail = [
+                `message: ${args.message}`,
+                args.paths?.length ? `paths: ${args.paths.join(', ')}` : 'paths: (已暂存 only)',
+              ].join('\n');
+            }
+
+            // Keep preview for integrity apply (search_replace must write preview.after, not re-run).
+            // Note: between preview and write there is still a TOCTOU window if the file changes externally.
+            let mutatePreview = null;
+
+            if (MUTATING_TOOLS.has(name)) {
+              // Preview before authorize so gate can show unified diff; write only if allowed.
+              try {
+                mutatePreview = previewMutatingTool(name, args, project.path, relPath || '');
+                fileOp = mutatePreview.op;
+                const built = buildDiffForAuthorize(relPath || '', mutatePreview.before, mutatePreview.after, {
+                  isDirDelete: mutatePreview.isDirDelete,
+                });
+                diffStats = built.computed.stats;
+                diffPayload = built.diffPayload;
+                detail = built.detailForGate;
+              } catch (err) {
+                if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                  const e = new Error('已停止');
+                  e.code = 'ABORTED';
+                  throw e;
+                }
+                // Preview failure (no match / non-unique / missing) → tool error, skip authorize
+                resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
+                authAllowed = false;
+                authReason = err.message || String(err);
+              }
+            }
+
+            if (resultStr == null) {
+              try {
+                const auth = await authorizeTool({
+                  gate: effectiveGate,
+                  confirmTerminal,
+                  settings,
+                  name,
+                  risk,
+                  summary,
+                  detail,
+                  path: relPath,
+                  sessionKey,
+                  signal,
+                  diff: diffPayload,
+                  agentMode: mode,
+                });
+                authAllowed = !!auth.allowed;
+                authReason = auth.reason;
+              } catch (err) {
+                if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                  const e = new Error('已停止');
+                  e.code = 'ABORTED';
+                  throw e;
+                }
+                authAllowed = false;
+                authReason = err.message || String(err);
+              }
+
+              if (!authAllowed) {
+                resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
+              } else if (name === 'search_replace' && mutatePreview) {
+                // Apply approved preview.after (do not re-run searchReplace / re-preview).
+                try {
+                  const w = writeFile(project.path, relPath || '', mutatePreview.after);
+                  const replacements = mutatePreview.previewMeta?.replacements ?? 1;
+                  resultStr = JSON.stringify({
+                    ok: true,
+                    path: w.path,
+                    replacements,
+                    bytes: w.bytes,
+                    mode: 'search_replace',
+                  });
+                } catch (err) {
+                  resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
+                }
+              } else {
+                resultStr = await registry.execute(name, args, {
+                  ...runCtx,
+                  project,
+                  settings,
+                  signal,
+                  gate: effectiveGate,
+                  onEvent,
+                });
+              }
+            }
+
+            let parsed;
+            try { parsed = JSON.parse(resultStr); } catch { parsed = { raw: resultStr }; }
+
+            const ok = parsed.ok !== false;
+            const stepSummary = summarizeToolResult(name, parsed);
+
+            agentLog.push({
+              turn,
+              tool: name,
+              args,
+              ok,
+              summary: stepSummary,
+            });
+
+            if (name === 'write_file' && parsed.ok) {
+              applied.push({ path: parsed.path, ok: true, bytes: parsed.bytes });
+            }
+            if (name === 'search_replace' && parsed.ok) {
+              applied.push({
+                path: parsed.path,
+                ok: true,
+                bytes: parsed.bytes,
+                mode: 'search_replace',
+                replacements: parsed.replacements,
+              });
+            }
+            if (name === 'delete_path' && parsed.ok) {
+              applied.push({ path: parsed.path, ok: true, bytes: 0, deleted: true });
+            }
+
+            // Track verify success when agent runs the exact verify command.
+            if (name === 'run_terminal' && verifyCmd) {
+              const cmd = String(args.command || '').trim();
+              if (cmd === verifyCmd) {
+                const codeOk = parsed.code == null || Number(parsed.code) === 0;
+                const termOk = parsed.ok !== false && codeOk && !parsed.aborted && !parsed.error;
+                if (termOk) {
+                  verifySucceeded = true;
+                  verifyLastFailed = false;
+                  onEvent?.({
+                    type: AGENT_EVENTS.VERIFY_RESULT,
+                    command: verifyCmd,
+                    ok: true,
+                    code: parsed.code != null ? Number(parsed.code) : 0,
+                    summary: stepSummary,
+                  });
+                } else {
+                  verifyLastFailed = true;
+                  onEvent?.({
+                    type: AGENT_EVENTS.VERIFY_RESULT,
+                    command: verifyCmd,
+                    ok: false,
+                    code: parsed.code != null ? Number(parsed.code) : -1,
+                    summary: stepSummary || parsed.error || '验证失败',
+                  });
+                }
+              }
+            }
+
+            // FILE_CHANGE before TOOL_END so UI can show change strip with tool completion.
+            if (MUTATING_TOOLS.has(name) && parsed.ok && diffStats) {
+              const changePath = parsed.path || relPath;
+              const changeOp = fileOp || (name === 'delete_path' ? 'delete' : 'write');
+              fileChanges.push({ path: changePath, op: changeOp, stats: diffStats });
+              onEvent?.({
+                type: AGENT_EVENTS.FILE_CHANGE,
+                path: changePath,
+                op: changeOp,
+                stats: diffStats,
+              });
+            }
+
+            onEvent?.({
+              type: AGENT_EVENTS.TOOL_END,
+              tool: name,
+              ok,
+              summary: stepSummary,
+            });
+            toolEndEmitted = true;
+
+            if (tc.id && String(tc.id).startsWith('text')) {
+              // text protocol: append as user-visible tool result in chat history
+              working.push({
+                role: 'user',
+                content: `【工具 ${name} 结果】\n` + resultStr.slice(0, 12000),
+              });
+            } else {
+              working.push({
+                role: 'tool',
+                tool_call_id: tc.id,
+                content: resultStr.slice(0, 50000),
+              });
+            }
+          } catch (err) {
+            // Abort (or unexpected throw) after TOOL_START: always emit TOOL_END first
+            if (!toolEndEmitted) {
+              const aborted = err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted;
+              onEvent?.({
+                type: AGENT_EVENTS.TOOL_END,
+                tool: name,
+                ok: false,
+                summary: aborted ? '已停止' : (err.message || String(err)),
+              });
+            }
+            if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+              const e = new Error('已停止');
+              e.code = 'ABORTED';
+              throw e;
+            }
+            throw err;
+          }
+        }
         continue;
       }
-      if (!verifyRepairPrompted && verifyLastFailed) {
-        verifyRepairPrompted = true;
-        working.push({ role: 'assistant', content: content || '(验证未通过)' });
-        working.push({
-          role: 'user',
-          content:
-            `验证命令未通过。请根据失败输出尽量修复，并再次 run_terminal：\n${verifyCmd}\n若无法修复请说明原因。`,
-        });
-        continue;
+
+      // Final natural language answer (maybe soft-verify first)
+      let content = msg.content || '';
+      // write fences: preview diff → authorize → write only if allowed
+      // Pass agentMode so plan mode cannot land fence writes.
+      const fence = await applyWriteFencesWithGate(project.path, content, {
+        gate: effectiveGate,
+        confirmTerminal,
+        settings,
+        sessionKey,
+        signal,
+        onEvent,
+        fileChanges,
+        agentMode: mode,
+      });
+      if (fence.applied.length) {
+        applied.push(...fence.applied);
+        content = fence.displayContent;
       }
-      // Allow done with incomplete verify
-      onEvent?.({
-        type: AGENT_EVENTS.VERIFY_RESULT,
-        command: verifyCmd,
-        ok: false,
-        skipped: true,
-        summary: '未完成验证',
-      });
-    } else if (
-      mode === 'agent'
-      && hadSuccessfulWrite
-      && settings.verifyBeforeDone !== false
-      && !settings.terminalEnabled
-      && verifyCmd
-      && !verifySucceeded
-    ) {
-      onEvent?.({
-        type: AGENT_EVENTS.VERIFY_RESULT,
-        command: verifyCmd,
-        ok: false,
-        skipped: true,
-        summary: '终端未启用，跳过验证',
-      });
-    } else if (
-      mode === 'agent'
-      && hadSuccessfulWrite
-      && verifySucceeded
-    ) {
-      // already emitted VERIFY_RESULT ok on tool end
+
+      const hadSuccessfulWrite = applied.some((a) => a && a.ok && !a.error)
+        || fileChanges.length > 0;
+
+      // Soft verify gate (agent only; never blocks done permanently)
+      if (
+        mode === 'agent'
+        && verifyCmd
+        && settings.verifyBeforeDone !== false
+        && hadSuccessfulWrite
+        && settings.terminalEnabled
+        && !verifySucceeded
+        && (unlimited || turn < maxTurns)
+      ) {
+        if (!verifyPrompted) {
+          verifyPrompted = true;
+          working.push({ role: 'assistant', content: content || '(完成修改)' });
+          working.push({
+            role: 'user',
+            content:
+              `请立即使用 run_terminal 执行项目验证命令（不要改命令）：\n${verifyCmd}\n根据输出修复问题或总结结果。`,
+          });
+          continue;
+        }
+        if (!verifyRepairPrompted && verifyLastFailed) {
+          verifyRepairPrompted = true;
+          working.push({ role: 'assistant', content: content || '(验证未通过)' });
+          working.push({
+            role: 'user',
+            content:
+              `验证命令未通过。请根据失败输出尽量修复，并再次 run_terminal：\n${verifyCmd}\n若无法修复请说明原因。`,
+          });
+          continue;
+        }
+        // Allow done with incomplete verify
+        onEvent?.({
+          type: AGENT_EVENTS.VERIFY_RESULT,
+          command: verifyCmd,
+          ok: false,
+          skipped: true,
+          summary: '未完成验证',
+        });
+      } else if (
+        mode === 'agent'
+        && hadSuccessfulWrite
+        && settings.verifyBeforeDone !== false
+        && !settings.terminalEnabled
+        && verifyCmd
+        && !verifySucceeded
+      ) {
+        onEvent?.({
+          type: AGENT_EVENTS.VERIFY_RESULT,
+          command: verifyCmd,
+          ok: false,
+          skipped: true,
+          summary: '终端未启用，跳过验证',
+        });
+      } else if (
+        mode === 'agent'
+        && hadSuccessfulWrite
+        && verifySucceeded
+      ) {
+        // already emitted VERIFY_RESULT ok on tool end
+      }
+
+      content = appendAgentFooter(content, agentLog, applied, unlimited ? '∞' : turn);
+      return {
+        content,
+        applied,
+        agentLog,
+        turns: turn,
+        toolsSupported,
+        fileChanges,
+        agentMode: mode,
+      };
     }
 
-    content = appendAgentFooter(content, agentLog, applied, unlimited ? '∞' : turn);
-    return {
-      content,
-      applied,
+    // Only reached when a finite maxTurns was set
+    const content = appendAgentFooter(
+      `已达到最大 Agent 轮数（${maxTurns}）。请根据工具日志继续说明需求，发送新消息可继续。`,
       agentLog,
-      turns: turn,
-      toolsSupported,
-      fileChanges,
-      agentMode: mode,
-    };
-  }
-
-  // Only reached when a finite maxTurns was set
-  const content = appendAgentFooter(
-    `已达到最大 Agent 轮数（${maxTurns}）。请根据工具日志继续说明需求，发送新消息可继续。`,
-    agentLog,
-    applied,
-    maxTurns
-  );
-  return { content, applied, agentLog, turns: maxTurns, toolsSupported, fileChanges };
+      applied,
+      maxTurns
+    );
+    return { content, applied, agentLog, turns: maxTurns, toolsSupported, fileChanges };
+    } catch (err) {
+      stopReason = (err && err.code === 'ABORTED') || signal?.aborted ? 'aborted' : 'error';
+      throw err;
+    }
   } finally {
+    try {
+      if (hooksRunner) {
+        const reason = signal?.aborted ? 'aborted' : stopReason;
+        await hooksRunner.runLifecycle('Stop', { reason });
+      }
+    } catch {
+      /* never throw from Stop */
+    }
     await registry.onRunEnd(runCtx);
   }
 }
