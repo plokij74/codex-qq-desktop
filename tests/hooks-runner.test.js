@@ -5,7 +5,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { loadHooks } = require('../src/ai/hooks-loader');
-const { createHooksRunner } = require('../src/ai/hooks-runner');
+const {
+  createHooksRunner,
+  parsePreStdout,
+  buildEnv,
+  isSecretKey,
+} = require('../src/ai/hooks-runner');
 const { AGENT_EVENTS } = require('../src/ai/agent-events');
 
 function writeHooks(project, hooksObj) {
@@ -150,5 +155,58 @@ describe('hooks-runner PreToolUse', () => {
       settings: { hooksEnabled: true }, subagentDepth: 0,
     });
     await runner.runLifecycle('Stop', { reason: 'done' });
+  });
+
+  it('unknown Pre decision is deny', () => {
+    const r = parsePreStdout(JSON.stringify({ decision: 'maybe' }), 0);
+    assert.equal(r.decision, 'deny');
+    assert.match(String(r.reason), /unknown/i);
+  });
+
+  it('strips secret-like keys from hook env', () => {
+    assert.equal(isSecretKey('OPENAI_API_KEY'), true);
+    assert.equal(isSecretKey('ANTHROPIC_API_KEY'), true);
+    assert.equal(isSecretKey('API_KEY'), true);
+    assert.equal(isSecretKey('api-key'), true);
+    assert.equal(isSecretKey('MY_TOKEN'), true);
+    assert.equal(isSecretKey('AUTHORIZATION'), true);
+    assert.equal(isSecretKey('PATH'), false);
+
+    const prevOpenAI = process.env.OPENAI_API_KEY;
+    const prevToken = process.env.MY_TOKEN;
+    process.env.OPENAI_API_KEY = 'sk-test-openai';
+    process.env.MY_TOKEN = 'tok-test';
+    try {
+      const env = buildEnv(
+        {
+          env: {
+            SAFE_FLAG: '1',
+            API_KEY: 'should-drop',
+            BEARER: 'should-drop',
+          },
+        },
+        {
+          event: 'PreToolUse',
+          projectPath: '/tmp/proj',
+          settings: { apiKey: 'settings-secret-value' },
+        }
+      );
+      assert.equal(env.OPENAI_API_KEY, undefined);
+      assert.equal(env.MY_TOKEN, undefined);
+      assert.equal(env.API_KEY, undefined);
+      assert.equal(env.BEARER, undefined);
+      assert.equal(env.SAFE_FLAG, '1');
+      assert.equal(env.CODEX_QQ_EVENT, 'PreToolUse');
+      // settings.apiKey must never appear as a value
+      for (const v of Object.values(env)) {
+        assert.notEqual(v, 'settings-secret-value');
+        assert.notEqual(v, 'sk-test-openai');
+      }
+    } finally {
+      if (prevOpenAI === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevOpenAI;
+      if (prevToken === undefined) delete process.env.MY_TOKEN;
+      else process.env.MY_TOKEN = prevToken;
+    }
   });
 });

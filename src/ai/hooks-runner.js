@@ -11,7 +11,7 @@ const PAYLOAD_MAX = 256 * 1024;
 const STREAM_MAX = 1024 * 1024;
 const STDERR_MAX = 8192;
 const STOP_ABORT_TIMEOUT_CAP = 5000;
-const SECRET_KEY_RE = /apikey|secret|token|password/i;
+const SECRET_KEY_RE = /api[_-]?key|secret|token|password|authorization|bearer/i;
 
 const SAFE_ENV_KEYS = new Set([
   'PATH',
@@ -126,21 +126,18 @@ function isSecretKey(key) {
 
 function buildEnv(rule, { event, projectPath, settings }) {
   const env = {};
+  // Copy process.env with secret-like keys stripped on all platforms.
+  // Windows: keep PATH/SystemRoot/TEMP essentials (+ a few Program* helpers).
+  // Non-Windows: broader env, still drop secret-looking names.
   for (const key of Object.keys(process.env)) {
     if (isSecretKey(key)) continue;
-    if (SAFE_ENV_KEYS.has(key) || process.platform !== 'win32') {
-      // On non-Windows, pass a broader safe subset of non-secret keys
-      // (still drop secret-looking names). On Windows stick mostly to SAFE_ENV_KEYS
-      // but also allow common PATH variants already listed.
-      if (process.platform === 'win32' && !SAFE_ENV_KEYS.has(key)) {
-        // Keep a few extra Windows vars that help spawn node/npm
-        if (!/^(ProgramFiles|ProgramW6432|ProgramData|PUBLIC|ALLUSERSPROFILE|PSModulePath)$/i.test(key)) {
-          continue;
-        }
+    if (process.platform === 'win32' && !SAFE_ENV_KEYS.has(key)) {
+      if (!/^(ProgramFiles|ProgramW6432|ProgramData|PUBLIC|ALLUSERSPROFILE|PSModulePath)$/i.test(key)) {
+        continue;
       }
-      const v = process.env[key];
-      if (v != null) env[key] = v;
     }
+    const v = process.env[key];
+    if (v != null) env[key] = v;
   }
   // Always ensure PATH is present when available
   if (process.env.PATH && !env.PATH) env.PATH = process.env.PATH;
@@ -154,11 +151,14 @@ function buildEnv(rule, { event, projectPath, settings }) {
     }
   }
 
-  // Never inject settings secrets
-  if (settings && settings.apiKey) {
-    // ensure not present under any name we might have copied
+  // Never inject settings.apiKey; drop any secret-like keys that slipped through
+  for (const k of Object.keys(env)) {
+    if (isSecretKey(k)) delete env[k];
+  }
+  if (settings && settings.apiKey != null && settings.apiKey !== '') {
+    const secretVal = String(settings.apiKey);
     for (const k of Object.keys(env)) {
-      if (isSecretKey(k)) delete env[k];
+      if (env[k] === secretVal) delete env[k];
     }
   }
 
@@ -277,7 +277,12 @@ function parsePreStdout(stdout, exitCode) {
       resultStr: null,
     };
   }
-  const decision = String(parsed.decision || 'allow').toLowerCase();
+  // Missing/empty decision defaults to allow; unknown values → deny (safer)
+  const rawDecision = parsed.decision;
+  const decision =
+    rawDecision == null || rawDecision === ''
+      ? 'allow'
+      : String(rawDecision).toLowerCase();
   if (decision === 'deny') {
     return {
       decision: 'deny',
@@ -300,15 +305,22 @@ function parsePreStdout(stdout, exitCode) {
       resultStr,
     };
   }
-  // allow (default)
-  let args = null;
-  if (parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)) {
-    args = parsed.args;
+  if (decision === 'allow') {
+    let args = null;
+    if (parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)) {
+      args = parsed.args;
+    }
+    return {
+      decision: 'allow',
+      reason: parsed.reason != null ? String(parsed.reason) : null,
+      args,
+      resultStr: null,
+    };
   }
   return {
-    decision: 'allow',
-    reason: parsed.reason != null ? String(parsed.reason) : null,
-    args,
+    decision: 'deny',
+    reason: `unknown hook decision: ${rawDecision}`,
+    args: null,
     resultStr: null,
   };
 }
@@ -485,10 +497,16 @@ function createHooksRunner(opts = {}) {
         });
       });
 
+      // Ignore EPIPE/stream errors if hook exits before reading stdin
+      if (child.stdin) {
+        child.stdin.on('error', () => {});
+      }
       try {
         const body = JSON.stringify(payload);
-        child.stdin.write(body, 'utf8');
-        child.stdin.end();
+        if (child.stdin) {
+          child.stdin.write(body, 'utf8');
+          child.stdin.end();
+        }
       } catch (err) {
         try {
           child.kill();
@@ -749,4 +767,6 @@ module.exports = {
   matchLifecycle,
   parsePreStdout,
   truncateDeep,
+  buildEnv,
+  isSecretKey,
 };
