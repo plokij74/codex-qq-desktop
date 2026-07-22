@@ -411,4 +411,225 @@ describe('hooks agent tool path', () => {
     assert.equal(fs.readFileSync(marker, 'utf8'), 'from-post');
     assert.equal(fs.existsSync(path.join(project, 'never.txt')), false);
   });
+
+  it('rewrite → Gate₂ deny: no file written / unauthorized', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const rewriteJs = path.join(project, '.codex', 'rewrite.js');
+    fs.writeFileSync(
+      rewriteJs,
+      `process.stdout.write(JSON.stringify({decision:'allow',args:{path:'forbidden.txt',content:'nope\\n'}}));\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PreToolUse: [{
+          matcher: 'write_file',
+          command: process.execPath,
+          args: [rewriteJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+
+    // Gate₁ allows original path; Gate₂ denies rewritten path.
+    const base = fullAutoGate();
+    const gate = {
+      authorize: async (req) => {
+        const p = String(req.path || '');
+        if (p.includes('forbidden.txt')) {
+          return { allowed: false, reason: 'gate2-deny-path' };
+        }
+        return base.authorize(req);
+      },
+    };
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf_g2deny',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'ok.txt',
+                content: 'should-not-land\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'denied' };
+    };
+
+    const result = await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({ maxAgentTurns: 4 }),
+      messages: [{ role: 'user', content: 'write' }],
+      gate,
+      sessionKey: 's-g2-deny',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    assert.ok(
+      result.agentLog.some(
+        (s) => s.tool === 'write_file' && s.ok === false && /gate2-deny-path|未授权/.test(s.summary || '')
+      ),
+      'expected Gate₂ deny in tool result'
+    );
+    assert.equal(fs.existsSync(path.join(project, 'ok.txt')), false);
+    assert.equal(fs.existsSync(path.join(project, 'forbidden.txt')), false);
+    assert.equal((result.applied || []).length, 0);
+  });
+
+  it('rewrite → Gate₂ allow → execute with effectiveArgs', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const rewriteJs = path.join(project, '.codex', 'rewrite-ok.js');
+    fs.writeFileSync(
+      rewriteJs,
+      `process.stdout.write(JSON.stringify({decision:'allow',args:{path:'rewritten.txt',content:'from-hook\\n'}}));\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PreToolUse: [{
+          matcher: 'write_file',
+          command: process.execPath,
+          args: [rewriteJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf_g2allow',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'original.txt',
+                content: 'original\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'done' };
+    };
+
+    const result = await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({ maxAgentTurns: 4 }),
+      messages: [{ role: 'user', content: 'write' }],
+      gate: fullAutoGate(),
+      sessionKey: 's-g2-allow',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    assert.equal(fs.existsSync(path.join(project, 'original.txt')), false);
+    assert.equal(fs.existsSync(path.join(project, 'rewritten.txt')), true);
+    assert.equal(fs.readFileSync(path.join(project, 'rewritten.txt'), 'utf8'), 'from-hook\n');
+    const step = result.agentLog.find((s) => s.tool === 'write_file');
+    assert.ok(step && step.ok);
+    assert.equal(step.args && step.args.path, 'rewritten.txt');
+    assert.ok(
+      (result.applied || []).some((a) => String(a.path || '').includes('rewritten.txt')),
+      'applied should record rewritten path'
+    );
+  });
+
+  it('skip side-effects: full-auto Pre skip write_file does not apply/fileChanges', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const skipJs = path.join(project, '.codex', 'skip-ok.js');
+    fs.writeFileSync(
+      skipJs,
+      `process.stdout.write(JSON.stringify({decision:'skip',result:{ok:true,skipped:true,by:'hook',path:'skip-side.txt'}}));\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PreToolUse: [{
+          matcher: 'write_file',
+          command: process.execPath,
+          args: [skipJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+
+    const events = [];
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf_skip_side',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'skip-side.txt',
+                content: 'should-not-create\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'skipped' };
+    };
+
+    const result = await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({ maxAgentTurns: 4 }),
+      messages: [{ role: 'user', content: 'write' }],
+      gate: fullAutoGate(),
+      onEvent: (e) => events.push(e),
+      sessionKey: 's-skip-side',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    assert.equal(fs.existsSync(path.join(project, 'skip-side.txt')), false);
+    assert.equal((result.applied || []).length, 0);
+    assert.equal((result.fileChanges || []).length, 0);
+    assert.equal(
+      events.filter((e) => e.type === AGENT_EVENTS.FILE_CHANGE).length,
+      0,
+      'skip must not emit FILE_CHANGE'
+    );
+    const step = result.agentLog.find((s) => s.tool === 'write_file');
+    assert.ok(step);
+    assert.equal(step.ok, true, 'skip is a successful short-circuit for the model');
+  });
 });

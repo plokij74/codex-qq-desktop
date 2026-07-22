@@ -1445,104 +1445,110 @@ async function runAgentLoop({
                 resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
                 hookFlags.deniedByGate = true;
               } else if (hooksRunner) {
+                /**
+                 * Mid-chain Gate₂ (design §5.4): after each Pre allow that rewrites
+                 * args, re-preview mutating tools and re-authorize before the next Pre.
+                 */
+                const onArgsChanged = async ({ args: nextArgs }) => {
+                  effectiveArgs = nextArgs && typeof nextArgs === 'object' ? { ...nextArgs } : {};
+                  effectiveRelPath = toolPath(name, effectiveArgs);
+                  const g2Summary = toolSummary(name, effectiveArgs);
+                  let g2Detail = toolDetail(name, effectiveArgs);
+                  let g2DiffPayload;
+
+                  if (name === 'git_commit') {
+                    g2Detail = [
+                      `message: ${effectiveArgs.message}`,
+                      effectiveArgs.paths?.length
+                        ? `paths: ${effectiveArgs.paths.join(', ')}`
+                        : 'paths: (已暂存 only)',
+                    ].join('\n');
+                  }
+
+                  // Discard stale mutate preview; recompute for mutating tools.
+                  mutatePreview = null;
+                  diffStats = null;
+                  fileOp = null;
+
+                  if (MUTATING_TOOLS.has(name)) {
+                    try {
+                      mutatePreview = previewMutatingTool(
+                        name,
+                        effectiveArgs,
+                        project.path,
+                        effectiveRelPath || ''
+                      );
+                      fileOp = mutatePreview.op;
+                      const built = buildDiffForAuthorize(
+                        effectiveRelPath || '',
+                        mutatePreview.before,
+                        mutatePreview.after,
+                        { isDirDelete: mutatePreview.isDirDelete }
+                      );
+                      diffStats = built.computed.stats;
+                      g2DiffPayload = built.diffPayload;
+                      g2Detail = built.detailForGate;
+                    } catch (err) {
+                      if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                        const e = new Error('已停止');
+                        e.code = 'ABORTED';
+                        throw e;
+                      }
+                      // Preview failure is not a Gate deny; still block execute.
+                      return {
+                        allowed: false,
+                        reason: err.message || String(err),
+                        deniedByGate: false,
+                      };
+                    }
+                  }
+
+                  const gate2 = await authorizeOnce({
+                    authSummary: g2Summary,
+                    authDetail: g2Detail,
+                    authPath: effectiveRelPath,
+                    authDiff: g2DiffPayload,
+                  });
+                  if (!gate2.allowed) {
+                    return {
+                      allowed: false,
+                      reason: gate2.reason || '未授权',
+                      deniedByGate: true,
+                    };
+                  }
+                  return { allowed: true };
+                };
+
                 const pre = await hooksRunner.runPreToolUse({
                   name,
                   args: effectiveArgs,
                   risk,
+                  onArgsChanged,
                 });
+                if (pre.args && typeof pre.args === 'object') {
+                  effectiveArgs = pre.args;
+                  if (pre.argsChanged) {
+                    effectiveRelPath = toolPath(name, effectiveArgs);
+                  }
+                }
                 if (pre.decision === 'deny') {
                   resultStr = JSON.stringify({
                     ok: false,
-                    error: pre.reason || '钩子拒绝',
+                    error: pre.reason || (pre.deniedByGate ? '未授权' : '钩子拒绝'),
                   });
-                  hookFlags.deniedByHook = true;
-                  if (pre.args && typeof pre.args === 'object') {
-                    effectiveArgs = pre.args;
+                  if (pre.deniedByGate) {
+                    hookFlags.deniedByGate = true;
+                  } else {
+                    hookFlags.deniedByHook = true;
                   }
                 } else if (pre.decision === 'skip') {
                   resultStr =
                     pre.resultStr
                     || JSON.stringify({ ok: true, skipped: true, by: 'hook' });
                   hookFlags.skipped = true;
-                  if (pre.args && typeof pre.args === 'object') {
-                    effectiveArgs = pre.args;
-                  }
-                } else {
-                  // allow (+ optional args rewrite → Gate₂)
-                  if (pre.args && typeof pre.args === 'object') {
-                    effectiveArgs = pre.args;
-                  }
-                  if (pre.argsChanged) {
-                    effectiveRelPath = toolPath(name, effectiveArgs);
-                    const g2Summary = toolSummary(name, effectiveArgs);
-                    let g2Detail = toolDetail(name, effectiveArgs);
-                    let g2DiffPayload;
-
-                    if (name === 'git_commit') {
-                      g2Detail = [
-                        `message: ${effectiveArgs.message}`,
-                        effectiveArgs.paths?.length
-                          ? `paths: ${effectiveArgs.paths.join(', ')}`
-                          : 'paths: (已暂存 only)',
-                      ].join('\n');
-                    }
-
-                    // Discard stale mutate preview; recompute for mutating tools.
-                    mutatePreview = null;
-                    diffStats = null;
-                    fileOp = null;
-
-                    if (MUTATING_TOOLS.has(name)) {
-                      try {
-                        mutatePreview = previewMutatingTool(
-                          name,
-                          effectiveArgs,
-                          project.path,
-                          effectiveRelPath || ''
-                        );
-                        fileOp = mutatePreview.op;
-                        const built = buildDiffForAuthorize(
-                          effectiveRelPath || '',
-                          mutatePreview.before,
-                          mutatePreview.after,
-                          { isDirDelete: mutatePreview.isDirDelete }
-                        );
-                        diffStats = built.computed.stats;
-                        g2DiffPayload = built.diffPayload;
-                        g2Detail = built.detailForGate;
-                      } catch (err) {
-                        if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
-                          const e = new Error('已停止');
-                          e.code = 'ABORTED';
-                          throw e;
-                        }
-                        resultStr = JSON.stringify({
-                          ok: false,
-                          error: err.message || String(err),
-                        });
-                      }
-                    }
-
-                    if (resultStr == null) {
-                      const gate2 = await authorizeOnce({
-                        authSummary: g2Summary,
-                        authDetail: g2Detail,
-                        authPath: effectiveRelPath,
-                        authDiff: g2DiffPayload,
-                      });
-                      if (!gate2.allowed) {
-                        resultStr = JSON.stringify({
-                          ok: false,
-                          error: gate2.reason || '未授权',
-                        });
-                        hookFlags.deniedByGate = true;
-                      }
-                    }
-                  }
-
-                  if (resultStr == null) {
-                    resultStr = await executeAllowedTool();
-                  }
+                } else if (resultStr == null) {
+                  // allow — Gate₂ already ran mid-chain for each rewrite
+                  resultStr = await executeAllowedTool();
                 }
               } else if (name === 'search_replace' && mutatePreview) {
                 // No hooks: existing apply path.
@@ -1580,7 +1586,8 @@ async function runAgentLoop({
             agentLog.push({
               turn,
               tool: name,
-              args,
+              // effectiveArgs reflects Pre rewrites (and mid-chain Gate₂ path).
+              args: effectiveArgs,
               ok,
               summary: stepSummary,
             });

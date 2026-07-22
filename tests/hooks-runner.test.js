@@ -209,4 +209,137 @@ describe('hooks-runner PreToolUse', () => {
       else process.env.MY_TOKEN = prevToken;
     }
   });
+
+  it('timeout → Pre deny', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-run-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    // Sleep longer than timeoutMs so runner treats as deny
+    const body = `
+      const end = Date.now() + 5000;
+      while (Date.now() < end) { /* spin */ }
+      process.exit(0);
+    `;
+    const rule = scriptCmd(body);
+    rule.timeoutMs = 200;
+    writeHooks(project, { PreToolUse: [rule] });
+    const hooks = loadHooks({ userDataPath: user, projectPath: project });
+    const runner = createHooksRunner({
+      hooks,
+      projectPath: project,
+      userDataPath: user,
+      settings: { hooksEnabled: true },
+      subagentDepth: 0,
+    });
+    const r = await runner.runPreToolUse({
+      name: 'write_file',
+      args: { path: 'x.txt' },
+      risk: 'write',
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(String(r.reason || ''), /timeout/i);
+  });
+
+  it('mid-chain onArgsChanged deny stops further Pre', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-run-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    const rewrite = `
+      let s=''; process.stdin.on('data',d=>s+=d);
+      process.stdin.on('end',()=>{
+        process.stdout.write(JSON.stringify({decision:'allow',args:{path:'rewritten.js'}}));
+      });
+    `;
+    const second = `
+      process.stdout.write(JSON.stringify({decision:'allow',args:{path:'should-not-run.js'}}));
+    `;
+    const r1 = scriptCmd(rewrite);
+    const r2 = scriptCmd(second);
+    writeHooks(project, { PreToolUse: [r1, r2] });
+    const hooks = loadHooks({ userDataPath: user, projectPath: project });
+    let gateCalls = 0;
+    const runner = createHooksRunner({
+      hooks,
+      projectPath: project,
+      userDataPath: user,
+      settings: { hooksEnabled: true },
+      subagentDepth: 0,
+    });
+    const r = await runner.runPreToolUse({
+      name: 'read_file',
+      args: { path: 'a.js' },
+      risk: 'read',
+      onArgsChanged: async ({ args }) => {
+        gateCalls += 1;
+        assert.equal(args.path, 'rewritten.js');
+        return { allowed: false, reason: 'gate2-block', deniedByGate: true };
+      },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.equal(r.deniedByGate, true);
+    assert.match(String(r.reason), /gate2-block/);
+    assert.equal(r.args.path, 'rewritten.js');
+    assert.equal(gateCalls, 1, 'second Pre must not run after Gate₂ deny');
+  });
+
+  it('mid-chain onArgsChanged allow continues with new args', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-run-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    const rewrite = `
+      let s=''; process.stdin.on('data',d=>s+=d);
+      process.stdin.on('end',()=>{
+        process.stdout.write(JSON.stringify({decision:'allow',args:{path:'mid.js'}}));
+      });
+    `;
+    // Second rule: empty allow (no rewrite)
+    const ok = scriptCmd('process.exit(0)');
+    writeHooks(project, { PreToolUse: [scriptCmd(rewrite), ok] });
+    const hooks = loadHooks({ userDataPath: user, projectPath: project });
+    const seen = [];
+    const runner = createHooksRunner({
+      hooks,
+      projectPath: project,
+      userDataPath: user,
+      settings: { hooksEnabled: true },
+      subagentDepth: 0,
+    });
+    const r = await runner.runPreToolUse({
+      name: 'read_file',
+      args: { path: 'a.js', offset: 2 },
+      risk: 'read',
+      onArgsChanged: async ({ args, previousArgs }) => {
+        seen.push({ path: args.path, prev: previousArgs.path });
+        return { allowed: true };
+      },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.args.path, 'mid.js');
+    assert.equal(r.args.offset, 2);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].path, 'mid.js');
+    assert.equal(seen[0].prev, 'a.js');
+  });
+
+  it('omitted onArgsChanged keeps merge-only behavior', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-run-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    const rewrite = `
+      process.stdout.write(JSON.stringify({decision:'allow',args:{path:'b.js'}}));
+    `;
+    writeHooks(project, { PreToolUse: [scriptCmd(rewrite)] });
+    const hooks = loadHooks({ userDataPath: user, projectPath: project });
+    const runner = createHooksRunner({
+      hooks,
+      projectPath: project,
+      userDataPath: user,
+      settings: { hooksEnabled: true },
+      subagentDepth: 0,
+    });
+    const r = await runner.runPreToolUse({
+      name: 'read_file',
+      args: { path: 'a.js' },
+      risk: 'read',
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.args.path, 'b.js');
+    assert.equal(r.argsChanged, true);
+  });
 });

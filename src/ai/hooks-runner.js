@@ -637,7 +637,14 @@ function createHooksRunner(opts = {}) {
     return { ok, durationMs, stdout: proc.stdout, stderr: proc.stderr };
   }
 
-  async function runPreToolUse({ name, args, risk }) {
+  /**
+   * PreToolUse serial chain.
+   * Optional onArgsChanged({ name, args, risk, previousArgs }) →
+   *   { allowed: boolean, reason?: string, deniedByGate?: boolean }
+   * is invoked after each Pre allow that rewrites args vs that rule's entry
+   * args (mid-chain Gate₂). Omitted → merge only (unit tests of runner alone).
+   */
+  async function runPreToolUse({ name, args, risk, onArgsChanged } = {}) {
     const initialArgs = args && typeof args === 'object' ? { ...args } : {};
     if (!enabled) {
       return { decision: 'allow', args: initialArgs, argsChanged: false };
@@ -653,6 +660,7 @@ function createHooksRunner(opts = {}) {
       if (signal && signal.aborted) {
         throw makeAbortedError('已停止');
       }
+      const entryArgs = { ...currentArgs };
       const payload = basePayload('PreToolUse', {
         tool: {
           name,
@@ -688,6 +696,52 @@ function createHooksRunner(opts = {}) {
       // allow — merge args by key overwrite
       if (one.args && typeof one.args === 'object') {
         currentArgs = { ...currentArgs, ...one.args };
+      }
+      // Mid-chain Gate₂: after each Pre allow with changed args (design §5.4)
+      const ruleChanged =
+        JSON.stringify(currentArgs) !== JSON.stringify(entryArgs);
+      if (ruleChanged && typeof onArgsChanged === 'function') {
+        if (signal && signal.aborted) {
+          throw makeAbortedError('已停止');
+        }
+        let gateResult;
+        try {
+          gateResult = await onArgsChanged({
+            name,
+            args: currentArgs,
+            risk: risk || null,
+            previousArgs: entryArgs,
+          });
+        } catch (err) {
+          if (err?.code === 'ABORTED' || err?.name === 'AbortError' || (signal && signal.aborted)) {
+            throw makeAbortedError('已停止');
+          }
+          return {
+            decision: 'deny',
+            args: currentArgs,
+            reason: err.message || String(err),
+            argsChanged:
+              JSON.stringify(currentArgs) !== JSON.stringify(initialArgs),
+          };
+        }
+        if (!gateResult || !gateResult.allowed) {
+          const out = {
+            decision: 'deny',
+            args: currentArgs,
+            reason:
+              (gateResult && gateResult.reason) || '未授权',
+            argsChanged:
+              JSON.stringify(currentArgs) !== JSON.stringify(initialArgs),
+          };
+          // Prefer explicit flag from agent Gate₂; default true when omitted
+          // (callback-style authorize deny without deniedByGate still counts as Gate).
+          if (gateResult && gateResult.deniedByGate === false) {
+            /* preview/other non-gate failure */
+          } else {
+            out.deniedByGate = true;
+          }
+          return out;
+        }
       }
     }
     return {
