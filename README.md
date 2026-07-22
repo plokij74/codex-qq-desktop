@@ -228,4 +228,57 @@ npm run dist
 
 ### 后续
 
-- C.3 Hooks · C.4 更强子 Agent · C.5 MCP/Skills 增强
+- C.4 更强子 Agent · C.5 MCP/Skills 增强
+
+## Phase C.3：Hooks（配置驱动生命周期）
+
+在 Agent 主 run 上挂载外部命令钩子（不改工具源码）。
+
+### 开关与配置
+
+| 项 | 说明 |
+|----|------|
+| 设置 `hooksEnabled` | 默认开；关闭则完全不加载/不执行 |
+| 用户配置 | `{userData}/hooks.json` |
+| 项目配置 | `{project}/.codex/hooks.json` |
+| 合并 | 同一事件下 **用户规则在前、项目在后**，串行执行 |
+
+### 事件
+
+| 事件 | 时机 |
+|------|------|
+| `SessionStart` | 主 run 开始（registry onRunStart 之后） |
+| `UserPromptSubmit` | 首次模型请求前 |
+| `PreToolUse` | Gate 通过后、工具执行前（可 allow/deny/改参/skip） |
+| `PostToolUse` | 工具有结果后（含拒绝/短路） |
+| `Stop` | run 结束（done/aborted/error），onRunEnd 之前 |
+
+### Pre 与权限
+
+顺序：**Gate₁ → Pre →（改参则 Gate₂）→ 执行或短路 → Post**。  
+`skip` **不能**绕过 Gate₁。Pre 失败/超时/非 JSON/非 0 退出 ⇒ **拒绝工具**。  
+`subagentDepth >= 1`（explore）不跑 Hooks。
+
+### 示例 `.codex/hooks.json`
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "run_terminal",
+        "command": "node",
+        "args": [".codex/scripts/check-terminal.js"],
+        "timeoutMs": 5000
+      }
+    ],
+    "PostToolUse": [],
+    "Stop": [],
+    "SessionStart": [],
+    "UserPromptSubmit": []
+  }
+}
+```
+
+命令通过 stdin 接收 JSON，Pre 向 stdout 写 `{"decision":"allow"}` / `deny` / `skip`。
