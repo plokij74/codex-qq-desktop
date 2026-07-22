@@ -1314,6 +1314,13 @@ async function runAgentLoop({
           let toolEndEmitted = false;
           let diffStats = null;
           let fileOp = null;
+          let effectiveArgs = args && typeof args === 'object' && !Array.isArray(args) ? { ...args } : {};
+          let effectiveRelPath = relPath;
+          const hookFlags = {
+            deniedByGate: false,
+            deniedByHook: false,
+            skipped: false,
+          };
           try {
             let detail = toolDetail(name, args);
             let diffPayload;
@@ -1354,7 +1361,43 @@ async function runAgentLoop({
               }
             }
 
-            if (resultStr == null) {
+            /**
+             * Apply search_replace via approved mutatePreview, else registry.execute.
+             * Uses effectiveArgs / effectiveRelPath (may differ after Pre rewrite).
+             */
+            async function executeAllowedTool() {
+              if (name === 'search_replace' && mutatePreview) {
+                // Apply approved preview.after (do not re-run searchReplace / re-preview).
+                try {
+                  const w = writeFile(project.path, effectiveRelPath || '', mutatePreview.after);
+                  const replacements = mutatePreview.previewMeta?.replacements ?? 1;
+                  return JSON.stringify({
+                    ok: true,
+                    path: w.path,
+                    replacements,
+                    bytes: w.bytes,
+                    mode: 'search_replace',
+                  });
+                } catch (err) {
+                  return JSON.stringify({ ok: false, error: err.message || String(err) });
+                }
+              }
+              return registry.execute(name, effectiveArgs, {
+                ...runCtx,
+                project,
+                settings,
+                signal,
+                gate: effectiveGate,
+                onEvent,
+              });
+            }
+
+            async function authorizeOnce({
+              authSummary,
+              authDetail,
+              authPath,
+              authDiff,
+            }) {
               try {
                 const auth = await authorizeTool({
                   gate: effectiveGate,
@@ -1362,30 +1405,147 @@ async function runAgentLoop({
                   settings,
                   name,
                   risk,
-                  summary,
-                  detail,
-                  path: relPath,
+                  summary: authSummary,
+                  detail: authDetail,
+                  path: authPath,
                   sessionKey,
                   signal,
-                  diff: diffPayload,
+                  diff: authDiff,
                   agentMode: mode,
                 });
-                authAllowed = !!auth.allowed;
-                authReason = auth.reason;
+                return {
+                  allowed: !!auth.allowed,
+                  reason: auth.reason,
+                };
               } catch (err) {
                 if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
                   const e = new Error('已停止');
                   e.code = 'ABORTED';
                   throw e;
                 }
-                authAllowed = false;
-                authReason = err.message || String(err);
+                return {
+                  allowed: false,
+                  reason: err.message || String(err),
+                };
               }
+            }
+
+            if (resultStr == null) {
+              // Gate₁ — sole authorization before Pre; skip cannot bypass this.
+              const gate1 = await authorizeOnce({
+                authSummary: summary,
+                authDetail: detail,
+                authPath: relPath,
+                authDiff: diffPayload,
+              });
+              authAllowed = gate1.allowed;
+              authReason = gate1.reason;
 
               if (!authAllowed) {
                 resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
+                hookFlags.deniedByGate = true;
+              } else if (hooksRunner) {
+                const pre = await hooksRunner.runPreToolUse({
+                  name,
+                  args: effectiveArgs,
+                  risk,
+                });
+                if (pre.decision === 'deny') {
+                  resultStr = JSON.stringify({
+                    ok: false,
+                    error: pre.reason || '钩子拒绝',
+                  });
+                  hookFlags.deniedByHook = true;
+                  if (pre.args && typeof pre.args === 'object') {
+                    effectiveArgs = pre.args;
+                  }
+                } else if (pre.decision === 'skip') {
+                  resultStr =
+                    pre.resultStr
+                    || JSON.stringify({ ok: true, skipped: true, by: 'hook' });
+                  hookFlags.skipped = true;
+                  if (pre.args && typeof pre.args === 'object') {
+                    effectiveArgs = pre.args;
+                  }
+                } else {
+                  // allow (+ optional args rewrite → Gate₂)
+                  if (pre.args && typeof pre.args === 'object') {
+                    effectiveArgs = pre.args;
+                  }
+                  if (pre.argsChanged) {
+                    effectiveRelPath = toolPath(name, effectiveArgs);
+                    const g2Summary = toolSummary(name, effectiveArgs);
+                    let g2Detail = toolDetail(name, effectiveArgs);
+                    let g2DiffPayload;
+
+                    if (name === 'git_commit') {
+                      g2Detail = [
+                        `message: ${effectiveArgs.message}`,
+                        effectiveArgs.paths?.length
+                          ? `paths: ${effectiveArgs.paths.join(', ')}`
+                          : 'paths: (已暂存 only)',
+                      ].join('\n');
+                    }
+
+                    // Discard stale mutate preview; recompute for mutating tools.
+                    mutatePreview = null;
+                    diffStats = null;
+                    fileOp = null;
+
+                    if (MUTATING_TOOLS.has(name)) {
+                      try {
+                        mutatePreview = previewMutatingTool(
+                          name,
+                          effectiveArgs,
+                          project.path,
+                          effectiveRelPath || ''
+                        );
+                        fileOp = mutatePreview.op;
+                        const built = buildDiffForAuthorize(
+                          effectiveRelPath || '',
+                          mutatePreview.before,
+                          mutatePreview.after,
+                          { isDirDelete: mutatePreview.isDirDelete }
+                        );
+                        diffStats = built.computed.stats;
+                        g2DiffPayload = built.diffPayload;
+                        g2Detail = built.detailForGate;
+                      } catch (err) {
+                        if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                          const e = new Error('已停止');
+                          e.code = 'ABORTED';
+                          throw e;
+                        }
+                        resultStr = JSON.stringify({
+                          ok: false,
+                          error: err.message || String(err),
+                        });
+                      }
+                    }
+
+                    if (resultStr == null) {
+                      const gate2 = await authorizeOnce({
+                        authSummary: g2Summary,
+                        authDetail: g2Detail,
+                        authPath: effectiveRelPath,
+                        authDiff: g2DiffPayload,
+                      });
+                      if (!gate2.allowed) {
+                        resultStr = JSON.stringify({
+                          ok: false,
+                          error: gate2.reason || '未授权',
+                        });
+                        hookFlags.deniedByGate = true;
+                      }
+                    }
+                  }
+
+                  if (resultStr == null) {
+                    resultStr = await executeAllowedTool();
+                  }
+                }
               } else if (name === 'search_replace' && mutatePreview) {
-                // Apply approved preview.after (do not re-run searchReplace / re-preview).
+                // No hooks: existing apply path.
                 try {
                   const w = writeFile(project.path, relPath || '', mutatePreview.after);
                   const replacements = mutatePreview.previewMeta?.replacements ?? 1;
@@ -1425,25 +1585,29 @@ async function runAgentLoop({
               summary: stepSummary,
             });
 
-            if (name === 'write_file' && parsed.ok) {
-              applied.push({ path: parsed.path, ok: true, bytes: parsed.bytes });
-            }
-            if (name === 'search_replace' && parsed.ok) {
-              applied.push({
-                path: parsed.path,
-                ok: true,
-                bytes: parsed.bytes,
-                mode: 'search_replace',
-                replacements: parsed.replacements,
-              });
-            }
-            if (name === 'delete_path' && parsed.ok) {
-              applied.push({ path: parsed.path, ok: true, bytes: 0, deleted: true });
+            // skip must not update applied / fileChanges (hook short-circuit is not a real write).
+            if (!hookFlags.skipped) {
+              if (name === 'write_file' && parsed.ok) {
+                applied.push({ path: parsed.path, ok: true, bytes: parsed.bytes });
+              }
+              if (name === 'search_replace' && parsed.ok) {
+                applied.push({
+                  path: parsed.path,
+                  ok: true,
+                  bytes: parsed.bytes,
+                  mode: 'search_replace',
+                  replacements: parsed.replacements,
+                });
+              }
+              if (name === 'delete_path' && parsed.ok) {
+                applied.push({ path: parsed.path, ok: true, bytes: 0, deleted: true });
+              }
             }
 
             // Track verify success when agent runs the exact verify command.
-            if (name === 'run_terminal' && verifyCmd) {
-              const cmd = String(args.command || '').trim();
+            // skip cannot count as verify success.
+            if (!hookFlags.skipped && name === 'run_terminal' && verifyCmd) {
+              const cmd = String((effectiveArgs.command != null ? effectiveArgs.command : args.command) || '').trim();
               if (cmd === verifyCmd) {
                 const codeOk = parsed.code == null || Number(parsed.code) === 0;
                 const termOk = parsed.ok !== false && codeOk && !parsed.aborted && !parsed.error;
@@ -1471,8 +1635,8 @@ async function runAgentLoop({
             }
 
             // FILE_CHANGE before TOOL_END so UI can show change strip with tool completion.
-            if (MUTATING_TOOLS.has(name) && parsed.ok && diffStats) {
-              const changePath = parsed.path || relPath;
+            if (!hookFlags.skipped && MUTATING_TOOLS.has(name) && parsed.ok && diffStats) {
+              const changePath = parsed.path || effectiveRelPath || relPath;
               const changeOp = fileOp || (name === 'delete_path' ? 'delete' : 'write');
               fileChanges.push({ path: changePath, op: changeOp, stats: diffStats });
               onEvent?.({
@@ -1481,6 +1645,26 @@ async function runAgentLoop({
                 op: changeOp,
                 stats: diffStats,
               });
+            }
+
+            // Post always when runner present (including Gate deny / Pre deny / skip / execute).
+            if (hooksRunner) {
+              try {
+                await hooksRunner.runPostToolUse({
+                  name,
+                  args: effectiveArgs,
+                  risk,
+                  result: parsed,
+                  flags: hookFlags,
+                });
+              } catch (err) {
+                // Post must not break tool path; ABORT still propagates if signal aborted mid-post.
+                if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                  const e = new Error('已停止');
+                  e.code = 'ABORTED';
+                  throw e;
+                }
+              }
             }
 
             onEvent?.({

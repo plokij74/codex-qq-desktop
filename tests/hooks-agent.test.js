@@ -191,3 +191,224 @@ describe('hooks agent lifecycle', () => {
     );
   });
 });
+
+describe('hooks agent tool path', () => {
+  it('Pre deny blocks tool without execute', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const denyJs = path.join(project, '.codex', 'deny.js');
+    fs.writeFileSync(
+      denyJs,
+      `process.stdout.write(JSON.stringify({decision:'deny',reason:'blocked-by-test'}));\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PreToolUse: [{
+          matcher: 'write_file',
+          command: process.execPath,
+          args: [denyJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf_deny',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'blocked.txt',
+                content: 'should-not-land\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'blocked' };
+    };
+
+    const result = await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({ maxAgentTurns: 4 }),
+      messages: [{ role: 'user', content: 'write' }],
+      gate: fullAutoGate(),
+      sessionKey: 's-pre-deny',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    assert.ok(
+      result.agentLog.some(
+        (s) => s.tool === 'write_file' && s.ok === false && /blocked-by-test/.test(s.summary || '')
+      ),
+      'expected blocked-by-test in tool result'
+    );
+    assert.equal(fs.existsSync(path.join(project, 'blocked.txt')), false);
+  });
+
+  it('skip cannot bypass Gate₁ read-only', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const skipJs = path.join(project, '.codex', 'skip.js');
+    fs.writeFileSync(
+      skipJs,
+      `process.stdout.write(JSON.stringify({decision:'skip',result:{ok:true,skipped:true,by:'hook',path:'skip-bypass.txt'}}));\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PreToolUse: [{
+          matcher: 'write_file',
+          command: process.execPath,
+          args: [skipJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+
+    const gate = createPermissionGate({
+      permissionMode: 'read-only',
+      agentMode: 'agent',
+      terminalEnabled: false,
+      terminalRequireConfirm: false,
+      onApprovalNeeded: async () => {},
+    });
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf_skip',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'skip-bypass.txt',
+                content: 'nope\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'denied' };
+    };
+
+    const result = await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({
+        maxAgentTurns: 4,
+        permissionMode: 'read-only',
+      }),
+      messages: [{ role: 'user', content: 'write' }],
+      gate,
+      sessionKey: 's-skip-gate',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    const step = result.agentLog.find((s) => s.tool === 'write_file');
+    assert.ok(step, 'write_file step expected');
+    assert.equal(step.ok, false);
+    assert.ok(
+      !/skipped/i.test(step.summary || ''),
+      'must not report hook skip success under read-only'
+    );
+    assert.equal(fs.existsSync(path.join(project, 'skip-bypass.txt')), false);
+  });
+
+  it('Post runs after gate deny', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const marker = path.join(project, 'post-after-gate.marker');
+    const postJs = path.join(project, '.codex', 'post-marker.js');
+    // Write marker under project cwd (hooks default cwd=project)
+    fs.writeFileSync(
+      postJs,
+      `require('fs').writeFileSync('post-after-gate.marker', 'from-post');\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PostToolUse: [{
+          matcher: 'write_file',
+          command: process.execPath,
+          args: [postJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+    fs.writeFileSync(path.join(project, 'package.json'), '{}');
+
+    const gate = createPermissionGate({
+      permissionMode: 'read-only',
+      agentMode: 'agent',
+      terminalEnabled: false,
+      terminalRequireConfirm: false,
+      onApprovalNeeded: async () => {},
+    });
+
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_wf_post',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: JSON.stringify({
+                path: 'never.txt',
+                content: 'x\n',
+              }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'denied' };
+    };
+
+    await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({
+        maxAgentTurns: 4,
+        permissionMode: 'read-only',
+      }),
+      messages: [{ role: 'user', content: 'write' }],
+      gate,
+      sessionKey: 's-post-gate',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    assert.equal(fs.existsSync(marker), true, 'PostToolUse should run after gate deny');
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'from-post');
+    assert.equal(fs.existsSync(path.join(project, 'never.txt')), false);
+  });
+});
