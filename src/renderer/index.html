@@ -223,6 +223,9 @@
           <span>MCP 服务器 JSON</span>
           <textarea id="set-mcp-servers" rows="5" placeholder='[{"name":"demo","command":"npx","args":["-y","@modelcontextprotocol/server-everything"]}]'></textarea>
         </label>
+        <label class="switch-row"><input type="checkbox" id="set-hooks-enabled" checked /> <span>启用 Hooks（项目 .codex/hooks.json + 用户 hooks.json）</span></label>
+        <div class="hooks-summary" id="hooks-summary">Hooks 摘要：未加载</div>
+        <button type="button" id="btn-hooks-refresh" class="btn-small">刷新 Hooks</button>
         <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。计划模式只读 + submit_plan。MCP 仅 agent 模式、非子 Agent 时连接。</small>
       </div>
       <div class="modal-actions">

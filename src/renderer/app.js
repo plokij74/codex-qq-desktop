@@ -1190,6 +1190,26 @@ function handleChatEvent(ev) {
     setRunStatus(ev.ok ? '子 Agent 完成' : ('子 Agent 失败: ' + (ev.error || '')));
     return;
   }
+  if (type === 'hook-start') {
+    const label = (ev.event || '') + (ev.toolName ? ' · ' + ev.toolName : '');
+    appendTimelineRow('start', '🪝 钩子', (label ? label + ' ' : '') + '开始');
+    return;
+  }
+  if (type === 'hook-end') {
+    const bit = ev.ok === false
+      ? '失败'
+      : (ev.decision === 'deny'
+        ? '拒绝'
+        : (ev.decision === 'skip' || ev.skipped ? '短路' : '完成'));
+    const ok = ev.ok !== false && ev.decision !== 'deny';
+    appendTimelineRow(
+      'end',
+      '🪝 钩子',
+      (ev.event ? ev.event + ' ' : '') + bit + (ev.reason ? '：' + ev.reason : ''),
+      ok
+    );
+    return;
+  }
   if (type === 'turn-end') {
     return;
   }
@@ -1855,9 +1875,28 @@ async function openSettings() {
     const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
     mcpServersEl.value = servers.length ? JSON.stringify(servers, null, 2) : '';
   }
+  const he = document.getElementById('set-hooks-enabled');
+  if (he) he.checked = settings.hooksEnabled !== false;
   document.getElementById('settings-modal').classList.remove('hidden');
+  await refreshHooksSummary();
 }
 function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
+async function refreshHooksSummary() {
+  const el = document.getElementById('hooks-summary');
+  if (!el || !window.codex?.hooksSummary) return;
+  const projectPath = sessionProject()?.path || null;
+  try {
+    const s = await window.codex.hooksSummary({ projectPath });
+    const c = s.countsByEvent || {};
+    const total = Object.values(c).reduce((a, b) => a + b, 0);
+    el.textContent = s.enabled
+      ? `Hooks 已启用 · 共 ${total} 条（用户 ${s.userPath || '-'} / 项目 ${s.projectPath || '无'}）`
+      : 'Hooks 已关闭';
+    if (s.errors?.length) el.textContent += ` · 警告: ${s.errors[0]}`;
+  } catch {
+    el.textContent = 'Hooks 摘要加载失败';
+  }
+}
 async function saveSettingsFromForm() {
   const mcpRaw = document.getElementById('set-mcp-servers')?.value?.trim() || '';
   let mcpServers = [];
@@ -1890,6 +1929,7 @@ async function saveSettingsFromForm() {
     subagentEnabled: document.getElementById('set-subagent-enabled')?.checked !== false,
     mcpEnabled: Boolean(document.getElementById('set-mcp-enabled')?.checked),
     mcpServers,
+    hooksEnabled: document.getElementById('set-hooks-enabled')?.checked !== false,
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
   await window.codex.saveSettings(partial);
@@ -2017,6 +2057,7 @@ function bindEvents() {
   document.getElementById('btn-settings').addEventListener('click', () => openSettings().catch((e) => alert(e.message)));
   document.getElementById('btn-settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('btn-settings-save').addEventListener('click', () => saveSettingsFromForm().catch((e) => alert(e.message)));
+  document.getElementById('btn-hooks-refresh')?.addEventListener('click', () => refreshHooksSummary().catch(() => {}));
   document.getElementById('settings-modal').addEventListener('click', (e) => { if (e.target.id === 'settings-modal') closeSettings(); });
   document.getElementById('btn-task-cancel').addEventListener('click', closeTaskModal);
   document.getElementById('btn-task-ok').addEventListener('click', createTaskFromModal);
