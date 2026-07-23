@@ -9,6 +9,8 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'git_commit',
   'run_terminal',
   'spawn_explore',
+  'spawn_explores',
+  'spawn_implement',
 ]);
 
 const PLAN_MARKDOWN_MAX = 32 * 1024;

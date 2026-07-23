@@ -215,10 +215,11 @@ npm run dist
 - 工具：`list_skills` / `use_skill`；斜杠 `/skills`、`/skill <name>`
 - 设置：`skillsEnabled`（默认开）
 
-### explore 子 Agent
+### explore 子 Agent（C.2 基线）
 
 - 工具：`spawn_explore`（仅执行模式）；只读六件套；默认 4 轮，最多 8
 - 设置：`subagentEnabled`（默认开）
+- C.4 在此基础上增加并行 explore、`spawn_explores`、`spawn_implement` 与可展开轨迹（见下）
 
 ### MCP（stdio）
 
@@ -228,7 +229,7 @@ npm run dist
 
 ### 后续
 
-- C.4 更强子 Agent · C.5 MCP/Skills 增强
+- C.5 MCP/Skills 增强（可选 worktree 等）
 
 ## Phase C.3：Hooks（配置驱动生命周期）
 
@@ -282,3 +283,53 @@ npm run dist
 ```
 
 命令通过 stdin 接收 JSON，Pre 向 stdout 写 `{"decision":"allow"}` / `deny` / `skip`。
+
+## Phase C.4：子 Agent 增强（implement + 并行 explore + transcript）
+
+在 C.2 的 `spawn_explore` 之上，增加可写 implement、有限并行 explore（含批量工具），以及主轨迹内可展开 transcript。**不实现 git worktree 隔离**；无新 npm 依赖。
+
+### 开关与设置
+
+| 设置 | 默认 | 说明 |
+|------|------|------|
+| `subagentEnabled` | 开 | 总开关；关闭后 `spawn_explore` / `spawn_explores` / `spawn_implement` 均不可用 |
+| `exploreMaxParallel` | **2** | 同主 run 内 explore 并发上限，clamp **1..3** |
+
+仅 **执行模式** 暴露 spawn 工具；**计划模式** 隐藏三者。
+
+### 主 Agent 工具
+
+| 工具 | 风险 | 说明 |
+|------|------|------|
+| `spawn_explore` | read | 单个只读调研子 Agent；`goal`（≥4 字）；`maxTurns` 默认 4、上限 8 |
+| `spawn_explores` | read | 批量并行 explore：`goals[]`（有效 1..6）共享 `maxTurns`；按序返回 `results` |
+| `spawn_implement` | **write** | 委派改文件子 Agent；`goal`（≥4 字）；`maxTurns` 默认 6、上限 12 |
+
+### 并行与互斥
+
+- **并行仅 explore**：多 explore / `spawn_explores` 受 `exploreMaxParallel` 信号量限制
+- **implement 串行**：同主 run 内互斥，不可并行多个 implement
+- 父 run 中止（停止）→ 运行中与排队中的子任务均取消
+
+### 子 Agent 能力边界
+
+| kind | 可用工具 | 不可用 |
+|------|----------|--------|
+| explore | `list_dir` / `read_file` / `grep` / `glob` / `git_status` / `git_diff` | 写/删/终端/commit/spawn/skills/mcp |
+| implement | 上表只读 + **`write_file` / `search_replace`** | `run_terminal` / `delete_path` / `git_commit` / spawn / skills / mcp |
+
+- **depth ≤ 1**：子 Agent **不可再 spawn**
+- implement 与父 **共用** PermissionGate 与 session「始终允许」；写入仍走 `confirm-writes` 审批
+- 子 run **不跑** Hooks（C.3：`subagentDepth >= 1`）
+- **无 worktree** 隔离（本阶段不实现）
+- implement 的 `fileChanges` **合并**进父轨迹；verify 软门闩 **不** 因子 implement 记成功（验证仍由主 Agent 负责）
+
+### 轨迹 UI
+
+- 主聊天轨迹中按 `subagentId` 归桶为 **可展开块**
+- 展示：kind / goal / 状态 / 耗时 / 子工具摘要 / 最终 summary（implement 另含写入路径数）
+- 并行多 explore 可同时出现多块
+
+### 本阶段明确不做
+
+git worktree 隔离、implement 并行、子内再 spawn、独立侧栏多 Agent 面板、子会话持久化/恢复。

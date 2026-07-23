@@ -13,6 +13,7 @@ describe('explore provider', () => {
       settings: { subagentEnabled: true },
       agentMode: 'agent',
       onEvent: () => {},
+      extensions: {},
     });
     assert.equal(JSON.parse(raw).ok, false);
   });
@@ -26,6 +27,7 @@ describe('explore provider', () => {
       settings: { subagentEnabled: true },
       agentMode: 'agent',
       onEvent: () => {},
+      extensions: {},
     });
     assert.match(JSON.parse(raw).error, /禁止|子 Agent/);
   });
@@ -51,10 +53,60 @@ describe('explore provider', () => {
     });
     const parsed = JSON.parse(raw);
     assert.equal(parsed.ok, true);
+    assert.equal(parsed.kind, 'explore');
+    assert.ok(parsed.subagentId);
     assert.equal(seen.subagentDepth, 1);
     assert.equal(seen.settings.maxAgentTurns, 3);
     assert.ok(events.some((e) => e.type === 'subagent-start'));
     assert.ok(events.some((e) => e.type === 'subagent-end'));
+  });
+
+  it('spawn_explore result includes kind and subagentId', async () => {
+    const p = createExploreProvider({
+      runLoop: async () => ({ content: 'done', turns: 1, agentLog: [] }),
+    });
+    const raw = await p.execute('spawn_explore', { goal: 'find auth module' }, {
+      subagentDepth: 0,
+      settings: { subagentEnabled: true },
+      agentMode: 'agent',
+      project: { path: process.cwd(), name: 't' },
+      gate: createPermissionGate({ permissionMode: 'full-auto', agentMode: 'agent' }),
+      onEvent: () => {},
+      extensions: {},
+    });
+    const parsed = JSON.parse(raw);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.kind, 'explore');
+    assert.ok(parsed.subagentId);
+    assert.ok(parsed.summary);
+  });
+
+  it('spawn_explores returns ordered results', async () => {
+    const p = createExploreProvider({
+      runLoop: async (opts) => ({
+        content: 'out:' + opts.messages[0].content,
+        turns: 1,
+        agentLog: [],
+      }),
+    });
+    const raw = await p.execute('spawn_explores', {
+      goals: ['goal one value', 'goal two value'],
+    }, {
+      subagentDepth: 0,
+      settings: { subagentEnabled: true, exploreMaxParallel: 2 },
+      agentMode: 'agent',
+      project: { path: process.cwd(), name: 't' },
+      gate: createPermissionGate({ permissionMode: 'full-auto', agentMode: 'agent' }),
+      onEvent: () => {},
+      extensions: {},
+    });
+    const parsed = JSON.parse(raw);
+    assert.equal(parsed.parallel, true);
+    assert.equal(parsed.results.length, 2);
+    assert.equal(parsed.results[0].kind, 'explore');
+    assert.ok(parsed.results[0].subagentId);
+    assert.equal(parsed.results[0].summary, 'out:goal one value');
+    assert.equal(parsed.results[1].summary, 'out:goal two value');
   });
 
   it('does not pass parent mcpHub to child extensions', async () => {
@@ -79,5 +131,11 @@ describe('explore provider', () => {
     assert.equal(seen.extensions.mcpHub, undefined);
     assert.equal(seen.extensions.other, 1);
     assert.equal(seen.subagentDepth, 1);
+  });
+
+  it('exposes spawn_explore and spawn_explores tools', () => {
+    const p = createExploreProvider({ runLoop: async () => ({}) });
+    const names = p.getTools().map((t) => t.function.name);
+    assert.deepEqual(names, ['spawn_explore', 'spawn_explores']);
   });
 });

@@ -1025,6 +1025,40 @@ html, body {
   color: #243a6a;
 }
 
+.subagent-block {
+  margin: 6px 0 2px;
+  border: 1px solid #8a9bcc;
+  border-radius: 3px;
+  background: #eef2fc;
+  color: #243a6a;
+  font-size: 12px;
+}
+.subagent-block-hd {
+  cursor: pointer;
+  padding: 4px 8px;
+  user-select: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.subagent-block-hd .sa-status.is-run { color: #3a5a9a; }
+.subagent-block-hd .sa-status.is-ok { color: #2a6a2a; }
+.subagent-block-hd .sa-status.is-fail { color: #8a2020; }
+.subagent-block-body {
+  display: none;
+  padding: 4px 8px 8px;
+  border-top: 1px solid #c5d0e8;
+}
+.subagent-block.open .subagent-block-body { display: block; }
+.subagent-block-body .sa-tool {
+  opacity: 0.9;
+  margin: 2px 0;
+}
+.subagent-block-body .sa-summary {
+  margin-top: 6px;
+  white-space: pre-wrap;
+}
+
 .msg-assistant .bubble.has-run {
   min-width: 220px;
   max-width: 100%;

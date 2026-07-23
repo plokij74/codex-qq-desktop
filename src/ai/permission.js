@@ -4,10 +4,10 @@ const READ_TOOLS = new Set([
   'list_dir', 'read_file', 'grep', 'glob',
   'git_status', 'git_diff',
   'submit_plan',
-  'list_skills', 'use_skill', 'spawn_explore',
+  'list_skills', 'use_skill', 'spawn_explore', 'spawn_explores',
 ]);
 const WRITE_TOOLS = new Set([
-  'write_file', 'search_replace', 'git_commit',
+  'write_file', 'search_replace', 'git_commit', 'spawn_implement',
 ]);
 
 /**

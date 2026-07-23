@@ -37,6 +37,12 @@ describe('permission', () => {
     assert.equal(riskForTool('spawn_explore'), 'read');
   });
 
+  it('spawn_implement is write risk; spawn_explores is read', () => {
+    assert.equal(riskForTool('spawn_implement'), 'write');
+    assert.equal(riskForTool('spawn_explores'), 'read');
+    assert.equal(riskForTool('spawn_explore'), 'read');
+  });
+
   it('riskForTool maps mcp_ prefix to mcp', () => {
     assert.equal(riskForTool('mcp_git_status'), 'mcp');
     assert.equal(riskForTool('mcp_server_tool_name'), 'mcp');

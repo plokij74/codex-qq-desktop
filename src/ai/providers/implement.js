@@ -10,13 +10,13 @@ function getRuntime(ctx, runLoop) {
   return rt;
 }
 
-function createExploreProvider({ runLoop } = {}) {
+function createImplementProvider({ runLoop } = {}) {
   const resolvedRunLoop = typeof runLoop === 'function'
     ? runLoop
     : (...args) => require('../agent').runAgentLoop(...args);
 
   return {
-    id: 'explore',
+    id: 'implement',
     isEnabled(ctx) {
       if (ctx.settings?.subagentEnabled === false) return false;
       if (normalizeMode(ctx.agentMode) !== 'agent') return false;
@@ -24,41 +24,24 @@ function createExploreProvider({ runLoop } = {}) {
       return true;
     },
     getTools() {
-      return [
-        {
-          type: 'function',
-          function: {
-            name: 'spawn_explore',
-            description: 'Spawn a read-only explore sub-agent for research; returns summary',
-            parameters: {
-              type: 'object',
-              properties: {
-                goal: { type: 'string' },
-                maxTurns: { type: 'integer' },
-              },
-              required: ['goal'],
+      return [{
+        type: 'function',
+        function: {
+          name: 'spawn_implement',
+          description: 'Spawn an implement sub-agent that may edit files via write_file/search_replace only; shares parent permissions; returns summary and fileChanges',
+          parameters: {
+            type: 'object',
+            properties: {
+              goal: { type: 'string' },
+              maxTurns: { type: 'integer' },
             },
+            required: ['goal'],
           },
         },
-        {
-          type: 'function',
-          function: {
-            name: 'spawn_explores',
-            description: 'Spawn multiple read-only explore sub-agents in parallel (limited concurrency); returns ordered results',
-            parameters: {
-              type: 'object',
-              properties: {
-                goals: { type: 'array', items: { type: 'string' } },
-                maxTurns: { type: 'integer' },
-              },
-              required: ['goals'],
-            },
-          },
-        },
-      ];
+      }];
     },
     async execute(name, args, ctx) {
-      if (name !== 'spawn_explore' && name !== 'spawn_explores') {
+      if (name !== 'spawn_implement') {
         return JSON.stringify({ ok: false, error: '未知工具: ' + name });
       }
       if (Number(ctx.subagentDepth) >= 1) {
@@ -66,15 +49,8 @@ function createExploreProvider({ runLoop } = {}) {
       }
       const rt = getRuntime(ctx, resolvedRunLoop);
       try {
-        if (name === 'spawn_explore') {
-          const out = await rt.runExplore(ctx, {
-            goal: args?.goal,
-            maxTurns: args?.maxTurns,
-          });
-          return JSON.stringify(out);
-        }
-        const out = await rt.runExplores(ctx, {
-          goals: args?.goals,
+        const out = await rt.runImplement(ctx, {
+          goal: args?.goal,
           maxTurns: args?.maxTurns,
         });
         return JSON.stringify(out);
@@ -90,4 +66,4 @@ function normalizeMode(m) {
   return m === 'plan' ? 'plan' : 'agent';
 }
 
-module.exports = { createExploreProvider };
+module.exports = { createImplementProvider };

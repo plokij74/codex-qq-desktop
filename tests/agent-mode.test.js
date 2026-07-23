@@ -44,6 +44,16 @@ describe('agent-mode', () => {
     assert.ok(!plan.includes('mcp_demo_ping'));
   });
 
+  it('plan mode hides spawn_implement and spawn_explores', () => {
+    const defs = ['spawn_explore', 'spawn_explores', 'spawn_implement', 'read_file'].map((name) => ({
+      type: 'function',
+      function: { name },
+    }));
+    const plan = filterToolsForMode(defs, 'plan');
+    const names = plan.map((t) => t.function.name);
+    assert.deepEqual(names, ['read_file']);
+  });
+
   it('filterToolsForMode plan hides writes and keeps submit_plan', () => {
     const defs = [
       { function: { name: 'read_file' } },

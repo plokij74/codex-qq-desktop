@@ -11,6 +11,12 @@ function createRegistry() {
     providers.push(provider);
   }
 
+  function routeMapFor(ctx) {
+    const fromCtx = ctx?.extensions?.toolRoute;
+    if (fromCtx && typeof fromCtx.get === 'function') return fromCtx;
+    return route;
+  }
+
   async function collectTools(ctx) {
     route = new Map();
     const out = [];
@@ -24,16 +30,21 @@ function createRegistry() {
         out.push(t);
       }
     }
+    // Per-run route on ctx so parent/child (or concurrent explores) do not clobber each other
+    // when they share one registry instance. execute prefers this over the module-level route.
+    if (ctx && ctx.extensions && typeof ctx.extensions === 'object') {
+      ctx.extensions.toolRoute = route;
+    }
     return out;
   }
 
   async function execute(name, args, ctx) {
-    const p = route.get(name);
-    if (!p) {
+    let provider = routeMapFor(ctx).get(name);
+    if (!provider) {
       // rebuild route if collectTools not called (tests)
       await collectTools(ctx);
+      provider = routeMapFor(ctx).get(name);
     }
-    const provider = route.get(name);
     if (!provider) {
       return JSON.stringify({ ok: false, error: '未知工具: ' + name });
     }

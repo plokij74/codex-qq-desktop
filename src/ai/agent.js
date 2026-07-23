@@ -29,6 +29,7 @@ const { resolveVerifyCommand } = require('./verify');
 const { createDefaultRegistry: buildDefaultRegistry } = require('./providers');
 const { loadHooks } = require('./hooks-loader');
 const { createHooksRunner } = require('./hooks-runner');
+const { mergeSubagentFileChanges } = require('./subagent-runtime');
 
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
@@ -223,41 +224,76 @@ const TOOL_DEFS = [
 const TOOL_NAMES = TOOL_DEFS.map((t) => t.function.name).join(', ');
 
 /**
+ * Short system prompt for readonly explore sub-agents.
+ * @param {object} project
+ */
+function buildExploreSubagentPrompt(project) {
+  const parts = [
+    '你是只读调研子 Agent（explore）。只能使用 list_dir / read_file / grep / glob / git_status / git_diff。',
+    '禁止写文件、删除、终端、git_commit、submit_plan、spawn_explore、spawn_explores、spawn_implement、skills。',
+    '围绕用户给出的 goal 做代码库调研，完成后用中文给出简洁结论（关键路径、发现、不确定点）。',
+    '不要编造文件内容；先搜/读再总结。路径一律相对项目根。',
+  ];
+  appendSubagentProjectContext(parts, project);
+  return parts.join('\n');
+}
+
+/**
+ * Short system prompt for implement sub-agents (write_file / search_replace only beyond reads).
+ * @param {object} project
+ */
+function buildImplementSubagentPrompt(project) {
+  const parts = [
+    '你是实现子 Agent（implement）。可用 list_dir / read_file / grep / glob / git_status / git_diff / write_file / search_replace。',
+    '禁止删除、终端、git_commit、submit_plan、spawn_explore、spawn_explores、spawn_implement、skills。',
+    '优先 search_replace 做局部修改；新建或整文件重写用 write_file。',
+    '围绕用户给出的 goal 完成改动，完成后用中文总结改动路径与要点。',
+    '不要编造文件内容；先搜/读再改。路径一律相对项目根。',
+  ];
+  appendSubagentProjectContext(parts, project);
+  return parts.join('\n');
+}
+
+/**
+ * @param {string[]} parts
+ * @param {object} project
+ */
+function appendSubagentProjectContext(parts, project) {
+  if (!project?.path) return;
+  parts.push(`当前工作项目：${project.name || path.basename(project.path)}`);
+  parts.push(`项目根目录（真实路径）: ${project.path}`);
+  try {
+    const ignoreRules = loadGitignoreRules(project.path);
+    const t = listTree(project.path, {
+      maxDepth: 3,
+      maxEntries: 80,
+      ignoreRules,
+    });
+    parts.push('');
+    parts.push(`简要目录树（maxDepth=3, maxEntries=80, 扫描 ${t.count} 项, 截断=${t.truncated}）:`);
+    parts.push(t.treeText);
+  } catch (e) {
+    parts.push(`目录树读取失败: ${e.message}`);
+  }
+}
+
+/**
  * @param {object} project
  * @param {object} settings
- * @param {{ agentMode?: string, verifyCmd?: string|null, subagentDepth?: number, exploreReadonly?: boolean }} [opts]
+ * @param {{ agentMode?: string, verifyCmd?: string|null, subagentDepth?: number, subagentKind?: string, exploreReadonly?: boolean }} [opts]
  */
 function agentSystemPrompt(project, settings, opts = {}) {
   const depth = Number(opts.subagentDepth) || 0;
+  const kind = opts.subagentKind === 'implement' ? 'implement' : 'explore';
   const exploreReadonly = !!opts.exploreReadonly || depth >= 1;
   const mode = normalizeAgentMode(opts.agentMode);
 
-  // Nested explore sub-agent: short readonly research prompt only.
+  // Nested sub-agent: short specialized prompt only.
   if (depth >= 1 || exploreReadonly) {
-    const parts = [
-      '你是只读调研子 Agent（explore）。只能使用 list_dir / read_file / grep / glob / git_status / git_diff。',
-      '禁止写文件、删除、终端、git_commit、submit_plan、spawn_explore、skills。',
-      '围绕用户给出的 goal 做代码库调研，完成后用中文给出简洁结论（关键路径、发现、不确定点）。',
-      '不要编造文件内容；先搜/读再总结。路径一律相对项目根。',
-    ];
-    if (project?.path) {
-      parts.push(`当前工作项目：${project.name || path.basename(project.path)}`);
-      parts.push(`项目根目录（真实路径）: ${project.path}`);
-      try {
-        const ignoreRules = loadGitignoreRules(project.path);
-        const t = listTree(project.path, {
-          maxDepth: 3,
-          maxEntries: 80,
-          ignoreRules,
-        });
-        parts.push('');
-        parts.push(`简要目录树（maxDepth=3, maxEntries=80, 扫描 ${t.count} 项, 截断=${t.truncated}）:`);
-        parts.push(t.treeText);
-      } catch (e) {
-        parts.push(`目录树读取失败: ${e.message}`);
-      }
+    if (kind === 'implement') {
+      return buildImplementSubagentPrompt(project);
     }
-    return parts.join('\n');
+    return buildExploreSubagentPrompt(project);
   }
 
   const parts = [
@@ -289,7 +325,7 @@ function agentSystemPrompt(project, settings, opts = {}) {
 
   if (settings?.subagentEnabled !== false && mode === 'agent') {
     parts.push('');
-    parts.push('【子 Agent】复杂调研可用 spawn_explore(goal, maxTurns?) 派发只读 explore 子 Agent，会返回 summary；勿嵌套 spawn。');
+    parts.push('【子 Agent】复杂调研：spawn_explore / spawn_explores（可并行只读）；委派改文件：spawn_implement（仅 write_file/search_replace，无终端/提交）；子 Agent 不能再 spawn；验证由你负责。');
   }
 
   if (project?.path) {
@@ -344,6 +380,7 @@ function createDefaultRegistry() {
  * @param {{
  *   agentMode?: string,
  *   subagentDepth?: number,
+ *   subagentKind?: string,
  *   exploreReadonly?: boolean,
  *   project?: object|null,
  *   extensions?: object,
@@ -358,6 +395,7 @@ async function toolsForSettings(settings, opts = {}) {
     settings,
     agentMode,
     subagentDepth: Number(opts.subagentDepth) || 0,
+    subagentKind: opts.subagentKind === 'implement' ? 'implement' : (opts.subagentKind || 'explore'),
     exploreReadonly: !!opts.exploreReadonly,
     project: opts.project || null,
     extensions: opts.extensions || {},
@@ -1120,6 +1158,7 @@ async function runAgentLoop({
   confirmTerminal, // legacy optional; prefer gate
   agentMode,
   subagentDepth = 0,
+  subagentKind = 'explore',
   registry: registryOpt,
   extensions: extensionsOpt,
 }) {
@@ -1129,6 +1168,7 @@ async function runAgentLoop({
 
   const mode = normalizeAgentMode(agentMode);
   const depth = Number(subagentDepth) || 0;
+  const kind = subagentKind === 'implement' ? 'implement' : 'explore';
   const effectiveGate = resolveGate({ gate });
   const chat = typeof chatFn === 'function' ? chatFn : chatCompletionMessage;
   const registry = registryOpt || createDefaultRegistry();
@@ -1152,7 +1192,8 @@ async function runAgentLoop({
     settings,
     agentMode: mode,
     subagentDepth: depth,
-    exploreReadonly: depth >= 1,
+    subagentKind: kind,
+    exploreReadonly: depth >= 1 && kind !== 'implement',
     gate: effectiveGate,
     onEvent,
     signal,
@@ -1194,7 +1235,8 @@ async function runAgentLoop({
       const tools = await toolsForSettings(settings, {
         agentMode: mode,
         subagentDepth: depth,
-        exploreReadonly: depth >= 1,
+        subagentKind: kind,
+        exploreReadonly: depth >= 1 && kind !== 'implement',
         project,
         extensions,
         registry,
@@ -1208,7 +1250,8 @@ async function runAgentLoop({
         agentMode: mode,
         verifyCmd,
         subagentDepth: depth,
-        exploreReadonly: depth >= 1,
+        subagentKind: kind,
+        exploreReadonly: depth >= 1 && kind !== 'implement',
       });
       const fragments = await registry.systemFragments(runCtx);
       if (fragments && String(fragments).trim()) {
@@ -1652,6 +1695,12 @@ async function runAgentLoop({
                 op: changeOp,
                 stats: diffStats,
               });
+            }
+
+            // Parent-only: fold spawn_implement result.fileChanges into return body
+            // (child FILE_CHANGE events already forwarded with subagent:true for UI).
+            if (depth === 0 && !hookFlags.skipped) {
+              mergeSubagentFileChanges(fileChanges, name, resultStr);
             }
 
             // Post always when runner present (including Gate deny / Pre deny / skip / execute).

@@ -25,10 +25,18 @@ const DEFAULT_SETTINGS = {
   mcpServers: [], // { name, command, args?, env?, cwd? }[]
   // Phase C.3 hooks
   hooksEnabled: true,
+  // Phase C.4
+  exploreMaxParallel: 2, // Phase C.4; clamp 1..3 on load
 };
 
 function getSettingsPath(userDataPath) {
   return path.join(userDataPath, 'settings.json');
+}
+
+function clampExploreMaxParallel(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 2;
+  return Math.max(1, Math.min(3, Math.floor(n)));
 }
 
 function loadSettings(userDataPath) {
@@ -36,7 +44,9 @@ function loadSettings(userDataPath) {
   try {
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
+    return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -44,6 +54,7 @@ function loadSettings(userDataPath) {
 
 function saveSettings(userDataPath, partial) {
   const next = { ...loadSettings(userDataPath), ...partial };
+  next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
   return next;

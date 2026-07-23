@@ -107,6 +107,11 @@ function toPublicSettings(s) {
     mcpEnabled: Boolean(s.mcpEnabled),
     mcpServers: sanitizeMcpServers(s.mcpServers),
     hooksEnabled: s.hooksEnabled !== false,
+    exploreMaxParallel: (() => {
+      const n = Number(s.exploreMaxParallel);
+      if (!Number.isFinite(n)) return 2;
+      return Math.max(1, Math.min(3, Math.floor(n)));
+    })(),
   };
 }
 
@@ -230,6 +235,11 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     const n = Number(nextPartial.maxAgentTurns);
     if (n === 0) nextPartial.maxAgentTurns = 0;
     else nextPartial.maxAgentTurns = Math.max(1, Math.min(50, Number.isFinite(n) && n > 0 ? n : 8));
+  }
+  if ('exploreMaxParallel' in nextPartial) {
+    const n = Number(nextPartial.exploreMaxParallel);
+    if (!Number.isFinite(n)) nextPartial.exploreMaxParallel = 2;
+    else nextPartial.exploreMaxParallel = Math.max(1, Math.min(3, Math.floor(n)));
   }
   if ('permissionMode' in nextPartial) {
     if (!PERMISSION_MODES.has(nextPartial.permissionMode)) {

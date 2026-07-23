@@ -4,10 +4,11 @@ const { createRegistry } = require('../extensions/registry');
 const { createBuiltinProvider } = require('./builtin');
 const { createSkillsProvider } = require('./skills');
 const { createExploreProvider } = require('./explore');
+const { createImplementProvider } = require('./implement');
 const { createMcpProvider } = require('./mcp');
 
 /**
- * Default registry: builtin + skills + explore + mcp.
+ * Default registry: builtin + skills + explore + implement + mcp.
  *
  * @param {{
  *   getToolDefs: () => Array,
@@ -29,6 +30,7 @@ function createDefaultRegistry(deps) {
     ? deps.runLoop
     : (...args) => require('../agent').runAgentLoop(...args);
   reg.register(createExploreProvider({ runLoop }));
+  reg.register(createImplementProvider({ runLoop }));
   reg.register(createMcpProvider());
   return reg;
 }
@@ -38,5 +40,6 @@ module.exports = {
   createBuiltinProvider,
   createSkillsProvider,
   createExploreProvider,
+  createImplementProvider,
   createMcpProvider,
 };

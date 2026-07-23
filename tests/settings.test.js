@@ -89,4 +89,15 @@ describe('settings', () => {
     assert.equal(AGENT_EVENTS.HOOK_START, 'hook-start');
     assert.equal(AGENT_EVENTS.HOOK_END, 'hook-end');
   });
+
+  it('defaults Phase C.4 exploreMaxParallel', () => {
+    const { DEFAULT_SETTINGS, loadSettings, saveSettings } = require('../src/ai/settings');
+    assert.equal(DEFAULT_SETTINGS.exploreMaxParallel, 2);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    assert.equal(loadSettings(dir).exploreMaxParallel, 2);
+    saveSettings(dir, { exploreMaxParallel: 99 });
+    assert.equal(loadSettings(dir).exploreMaxParallel, 3);
+    saveSettings(dir, { exploreMaxParallel: 0 });
+    assert.equal(loadSettings(dir).exploreMaxParallel, 1);
+  });
 });

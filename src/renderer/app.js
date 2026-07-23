@@ -917,6 +917,45 @@ function appendTimelineRow(kind, tool, summary, ok) {
   scrollToBottom();
 }
 
+function appendTimelineCustom(node) {
+  if (!chatRun?.timelineEl || !node) return;
+  chatRun.timelineEl.appendChild(node);
+  scrollToBottom();
+}
+
+function ensureSubagentBlock(ev) {
+  if (!chatRun) return null;
+  if (!chatRun.subagentBlocks) chatRun.subagentBlocks = new Map();
+  const id = ev.subagentId || 'unknown';
+  if (chatRun.subagentBlocks.has(id)) return chatRun.subagentBlocks.get(id);
+  const root = document.createElement('div');
+  root.className = 'subagent-block';
+  root.dataset.subagentId = id;
+  root.innerHTML =
+    '<div class="subagent-block-hd">' +
+      '<span class="sa-title"></span>' +
+      '<span class="sa-status is-run">进行中…</span>' +
+    '</div>' +
+    '<div class="subagent-block-body">' +
+      '<div class="sa-tools"></div>' +
+      '<div class="sa-summary"></div>' +
+    '</div>';
+  const hd = root.querySelector('.subagent-block-hd');
+  hd.addEventListener('click', () => root.classList.toggle('open'));
+  const kind = ev.kind || 'explore';
+  const goal = String(ev.goal || '').slice(0, 80);
+  root.querySelector('.sa-title').textContent = '子 Agent · ' + kind + ' · ' + goal;
+  appendTimelineCustom(root);
+  const rec = {
+    el: root,
+    toolsEl: root.querySelector('.sa-tools'),
+    summaryEl: root.querySelector('.sa-summary'),
+    statusEl: root.querySelector('.sa-status'),
+  };
+  chatRun.subagentBlocks.set(id, rec);
+  return rec;
+}
+
 function updateStreamBody() {
   if (!chatRun?.streamEl) return;
   chatRun.streamEl.textContent = chatRun.textBuffer;
@@ -1137,12 +1176,23 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'tool-start') {
+    if (ev.subagent && ev.subagentId && chatRun?.subagentBlocks?.get(ev.subagentId)) {
+      return;
+    }
     const sum = toolArgsSummary(ev.tool, ev.args);
     appendTimelineRow('start', ev.tool, sum || '运行中…');
     setRunStatus('工具：' + (ev.tool || ''));
     return;
   }
   if (type === 'tool-end') {
+    if (ev.subagent && ev.subagentId && chatRun?.subagentBlocks?.get(ev.subagentId)) {
+      const rec = chatRun.subagentBlocks.get(ev.subagentId);
+      const line = document.createElement('div');
+      line.className = 'sa-tool';
+      line.textContent = '· ' + (ev.name || ev.tool || '?') + ' ' + (ev.ok === false ? '失败' : 'ok');
+      rec.toolsEl.appendChild(line);
+      return;
+    }
     appendTimelineRow('end', ev.tool, ev.summary || (ev.ok === false ? '失败' : '完成'), ev.ok !== false);
     return;
   }
@@ -1183,10 +1233,19 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'subagent-start') {
-    setRunStatus('子 Agent 调研中: ' + String(ev.goal || '').slice(0, 60));
+    ensureSubagentBlock(ev);
+    setRunStatus('子 Agent (' + (ev.kind || 'explore') + '): ' + String(ev.goal || '').slice(0, 60));
     return;
   }
   if (type === 'subagent-end') {
+    const rec = ensureSubagentBlock(ev);
+    if (rec) {
+      rec.statusEl.className = 'sa-status ' + (ev.ok ? 'is-ok' : 'is-fail');
+      const ms = ev.durationMs != null ? ' · ' + (ev.durationMs / 1000).toFixed(1) + 's' : '';
+      const writes = ev.fileChangeCount ? ' · 写入 ' + ev.fileChangeCount + ' 个文件' : '';
+      rec.statusEl.textContent = (ev.ok ? '成功' : ('失败: ' + (ev.error || ''))) + ms + writes;
+      if (ev.summary) rec.summaryEl.textContent = String(ev.summary).slice(0, 4000);
+    }
     setRunStatus(ev.ok ? '子 Agent 完成' : ('子 Agent 失败: ' + (ev.error || '')));
     return;
   }
@@ -1868,6 +1927,8 @@ async function openSettings() {
   if (se) se.checked = settings.skillsEnabled !== false;
   const sub = document.getElementById('set-subagent-enabled');
   if (sub) sub.checked = settings.subagentEnabled !== false;
+  const emp = document.getElementById('set-explore-max-parallel');
+  if (emp) emp.value = String(settings.exploreMaxParallel ?? 2);
   const mcpEn = document.getElementById('set-mcp-enabled');
   if (mcpEn) mcpEn.checked = Boolean(settings.mcpEnabled);
   const mcpServersEl = document.getElementById('set-mcp-servers');
@@ -1927,6 +1988,7 @@ async function saveSettingsFromForm() {
     verifyBeforeDone: document.getElementById('set-verify-before-done')?.checked !== false,
     skillsEnabled: document.getElementById('set-skills-enabled')?.checked !== false,
     subagentEnabled: document.getElementById('set-subagent-enabled')?.checked !== false,
+    exploreMaxParallel: Number(document.getElementById('set-explore-max-parallel')?.value || 2),
     mcpEnabled: Boolean(document.getElementById('set-mcp-enabled')?.checked),
     mcpServers,
     hooksEnabled: document.getElementById('set-hooks-enabled')?.checked !== false,

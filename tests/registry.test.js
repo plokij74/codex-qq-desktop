@@ -68,4 +68,41 @@ describe('extension registry', () => {
     });
     assert.match(await reg.systemFragments({}), /FRAG/);
   });
+
+  it('stores per-run toolRoute on ctx.extensions and execute prefers it', async () => {
+    const reg = createRegistry();
+    const parentProv = {
+      id: 'parent',
+      isEnabled: (ctx) => !ctx?.childOnly,
+      getTools: () => [{ type: 'function', function: { name: 'parent_tool', parameters: { type: 'object', properties: {} } } }],
+      execute: async () => JSON.stringify({ ok: true, who: 'parent' }),
+    };
+    const childProv = {
+      id: 'child',
+      isEnabled: (ctx) => !!ctx?.childOnly,
+      getTools: () => [{ type: 'function', function: { name: 'child_tool', parameters: { type: 'object', properties: {} } } }],
+      execute: async () => JSON.stringify({ ok: true, who: 'child' }),
+    };
+    reg.register(parentProv);
+    reg.register(childProv);
+
+    const parentExt = {};
+    const parentCtx = { childOnly: false, extensions: parentExt };
+    await reg.collectTools(parentCtx);
+    assert.ok(parentExt.toolRoute instanceof Map);
+    assert.ok(parentExt.toolRoute.has('parent_tool'));
+
+    const childExt = {};
+    const childCtx = { childOnly: true, extensions: childExt };
+    await reg.collectTools(childCtx);
+    assert.ok(childExt.toolRoute instanceof Map);
+    assert.ok(childExt.toolRoute.has('child_tool'));
+    assert.ok(!childExt.toolRoute.has('parent_tool'));
+
+    // Parent route must remain usable even after child collectTools rewrote registry-level route
+    const parentRaw = await reg.execute('parent_tool', {}, parentCtx);
+    assert.deepEqual(JSON.parse(parentRaw), { ok: true, who: 'parent' });
+    const childRaw = await reg.execute('child_tool', {}, childCtx);
+    assert.deepEqual(JSON.parse(childRaw), { ok: true, who: 'child' });
+  });
 });
