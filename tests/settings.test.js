@@ -100,4 +100,37 @@ describe('settings', () => {
     saveSettings(dir, { exploreMaxParallel: 0 });
     assert.equal(loadSettings(dir).exploreMaxParallel, 1);
   });
+
+  it('loadSettings sanitizes mcpServers (drops non-http url)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const file = getSettingsPath(dir);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        mcpServers: [
+          { name: 'bad', transport: 'http', url: 'file:///etc/passwd' },
+          { name: 'good', command: 'npx', args: ['-y', 'x'] },
+        ],
+      }),
+      'utf8'
+    );
+    const s = loadSettings(dir);
+    assert.equal(s.mcpServers.length, 1);
+    assert.equal(s.mcpServers[0].name, 'good');
+    assert.equal(s.mcpServers[0].transport, 'stdio');
+    assert.ok(!s.mcpServers.some((x) => String(x.url || '').startsWith('file:')));
+  });
+
+  it('saveSettings sanitizes mcpServers on write', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const next = saveSettings(dir, {
+      mcpServers: [
+        { name: 'bad', transport: 'sse', url: 'file:///tmp/x' },
+        { name: 'ok', transport: 'http', url: 'https://example.com/mcp' },
+      ],
+    });
+    assert.equal(next.mcpServers.length, 1);
+    assert.equal(next.mcpServers[0].name, 'ok');
+    assert.equal(loadSettings(dir).mcpServers.length, 1);
+  });
 });

@@ -54,6 +54,18 @@ describe('agent-mode', () => {
     assert.deepEqual(names, ['read_file']);
   });
 
+  it('plan mode hides run_skill keeps list_skills and use_skill', () => {
+    const defs = ['list_skills', 'use_skill', 'run_skill', 'read_file'].map((name) => ({
+      type: 'function',
+      function: { name },
+    }));
+    const plan = filterToolsForMode(defs, 'plan').map((t) => t.function.name);
+    assert.ok(plan.includes('list_skills'));
+    assert.ok(plan.includes('use_skill'));
+    assert.ok(plan.includes('read_file'));
+    assert.ok(!plan.includes('run_skill'));
+  });
+
   it('filterToolsForMode plan hides writes and keeps submit_plan', () => {
     const defs = [
       { function: { name: 'read_file' } },

@@ -11,6 +11,7 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'spawn_explore',
   'spawn_explores',
   'spawn_implement',
+  'run_skill',
 ]);
 
 const PLAN_MARKDOWN_MAX = 32 * 1024;

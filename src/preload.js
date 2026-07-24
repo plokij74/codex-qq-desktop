@@ -29,4 +29,5 @@ contextBridge.exposeInMainWorld('codex', {
   listSkills: (payload) => ipcRenderer.invoke('skills:list', payload || {}),
   getSkill: (payload) => ipcRenderer.invoke('skills:get', payload || {}),
   hooksSummary: (payload) => ipcRenderer.invoke('hooks:summary', payload || {}),
+  testMcpServer: (cfg) => ipcRenderer.invoke('mcp:testServer', cfg),
 });

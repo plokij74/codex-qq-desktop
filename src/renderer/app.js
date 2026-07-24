@@ -1900,6 +1900,232 @@ function handleSlashCommand(text) {
 function clearCurrentChat() {
   const s = activeSession(); s.messages = [{ role: 'assistant', content: '会话已清空。继续说吧。' }]; s.updatedAt = Date.now(); saveState(); renderMessages(); toast('已清空当前会话');
 }
+/** In-memory MCP server list for settings UI (list is source of truth). */
+let mcpServerDrafts = [];
+
+function normalizeMcpTransport(t) {
+  const x = String(t || '').toLowerCase();
+  if (x === 'sse' || x === 'http' || x === 'stdio') return x;
+  return 'stdio';
+}
+
+function cloneMcpServer(s) {
+  const transport = normalizeMcpTransport(s?.transport || (s?.url ? 'http' : 'stdio'));
+  const out = {
+    name: String(s?.name || ''),
+    transport,
+    enabled: s?.enabled === false ? false : true,
+    command: String(s?.command || ''),
+    url: String(s?.url || ''),
+  };
+  if (Array.isArray(s?.args)) out.args = s.args.map(String);
+  if (s?.env && typeof s.env === 'object' && !Array.isArray(s.env)) out.env = { ...s.env };
+  if (s?.cwd) out.cwd = String(s.cwd);
+  if (s?.headers && typeof s.headers === 'object' && !Array.isArray(s.headers)) {
+    out.headers = { ...s.headers };
+  }
+  if (s?.timeoutMs != null && Number.isFinite(Number(s.timeoutMs))) {
+    out.timeoutMs = Number(s.timeoutMs);
+  }
+  return out;
+}
+
+function serializeMcpServerList() {
+  return mcpServerDrafts.map((s) => {
+    const transport = normalizeMcpTransport(s.transport);
+    const base = {
+      name: String(s.name || '').trim(),
+      transport,
+      enabled: s.enabled !== false,
+    };
+    if (transport === 'stdio') {
+      base.command = String(s.command || '').trim();
+      if (Array.isArray(s.args) && s.args.length) base.args = s.args.map(String);
+      if (s.env && typeof s.env === 'object' && !Array.isArray(s.env)) base.env = { ...s.env };
+      if (s.cwd) base.cwd = String(s.cwd);
+    } else {
+      base.url = String(s.url || '').trim();
+      if (s.headers && typeof s.headers === 'object' && !Array.isArray(s.headers)) {
+        base.headers = { ...s.headers };
+      }
+    }
+    if (s.timeoutMs != null && Number.isFinite(Number(s.timeoutMs))) {
+      base.timeoutMs = Number(s.timeoutMs);
+    }
+    return base;
+  });
+}
+
+function setMcpServerDrafts(list) {
+  mcpServerDrafts = Array.isArray(list) ? list.map(cloneMcpServer) : [];
+  renderMcpServerList();
+}
+
+function hideMcpImportPanel() {
+  const panel = document.getElementById('mcp-import-panel');
+  if (panel) panel.classList.add('hidden');
+  const ta = document.getElementById('mcp-import-json');
+  if (ta) ta.value = '';
+}
+
+function renderMcpServerList() {
+  const root = document.getElementById('mcp-server-list');
+  if (!root) return;
+  root.innerHTML = '';
+  if (!mcpServerDrafts.length) {
+    const empty = document.createElement('div');
+    empty.className = 'mcp-server-empty';
+    empty.textContent = '暂无 MCP 服务器，可添加或从 JSON 导入';
+    root.appendChild(empty);
+    return;
+  }
+  mcpServerDrafts.forEach((s, idx) => {
+    const transport = normalizeMcpTransport(s.transport);
+    const row = document.createElement('div');
+    row.className = 'mcp-server-row';
+    row.dataset.idx = String(idx);
+
+    const enLabel = document.createElement('label');
+    enLabel.className = 'mcp-en';
+    enLabel.title = '启用';
+    const en = document.createElement('input');
+    en.type = 'checkbox';
+    en.checked = s.enabled !== false;
+    en.addEventListener('change', () => {
+      mcpServerDrafts[idx].enabled = en.checked;
+    });
+    enLabel.appendChild(en);
+
+    const name = document.createElement('input');
+    name.type = 'text';
+    name.className = 'mcp-name';
+    name.placeholder = '名称';
+    name.value = s.name || '';
+    name.addEventListener('input', () => {
+      mcpServerDrafts[idx].name = name.value;
+    });
+
+    const tr = document.createElement('select');
+    tr.className = 'mcp-transport';
+    for (const opt of ['stdio', 'sse', 'http']) {
+      const o = document.createElement('option');
+      o.value = opt;
+      o.textContent = opt;
+      if (opt === transport) o.selected = true;
+      tr.appendChild(o);
+    }
+    tr.addEventListener('change', () => {
+      mcpServerDrafts[idx].transport = normalizeMcpTransport(tr.value);
+      renderMcpServerList();
+    });
+
+    const endpoint = document.createElement('input');
+    endpoint.type = 'text';
+    endpoint.className = 'mcp-endpoint';
+    if (transport === 'stdio') {
+      endpoint.placeholder = '命令（如 npx）';
+      endpoint.value = s.command || '';
+      endpoint.addEventListener('input', () => {
+        mcpServerDrafts[idx].command = endpoint.value;
+      });
+    } else {
+      endpoint.placeholder = 'URL（https://…）';
+      endpoint.value = s.url || '';
+      endpoint.addEventListener('input', () => {
+        mcpServerDrafts[idx].url = endpoint.value;
+      });
+    }
+
+    const testBtn = document.createElement('button');
+    testBtn.type = 'button';
+    testBtn.className = 'btn-small mcp-test';
+    testBtn.textContent = '测试';
+    testBtn.addEventListener('click', () => testMcpServerRow(idx, resultEl, testBtn));
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'btn-small mcp-del';
+    delBtn.textContent = '删除';
+    delBtn.addEventListener('click', () => {
+      mcpServerDrafts.splice(idx, 1);
+      renderMcpServerList();
+    });
+
+    const resultEl = document.createElement('div');
+    resultEl.className = 'mcp-test-result';
+
+    row.appendChild(enLabel);
+    row.appendChild(name);
+    row.appendChild(tr);
+    row.appendChild(endpoint);
+    row.appendChild(testBtn);
+    row.appendChild(delBtn);
+    row.appendChild(resultEl);
+    root.appendChild(row);
+  });
+}
+
+async function testMcpServerRow(idx, resultEl, testBtn) {
+  const draft = mcpServerDrafts[idx];
+  if (!draft || !window.codex?.testMcpServer) return;
+  const cfg = serializeMcpServerList()[idx];
+  if (resultEl) {
+    resultEl.className = 'mcp-test-result';
+    resultEl.textContent = '测试中…';
+  }
+  if (testBtn) testBtn.disabled = true;
+  try {
+    const r = await window.codex.testMcpServer(cfg);
+    if (!resultEl) return;
+    if (r?.ok) {
+      resultEl.className = 'mcp-test-result ok';
+      resultEl.textContent = `连接成功 · ${r.transport || cfg.transport} · tools ${r.toolsCount ?? 0} · resources ${r.resourcesCount ?? 0}`;
+    } else {
+      resultEl.className = 'mcp-test-result err';
+      resultEl.textContent = `失败：${r?.error || '未知错误'}`;
+    }
+  } catch (err) {
+    if (resultEl) {
+      resultEl.className = 'mcp-test-result err';
+      resultEl.textContent = `失败：${err.message || String(err)}`;
+    }
+  } finally {
+    if (testBtn) testBtn.disabled = false;
+  }
+}
+
+function addMcpServerDraft() {
+  mcpServerDrafts.push(cloneMcpServer({
+    name: '',
+    transport: 'stdio',
+    enabled: true,
+    command: '',
+  }));
+  renderMcpServerList();
+}
+
+function applyMcpImportJson() {
+  const raw = document.getElementById('mcp-import-json')?.value?.trim() || '';
+  if (!raw) {
+    toast('请粘贴 MCP 服务器 JSON 数组');
+    return;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    toast('JSON 无效，已中止导入');
+    return;
+  }
+  if (!Array.isArray(parsed)) {
+    toast('MCP 服务器 JSON 必须是数组');
+    return;
+  }
+  setMcpServerDrafts(parsed);
+  hideMcpImportPanel();
+  toast(`已导入 ${mcpServerDrafts.length} 项（保存时校验）`);
+}
+
 async function openSettings() {
   const settings = await window.codex.getSettings();
   document.getElementById('set-mode').value = settings.mode || 'local';
@@ -1931,17 +2157,17 @@ async function openSettings() {
   if (emp) emp.value = String(settings.exploreMaxParallel ?? 2);
   const mcpEn = document.getElementById('set-mcp-enabled');
   if (mcpEn) mcpEn.checked = Boolean(settings.mcpEnabled);
-  const mcpServersEl = document.getElementById('set-mcp-servers');
-  if (mcpServersEl) {
-    const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
-    mcpServersEl.value = servers.length ? JSON.stringify(servers, null, 2) : '';
-  }
+  setMcpServerDrafts(Array.isArray(settings.mcpServers) ? settings.mcpServers : []);
+  hideMcpImportPanel();
   const he = document.getElementById('set-hooks-enabled');
   if (he) he.checked = settings.hooksEnabled !== false;
   document.getElementById('settings-modal').classList.remove('hidden');
   await refreshHooksSummary();
 }
-function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
+function closeSettings() {
+  document.getElementById('settings-modal').classList.add('hidden');
+  hideMcpImportPanel();
+}
 async function refreshHooksSummary() {
   const el = document.getElementById('hooks-summary');
   if (!el || !window.codex?.hooksSummary) return;
@@ -1959,21 +2185,7 @@ async function refreshHooksSummary() {
   }
 }
 async function saveSettingsFromForm() {
-  const mcpRaw = document.getElementById('set-mcp-servers')?.value?.trim() || '';
-  let mcpServers = [];
-  if (mcpRaw) {
-    try {
-      const parsed = JSON.parse(mcpRaw);
-      if (!Array.isArray(parsed)) {
-        toast('MCP 服务器 JSON 必须是数组');
-        return;
-      }
-      mcpServers = parsed;
-    } catch {
-      toast('MCP 服务器 JSON 无效，已中止保存');
-      return;
-    }
-  }
+  const mcpServers = serializeMcpServerList();
   const partial = {
     mode: document.getElementById('set-mode').value,
     baseUrl: document.getElementById('set-base-url').value.trim(),
@@ -2120,6 +2332,17 @@ function bindEvents() {
   document.getElementById('btn-settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('btn-settings-save').addEventListener('click', () => saveSettingsFromForm().catch((e) => alert(e.message)));
   document.getElementById('btn-hooks-refresh')?.addEventListener('click', () => refreshHooksSummary().catch(() => {}));
+  document.getElementById('btn-mcp-add')?.addEventListener('click', () => addMcpServerDraft());
+  document.getElementById('btn-mcp-import')?.addEventListener('click', () => {
+    const panel = document.getElementById('mcp-import-panel');
+    if (!panel) return;
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) {
+      document.getElementById('mcp-import-json')?.focus();
+    }
+  });
+  document.getElementById('btn-mcp-import-apply')?.addEventListener('click', () => applyMcpImportJson());
+  document.getElementById('btn-mcp-import-cancel')?.addEventListener('click', () => hideMcpImportPanel());
   document.getElementById('settings-modal').addEventListener('click', (e) => { if (e.target.id === 'settings-modal') closeSettings(); });
   document.getElementById('btn-task-cancel').addEventListener('click', closeTaskModal);
   document.getElementById('btn-task-ok').addEventListener('click', createTaskFromModal);

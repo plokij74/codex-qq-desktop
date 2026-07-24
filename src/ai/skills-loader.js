@@ -5,6 +5,12 @@ const SKILL_BODY_MAX = 24 * 1024;
 const SKILL_MAX_COUNT = 50;
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const DESC_FALLBACK_MAX = 120;
+const TRIGGER_MATCH_MAX = 5;
+const TRIGGER_COUNT_MAX = 20;
+const TRIGGER_LEN_MAX = 64;
+const TIMEOUT_DEFAULT = 30000;
+const TIMEOUT_MIN = 1000;
+const TIMEOUT_MAX = 120000;
 
 /**
  * @param {unknown} name
@@ -80,10 +86,117 @@ function descriptionFromBody(body) {
 }
 
 /**
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function parseTriggers(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(/[,，]/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, TRIGGER_COUNT_MAX)
+    .map((s) => s.slice(0, TRIGGER_LEN_MAX));
+}
+
+/**
+ * JSON array string only.
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function parseArgsField(raw) {
+  if (!raw) return [];
+  const s = String(raw).trim();
+  if (s.startsWith('[')) {
+    try {
+      const a = JSON.parse(s);
+      return Array.isArray(a) ? a.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {number}
+ */
+function parseTimeoutMs(raw) {
+  if (raw == null || raw === '') return TIMEOUT_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return TIMEOUT_DEFAULT;
+  return Math.max(TIMEOUT_MIN, Math.min(TIMEOUT_MAX, Math.floor(n)));
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function parseCwdKind(raw) {
+  if (raw == null || raw === '') return 'project';
+  const s = String(raw).trim();
+  if (!s) return 'project';
+  if (s === 'project' || s === 'skill') return s;
+  return s; // relative path under project
+}
+
+/**
+ * Case-insensitive substring match; catalog order; max 5.
+ * @param {Array<{ name?: string, triggers?: string[] }>} catalog
+ * @param {string} userText
+ * @returns {Array}
+ */
+function matchSkillsByTriggers(catalog, userText) {
+  const text = String(userText || '').slice(0, 8 * 1024).toLowerCase();
+  if (!text || !Array.isArray(catalog)) return [];
+  const out = [];
+  for (const skill of catalog) {
+    const triggers = Array.isArray(skill?.triggers) ? skill.triggers : [];
+    if (!triggers.length) continue;
+    const hit = triggers.some((t) => {
+      const key = String(t || '').toLowerCase();
+      return key && text.includes(key);
+    });
+    if (hit) {
+      out.push(skill);
+      if (out.length >= TRIGGER_MATCH_MAX) break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve skill process cwd.
+ * cwdKind: project | skill | relative-under-project
+ * @param {{ cwdKind?: string, dir?: string }} meta
+ * @param {string} projectPath
+ * @returns {string}
+ */
+function resolveSkillCwd(meta, projectPath) {
+  const kind = (meta && meta.cwdKind) || 'project';
+  if (kind === 'skill') {
+    if (!meta.dir) throw new Error('skill 目录缺失');
+    return meta.dir;
+  }
+  if (kind === 'project' || !kind) {
+    return path.resolve(projectPath);
+  }
+  // relative under project
+  const root = path.resolve(projectPath);
+  const resolved = path.resolve(root, kind);
+  const rel = path.relative(root, resolved);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error('cwd 越界');
+  }
+  return resolved;
+}
+
+/**
  * Scan one skills root: immediate subdirs that contain SKILL.md.
  * @param {string} rootDir
  * @param {'project'|'user'|'bundled'} source
- * @returns {Array<{ name: string, description: string, source: string, dir: string, skillPath: string }>}
+ * @returns {Array}
  */
 function scanSkillRoot(rootDir, source) {
   const out = [];
@@ -115,12 +228,23 @@ function scanSkillRoot(rootDir, source) {
     let description = attrs.description != null ? String(attrs.description).trim() : '';
     if (!description) description = descriptionFromBody(body);
 
+    const triggers = parseTriggers(attrs.triggers);
+    const command = attrs.command != null ? String(attrs.command).trim() : '';
+    const skillArgs = parseArgsField(attrs.args);
+    const timeoutMs = parseTimeoutMs(attrs.timeoutMs);
+    const cwdKind = parseCwdKind(attrs.cwd);
+
     out.push({
       name,
       description,
       source,
       dir,
       skillPath,
+      triggers,
+      command: command || undefined,
+      skillArgs,
+      timeoutMs,
+      cwdKind,
     });
   }
   return out;
@@ -209,6 +333,12 @@ module.exports = {
   SKILL_MAX_COUNT,
   parseFrontmatter,
   sanitizeSkillName,
+  parseTriggers,
+  parseArgsField,
+  parseTimeoutMs,
+  parseCwdKind,
+  matchSkillsByTriggers,
+  resolveSkillCwd,
   discoverSkills,
   loadSkillBody,
 };

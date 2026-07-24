@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { sanitizeMcpServers } = require('./mcp-config');
 
 const DEFAULT_SETTINGS = {
   mode: 'local',
@@ -22,7 +23,9 @@ const DEFAULT_SETTINGS = {
   skillsEnabled: true,
   subagentEnabled: true,
   mcpEnabled: false,
-  mcpServers: [], // { name, command, args?, env?, cwd? }[]
+  // MCP servers: sanitized on load/save via sanitizeMcpServers
+  // shape: { name, transport?, command?, args?, env?, cwd?, url?, headers?, enabled?, timeoutMs? }[]
+  mcpServers: [],
   // Phase C.3 hooks
   hooksEnabled: true,
   // Phase C.4
@@ -46,6 +49,7 @@ function loadSettings(userDataPath) {
     const parsed = JSON.parse(raw);
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
     merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
+    merged.mcpServers = sanitizeMcpServers(merged.mcpServers);
     return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -55,6 +59,7 @@ function loadSettings(userDataPath) {
 function saveSettings(userDataPath, partial) {
   const next = { ...loadSettings(userDataPath), ...partial };
   next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
+  next.mcpServers = sanitizeMcpServers(next.mcpServers);
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
   return next;

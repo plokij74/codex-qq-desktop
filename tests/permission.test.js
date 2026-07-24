@@ -37,6 +37,10 @@ describe('permission', () => {
     assert.equal(riskForTool('spawn_explore'), 'read');
   });
 
+  it('riskForTool run_skill is write', () => {
+    assert.equal(riskForTool('run_skill'), 'write');
+  });
+
   it('spawn_implement is write risk; spawn_explores is read', () => {
     assert.equal(riskForTool('spawn_implement'), 'write');
     assert.equal(riskForTool('spawn_explores'), 'read');

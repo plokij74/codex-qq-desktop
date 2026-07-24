@@ -414,6 +414,22 @@ function parseArgs(raw) {
   }
 }
 
+/**
+ * Last user message text for Skills trigger matching (max 8 KiB).
+ * @param {Array} messages
+ * @returns {string}
+ */
+function extractLastUserText(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m && m.role === 'user') {
+      return String(m.content || '').slice(0, 8 * 1024);
+    }
+  }
+  return '';
+}
+
 /** Text-protocol fallback when API has no tool_calls support */
 function parseTextToolCalls(content) {
   const text = String(content || '');
@@ -1173,6 +1189,8 @@ async function runAgentLoop({
   const chat = typeof chatFn === 'function' ? chatFn : chatCompletionMessage;
   const registry = registryOpt || createDefaultRegistry();
   const extensions = extensionsOpt || {};
+  // Skills trigger matching: last user message text for system fragment
+  extensions.userPromptText = extractLastUserText(messages);
 
   const rawTurns = Number(settings.maxAgentTurns);
   // 0 = unlimited; otherwise clamp 1..50 for safety when user sets a number

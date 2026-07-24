@@ -221,15 +221,15 @@ npm run dist
 - 设置：`subagentEnabled`（默认开）
 - C.4 在此基础上增加并行 explore、`spawn_explores`、`spawn_implement` 与可展开轨迹（见下）
 
-### MCP（stdio）
+### MCP（C.2 基线：stdio）
 
-- 设置：`mcpEnabled`（默认关）+ `mcpServers` JSON
-- 每次 Agent run 连接，结束断开；工具名 `mcp_<server>_<tool>`；权限同写操作
-- 仅 stdio；无 SSE/HTTP
+- 设置：`mcpEnabled`（默认关）+ `mcpServers`
+- 每次 Agent run 连接，结束断开；工具名 `mcp_<server>_<tool>`；权限 risk=`mcp`
+- C.2 仅 stdio；**三传输 / resources / 列表 UI** 见 **Phase C.5**
 
 ### 后续
 
-- C.5 MCP/Skills 增强（可选 worktree 等）
+- C.5 三传输 MCP、resources、`run_skill` / triggers、列表 UI（已交付，见下）
 
 ## Phase C.3：Hooks（配置驱动生命周期）
 
@@ -333,3 +333,133 @@ npm run dist
 ### 本阶段明确不做
 
 git worktree 隔离、implement 并行、子内再 spawn、独立侧栏多 Agent 面板、子会话持久化/恢复。
+
+## Phase C.5：MCP 增强 + Skills 可执行 / 路由 + 列表 UI
+
+在 C.2 的 stdio MCP 与 Markdown Skills 之上：支持 **stdio / SSE / Streamable HTTP**、**只读 resources**、Skills **`run_skill` + triggers 提示路由**，以及设置页 **MCP 服务器列表（含测试连接）**。无新 npm 依赖；不实现 OAuth / MCP prompts / sampling。
+
+### 开关与配置
+
+| 设置 | 默认 | 说明 |
+|------|------|------|
+| `mcpEnabled` | **关** | 总开关；关则不连接、不注册 MCP 工具 |
+| `mcpServers` | `[]` | 服务器列表；经 `sanitizeMcpServers` 规范化（非法项丢弃） |
+| `skillsEnabled` | 开 | 关闭则无 list/use/run_skill 与匹配片段 |
+
+主 Agent run 开始时串行连接已启用 server，run 结束断开（与 C.2 一致）。**计划模式**与 **子 Agent（depth≥1）** 不暴露 MCP 工具与 `run_skill`。
+
+### 三传输与 `mcpServers` 字段
+
+| 字段 | 说明 |
+|------|------|
+| `name` | 必填，`^[a-zA-Z0-9_-]+$`；重名保留先出现 |
+| `transport` | `stdio` \| `sse` \| `http`；缺省：有 `command`→stdio，否则有 `url`→http |
+| `enabled` | 默认 `true`；`false` 时跳过连接 |
+| `command` / `args` / `env` / `cwd` | **stdio** 用；`command` 必填 |
+| `url` | **sse / http** 必填；仅 `http:` / `https:` |
+| `headers` | 可选；静态请求头（键/值有长度上限）；**不会**自动注入 API Key |
+| `timeoutMs` | 默认 60000；钳制 1000..300000 |
+
+示例：
+
+```json
+[
+  {
+    "name": "local_fs",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+  },
+  {
+    "name": "remote_http",
+    "transport": "http",
+    "url": "https://example.com/mcp",
+    "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+  },
+  {
+    "name": "remote_sse",
+    "transport": "sse",
+    "url": "https://example.com/sse",
+    "enabled": false
+  }
+]
+```
+
+旧配置仅含 `command`、无 `transport` 时仍按 **stdio** 兼容。
+
+| 传输 | 要点 |
+|------|------|
+| **stdio** | Content-Length JSON-RPC；`spawn` + `shell: false` |
+| **http** | Streamable HTTP **最小子集**：POST JSON-RPC；JSON 或 SSE 式响应；无会话恢复 |
+| **sse** | 最小 MCP-over-SSE；与 tools/resources 语义对齐 |
+
+单 server 失败不影响其他 server；聊天侧有 `mcp-status`（可带 `transport`）。
+
+### MCP 工具
+
+| 工具 | 风险 | 说明 |
+|------|------|------|
+| `mcp_<server>_<tool>` | mcp | 各 server 动态工具（固定名 `mcp_resources_*` 保留，避免冲突） |
+| `mcp_resources_list` | mcp | 列出已连接 server 的 resources；可选参数 `server` |
+| `mcp_resource_read` | mcp | 按 `server` + `uri` 读取；无能力时安全失败 |
+
+- `confirm-writes`：与其它 mcp 一样走内联审批；`allow_session` 可记 risk=`mcp`
+- `full-auto`：自动允许
+- 输出默认截断（约 32 KiB，标记 `truncated`）
+- **不支持** MCP prompts / sampling / OAuth 浏览器鉴权
+
+### Skills：`run_skill` 与 triggers
+
+目录与 `list_skills` / `use_skill` 同 C.2。frontmatter 扩展：
+
+| 字段 | 说明 |
+|------|------|
+| `triggers` | 可选；逗号分隔关键词；最多 20 条、每条 ≤64 字；子串、不区分大小写 |
+| `command` | 可选；有则 `runnable: true`，可用 `run_skill` |
+| `args` | 可选；JSON 数组字符串 |
+| `timeoutMs` | 默认 30000；钳制 1000..120000 |
+| `cwd` | `project`（默认）\| `skill` \| 项目内相对路径；必须落在 **项目根** 或 **该 skill 目录** 内 |
+
+| 工具 | 风险 | 说明 |
+|------|------|------|
+| `list_skills` | read | 含 `runnable`、`triggers` 摘要 |
+| `use_skill` | read | 加载 Markdown 全文（同 C.2） |
+| `run_skill` | **write** | 外部 `spawn(command, args, { shell: false })`；**不**依赖「允许终端」；**禁止**主进程 `require` 用户 skill JS |
+
+自动路由：
+
+1. 用当前用户消息（过长只取前约 8 KiB）匹配 `triggers`
+2. 最多 **5** 个 skill 写入 system 的【Skills 自动匹配】（name + description 截断 + triggers）
+3. 提示优先 `use_skill`；可执行再用 `run_skill`
+4. **不**自动注入 body、**不**自动执行脚本
+
+计划模式：保留 list/use 与匹配片段，**隐藏** `run_skill`。`run_skill` **不**计入 verify 软门闩成功。
+
+示例 `SKILL.md` frontmatter：
+
+```markdown
+---
+name: fmt-check
+description: 运行项目格式检查
+triggers: format, prettier, 格式化
+command: npm
+args: ["run", "format:check"]
+timeoutMs: 60000
+cwd: project
+---
+```
+
+### 设置列表 UI + 测试连接
+
+- 设置 → **MCP 服务器** 列表：增删改、启停、`transport` 与 stdio/url 字段
+- **测试连接**：临时 start → listTools（+ 可选 listResources）→ close；返回 ok / toolsCount / resourcesCount / error / transport（超时约 ≤15s）
+- **从 JSON 导入替换**：导入整表替换列表；日常保存以列表为源 of truth
+- Skills：设置内短说明（可执行 + triggers），无完整 skill 编辑器
+
+### 安全与风险声明
+
+- 远程 **http(s) URL** 由用户自行配置；本阶段**不做**私网 / SSRF 企业级拦截，请勿指向不可信地址
+- 静态 `headers` / `env` 可放 token；**不会**把应用 API Key 自动写入 MCP
+- stdio / `run_skill` 均为 `shell: false`；`run_skill` 的 cwd 限制在项目根或 skill 目录
+- 可执行 skill 与 MCP 工具可能改文件或访问外网：请配合权限模式与审批使用
+- **明确不做**：OAuth、MCP prompts/sampling、skill 市场、require 用户模块进主进程

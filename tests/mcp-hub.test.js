@@ -19,11 +19,18 @@ describe('sanitizeToolPart', () => {
 });
 
 describe('createMcpHub', () => {
-  function mockClient({ tools = [], callResult = { ok: true }, failStart = false } = {}) {
-    const state = { started: false, closed: false, calls: [] };
+  function mockClient({
+    tools = [],
+    resources = [],
+    callResult = { ok: true },
+    readResult = { contents: [] },
+    failStart = false,
+  } = {}) {
+    const state = { started: false, closed: false, calls: [], reads: [], createArgs: [] };
     return {
       state,
-      createClient() {
+      createClient(cfg) {
+        state.createArgs.push(cfg);
         return {
           async start() {
             if (failStart) throw new Error('start failed');
@@ -31,6 +38,14 @@ describe('createMcpHub', () => {
           },
           async listTools() {
             return tools;
+          },
+          async listResources() {
+            return resources;
+          },
+          async readResource(uri) {
+            state.reads.push(uri);
+            if (readResult instanceof Error) throw readResult;
+            return readResult;
           },
           async callTool(name, args) {
             state.calls.push({ name, args });
@@ -55,10 +70,11 @@ describe('createMcpHub', () => {
     const hub = createMcpHub({ createClient: mock.createClient });
     await hub.startAll([{ name: 'git', command: 'echo' }], {});
     const defs = hub.getToolDefs();
-    assert.deepEqual(
-      defs.map((d) => d.function.name),
-      ['mcp_git_status', 'mcp_git_status_2']
-    );
+    const names = defs.map((d) => d.function.name);
+    assert.ok(names.includes('mcp_git_status'));
+    assert.ok(names.includes('mcp_git_status_2'));
+    assert.ok(names.includes('mcp_resources_list'));
+    assert.ok(names.includes('mcp_resource_read'));
     await hub.stopAll();
     assert.equal(mock.state.closed, true);
   });
@@ -104,6 +120,29 @@ describe('createMcpHub', () => {
     assert.equal(hub.getToolDefs().length, 0);
   });
 
+  it('rejects non-http url for http/sse transport', async () => {
+    const statuses = [];
+    let createCount = 0;
+    const hub = createMcpHub({
+      createClient() {
+        createCount += 1;
+        throw new Error('should not create for file url');
+      },
+    });
+    await hub.startAll(
+      [
+        { name: 'filehttp', transport: 'http', url: 'file:///etc/passwd' },
+        { name: 'filesse', transport: 'sse', url: 'file:///tmp/x' },
+        { name: 'noturl', transport: 'http', url: 'not-a-url' },
+      ],
+      { onStatus: (s) => statuses.push(s) }
+    );
+    assert.equal(createCount, 0);
+    assert.ok(statuses.length >= 3);
+    assert.ok(statuses.every((s) => s.ok === false && s.error === 'invalid config'));
+    assert.equal(hub.getToolDefs().length, 0);
+  });
+
   it('stopAll clears route so call fails after stop', async () => {
     const mock = mockClient({ tools: [{ name: 't' }], callResult: 'hi' });
     const hub = createMcpHub({ createClient: mock.createClient });
@@ -143,6 +182,126 @@ describe('createMcpHub', () => {
     assert.equal(state.closed, true);
     assert.equal(hub.getToolDefs().length, 0);
     assert.ok(statuses.some((s) => s.server === 'bad' && s.ok === false));
+  });
+
+  it('skips disabled servers', async () => {
+    let createCount = 0;
+    const hub = createMcpHub({
+      createClient(cfg) {
+        createCount += 1;
+        return {
+          async start() {},
+          async listTools() {
+            return [{ name: 't' }];
+          },
+          async listResources() {
+            return [];
+          },
+          async readResource() {
+            return {};
+          },
+          async callTool() {
+            return {};
+          },
+          async close() {},
+        };
+      },
+    });
+    await hub.startAll(
+      [
+        { name: 'off', command: 'c', enabled: false },
+        { name: 'on', command: 'c', enabled: true },
+      ],
+      {}
+    );
+    assert.equal(createCount, 1);
+    const names = hub.getToolDefs().map((d) => d.function.name);
+    assert.ok(names.includes('mcp_on_t'));
+    assert.ok(!names.some((n) => n.startsWith('mcp_off_')));
+    await hub.stopAll();
+  });
+
+  it('registers resource tools when connected', async () => {
+    const mock = mockClient({
+      tools: [{ name: 'ping' }],
+      resources: [{ uri: 'file://a', name: 'a', description: 'A', mimeType: 'text/plain' }],
+    });
+    const hub = createMcpHub({ createClient: mock.createClient });
+    await hub.startAll([{ name: 's1', command: 'c', transport: 'stdio' }], {});
+    assert.deepEqual(mock.state.createArgs[0].transport, 'stdio');
+    const names = hub.getToolDefs().map((d) => d.function.name);
+    assert.ok(names.includes('mcp_s1_ping'));
+    assert.ok(names.includes('mcp_resources_list'));
+    assert.ok(names.includes('mcp_resource_read'));
+    const listed = await hub.call('mcp_resources_list', {});
+    assert.equal(listed.ok, true);
+    assert.equal(listed.resources.length, 1);
+    assert.equal(listed.resources[0].server, 's1');
+    assert.equal(listed.resources[0].uri, 'file://a');
+    await hub.stopAll();
+    assert.equal(hub.getToolDefs().length, 0);
+  });
+
+  it('mcp_resource_read returns truncated content', async () => {
+    const big = 'y'.repeat(33 * 1024);
+    const mock = mockClient({
+      tools: [],
+      resources: [{ uri: 'mem://big' }],
+      readResult: { contents: [{ text: big }] },
+    });
+    const hub = createMcpHub({ createClient: mock.createClient });
+    await hub.startAll([{ name: 'rs', command: 'c' }], {});
+    const r = await hub.call('mcp_resource_read', { server: 'rs', uri: 'mem://big' });
+    assert.equal(r.ok, true);
+    assert.equal(r.truncated, true);
+    assert.equal(typeof r.contents, 'string');
+    assert.equal(r.contents.length, 32 * 1024);
+    assert.deepEqual(mock.state.reads, ['mem://big']);
+    await hub.stopAll();
+  });
+
+  it('does not register dynamic tools with reserved resource names', async () => {
+    const mock = mockClient({
+      tools: [
+        { name: 'list' },
+        { name: 'read' },
+      ],
+    });
+    // server name "resources" + tool "list" → mcp_resources_list (reserved)
+    // server name "resource" + tool "read" → mcp_resource_read (reserved)
+    const hub = createMcpHub({ createClient: mock.createClient });
+    await hub.startAll(
+      [
+        { name: 'resources', command: 'c' },
+        { name: 'resource', command: 'c' },
+      ],
+      {}
+    );
+    const names = hub.getToolDefs().map((d) => d.function.name);
+    assert.ok(names.includes('mcp_resources_list'));
+    assert.ok(names.includes('mcp_resource_read'));
+    // reserved fixed tools present once; dynamic collisions renamed or skipped
+    assert.equal(names.filter((n) => n === 'mcp_resources_list').length, 1);
+    assert.equal(names.filter((n) => n === 'mcp_resource_read').length, 1);
+    // dynamic tools should still be reachable under non-reserved names
+    assert.ok(names.some((n) => n.startsWith('mcp_resources_') && n !== 'mcp_resources_list'));
+    assert.ok(names.some((n) => n.startsWith('mcp_resource_') && n !== 'mcp_resource_read'));
+    await hub.stopAll();
+  });
+
+  it('passes full cfg including transport to createClient', async () => {
+    const mock = mockClient({ tools: [] });
+    const hub = createMcpHub({ createClient: mock.createClient });
+    await hub.startAll(
+      [{ name: 'http1', transport: 'http', url: 'http://127.0.0.1:9', headers: { a: '1' } }],
+      { cwd: '/proj' }
+    );
+    assert.equal(mock.state.createArgs.length, 1);
+    const arg = mock.state.createArgs[0];
+    assert.equal(arg.transport, 'http');
+    assert.equal(arg.url, 'http://127.0.0.1:9');
+    assert.deepEqual(arg.headers, { a: '1' });
+    await hub.stopAll();
   });
 });
 

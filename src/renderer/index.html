@@ -222,11 +222,23 @@
           <span>Explore 最大并行</span>
           <input id="set-explore-max-parallel" type="number" min="1" max="3" value="2" />
         </label>
-        <label class="switch-row"><input type="checkbox" id="set-mcp-enabled" /> <span>启用 MCP（stdio）</span></label>
-        <label class="field">
-          <span>MCP 服务器 JSON</span>
-          <textarea id="set-mcp-servers" rows="5" placeholder='[{"name":"demo","command":"npx","args":["-y","@modelcontextprotocol/server-everything"]}]'></textarea>
-        </label>
+        <label class="switch-row"><input type="checkbox" id="set-mcp-enabled" /> <span>启用 MCP</span></label>
+        <div class="field mcp-servers-field">
+          <span>MCP 服务器</span>
+          <div id="mcp-server-list" class="mcp-server-list"></div>
+          <div class="mcp-server-actions">
+            <button type="button" id="btn-mcp-add" class="btn-small">添加服务器</button>
+            <button type="button" id="btn-mcp-import" class="btn-small">从 JSON 导入替换</button>
+          </div>
+          <div id="mcp-import-panel" class="mcp-import-panel hidden">
+            <textarea id="mcp-import-json" rows="4" placeholder='[{"name":"demo","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-everything"]}]'></textarea>
+            <div class="mcp-server-actions">
+              <button type="button" id="btn-mcp-import-apply" class="btn-small">应用导入</button>
+              <button type="button" id="btn-mcp-import-cancel" class="btn-small">取消</button>
+            </div>
+          </div>
+          <small class="field-hint">stdio 填命令；sse/http 填 URL。保存时过滤无效项。远程 URL 请仅连接信任源。</small>
+        </div>
         <label class="switch-row"><input type="checkbox" id="set-hooks-enabled" checked /> <span>启用 Hooks（项目 .codex/hooks.json + 用户 hooks.json）</span></label>
         <div class="hooks-summary" id="hooks-summary">Hooks 摘要：未加载</div>
         <button type="button" id="btn-hooks-refresh" class="btn-small">刷新 Hooks</button>

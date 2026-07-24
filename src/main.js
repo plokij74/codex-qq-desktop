@@ -27,6 +27,7 @@ const {
 } = require('./ai/agent-mode');
 const { discoverSkills, loadSkillBody } = require('./ai/skills-loader');
 const { loadHooks } = require('./ai/hooks-loader');
+const { sanitizeMcpServers } = require('./ai/mcp-config');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
@@ -113,26 +114,6 @@ function toPublicSettings(s) {
       return Math.max(1, Math.min(3, Math.floor(n)));
     })(),
   };
-}
-
-function sanitizeMcpServers(raw) {
-  if (!Array.isArray(raw)) return [];
-  const seen = new Set();
-  const out = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
-    const name = String(item.name || '').trim();
-    const command = String(item.command || '').trim();
-    if (!/^[a-zA-Z0-9_-]+$/.test(name) || !command) continue;
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const entry = { name, command };
-    if (Array.isArray(item.args)) entry.args = item.args.map(String);
-    if (item.env && typeof item.env === 'object') entry.env = item.env;
-    if (item.cwd) entry.cwd = String(item.cwd);
-    out.push(entry);
-  }
-  return out;
 }
 
 function isAbortError(err, signal) {
@@ -256,6 +237,28 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     nextPartial.mcpServers = sanitizeMcpServers(nextPartial.mcpServers);
   }
   return toPublicSettings(saveSettings(userDataPath(), nextPartial));
+});
+
+ipcMain.handle('mcp:testServer', async (_e, rawCfg) => {
+  const list = sanitizeMcpServers([rawCfg]);
+  if (!list.length) return { ok: false, error: '无效配置' };
+  const cfg = list[0];
+  const { createMcpClient } = require('./ai/mcp-client');
+  const client = createMcpClient({ ...cfg, timeoutMs: Math.min(cfg.timeoutMs || 15000, 15000) });
+  try {
+    await client.start();
+    const tools = await client.listTools();
+    let resourcesCount = 0;
+    try {
+      const res = await client.listResources();
+      resourcesCount = Array.isArray(res) ? res.length : 0;
+    } catch { /* ignore */ }
+    await client.close();
+    return { ok: true, toolsCount: tools.length, resourcesCount, transport: cfg.transport };
+  } catch (err) {
+    try { await client.close(); } catch { /* */ }
+    return { ok: false, error: err.message || String(err), transport: cfg.transport };
+  }
 });
 
 ipcMain.handle('skills:list', async (_e, payload = {}) => {

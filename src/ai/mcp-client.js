@@ -53,7 +53,7 @@ function createFrameReader() {
 }
 
 /**
- * Minimal MCP stdio JSON-RPC client (tools/list + tools/call).
+ * Minimal MCP stdio JSON-RPC client (tools + resources).
  *
  * @param {{
  *   command: string,
@@ -62,15 +62,18 @@ function createFrameReader() {
  *   cwd?: string,
  *   spawnFn?: typeof spawn,
  *   timeoutMs?: number,
+ *   transport?: string,
  * }} opts
  * @returns {{
  *   start(): Promise<void>,
  *   listTools(): Promise<object[]>,
  *   callTool(name: string, args?: object): Promise<any>,
+ *   listResources(): Promise<object[]>,
+ *   readResource(uri: string): Promise<any>,
  *   close(): void,
  * }}
  */
-function createMcpClient(opts = {}) {
+function createMcpStdioClient(opts = {}) {
   const command = opts.command;
   const args = Array.isArray(opts.args) ? opts.args : [];
   const cwd = opts.cwd;
@@ -169,6 +172,7 @@ function createMcpClient(opts = {}) {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      shell: false,
     };
     if (cwd) spawnOpts.cwd = cwd;
 
@@ -221,6 +225,20 @@ function createMcpClient(opts = {}) {
     });
   }
 
+  async function listResources() {
+    try {
+      const result = await request('resources/list', {});
+      if (Array.isArray(result?.resources)) return result.resources;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function readResource(uri) {
+    return request('resources/read', { uri: String(uri || '') });
+  }
+
   function close() {
     closed = true;
     rejectAll(new Error('MCP client closed'));
@@ -238,14 +256,44 @@ function createMcpClient(opts = {}) {
     start,
     listTools,
     callTool,
+    listResources,
+    readResource,
     close,
   };
+}
+
+/**
+ * MCP client factory. Dispatches by transport: stdio (default), http, sse.
+ *
+ * @param {{
+ *   command?: string,
+ *   args?: string[],
+ *   env?: Record<string, string>,
+ *   cwd?: string,
+ *   spawnFn?: typeof spawn,
+ *   timeoutMs?: number,
+ *   transport?: string,
+ *   url?: string,
+ *   headers?: Record<string, string>,
+ *   requestFn?: Function,
+ * }} opts
+ */
+function createMcpClient(opts = {}) {
+  const transport = String(opts.transport || 'stdio').toLowerCase();
+  if (transport === 'http') {
+    return require('./mcp-http').createMcpHttpClient(opts);
+  }
+  if (transport === 'sse') {
+    return require('./mcp-sse').createMcpSseClient(opts);
+  }
+  return createMcpStdioClient(opts);
 }
 
 module.exports = {
   encodeFrame,
   createFrameReader,
   createMcpClient,
+  createMcpStdioClient,
   PROTOCOL_VERSION,
   REQUEST_TIMEOUT_MS,
 };

@@ -7,7 +7,7 @@ const READ_TOOLS = new Set([
   'list_skills', 'use_skill', 'spawn_explore', 'spawn_explores',
 ]);
 const WRITE_TOOLS = new Set([
-  'write_file', 'search_replace', 'git_commit', 'spawn_implement',
+  'write_file', 'search_replace', 'git_commit', 'spawn_implement', 'run_skill',
 ]);
 
 /**
