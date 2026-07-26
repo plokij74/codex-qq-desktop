@@ -187,7 +187,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory settings defaults and clamp"
   - `readEntries(file, scope) -> { entries: Entry[], skipped: number }`
   - `readAll({ projectPath, userDataPath }) -> { entries: Entry[], skipped: number, counts: { project: number, user: number } }`
   - `appendEntry({ scope, projectPath, userDataPath, text, tags, source, maxEntries, now }) -> { ok: true, id, scope, deduped?, pruned? } | { ok: false, error }`
-  - `deleteEntry({ id, scope, projectPath, userDataPath }) -> { ok: true, removed: boolean, scope? }`
+  - `deleteEntry({ id, scope, projectPath, userDataPath }) -> { ok: true, removed: boolean, scope? } | { ok: false, error }`（路径绑定缺失或 I/O 失败时走 `ok:false`；消费方先判 `ok` 再读 `removed`）
   - `normalizeText(s) -> string`、常量 `TEXT_MAX = 1000`
   - `Entry = { id: string, text: string, tags: string[], createdAt: number, source: 'tool'|'slash', scope: 'project'|'user' }`
 
