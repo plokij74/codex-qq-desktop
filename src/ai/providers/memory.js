@@ -162,7 +162,8 @@ function createMemoryProvider() {
           maxApproxTokens: clampInt(ctx?.settings?.memoryInjectMaxTokens, 200, 8000, 1200),
           now: Date.now(),
         });
-        return formatInjection(picked);
+        // plan mode withholds remember (see getTools) — don't advertise it.
+        return formatInjection(picked, { writeHint: normalizeMode(ctx?.agentMode) !== 'plan' });
       } catch {
         // A broken store must never break the run.
         return '';

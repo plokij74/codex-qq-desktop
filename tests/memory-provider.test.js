@@ -107,6 +107,22 @@ describe('memory provider', () => {
     assert.match(frag, /构建只用 npm test/);
   });
 
+  it('getSystemFragment does not advertise remember in plan mode', () => {
+    const p = createMemoryProvider();
+    const ctx = ctxFor({ userPromptText: 'npm test 怎么跑' });
+    appendEntry({ scope: 'project', projectPath: ctx._paths.projectPath, text: '构建只用 npm test', maxEntries: 200, now: Date.now() });
+
+    // plan 模式的 getTools 只给 recall，system 片段就不能叫模型用 remember
+    const planFrag = p.getSystemFragment({ ...ctx, agentMode: 'plan' });
+    assert.match(planFrag, /【长期记忆】/);
+    assert.equal(planFrag.includes('remember'), false);
+    assert.match(planFrag, /更多条目用 recall 检索。$/);
+
+    // 同一份 store，agent 模式照旧保留写入提示
+    const agentFrag = p.getSystemFragment(ctx);
+    assert.equal(agentFrag.includes('remember'), true);
+  });
+
   it('getSystemFragment returns empty when there is nothing or topN is 0', () => {
     const p = createMemoryProvider();
     assert.equal(p.getSystemFragment(ctxFor()), '');

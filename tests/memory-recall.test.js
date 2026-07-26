@@ -137,4 +137,22 @@ describe('memory-recall', () => {
     for (const line of lines.slice(1, -1)) assert.equal(line.startsWith('- ('), true);
     assert.equal(lines.at(-1), '更多条目用 recall 检索；需要记住新事实用 remember。');
   });
+
+  it('writeHint:false drops the remember hint entirely', () => {
+    const entries = [entry({ text: '构建只用 npm test' }), entry({ text: '回答一律用中文', scope: 'user' })];
+    const text = formatInjection(entries, { writeHint: false });
+    const lines = text.split('\n');
+    assert.equal(lines.at(-1), '更多条目用 recall 检索。');
+    // plan 模式不提供 remember 工具，整块里就不能出现这个名字
+    assert.equal(text.includes('remember'), false);
+    // 表头与正文与默认调用完全一致，只换尾行
+    assert.deepEqual(lines.slice(0, -1), formatInjection(entries).split('\n').slice(0, -1));
+    assert.equal(formatInjection([], { writeHint: false }), '');
+  });
+
+  it('formatInjection without opts keeps the remember hint (backward compatible)', () => {
+    const text = formatInjection([entry({ text: '构建只用 npm test' })]);
+    assert.equal(text.endsWith('\n更多条目用 recall 检索；需要记住新事实用 remember。'), true);
+    assert.equal(text, formatInjection([entry({ text: '构建只用 npm test' })], { writeHint: true }));
+  });
 });
