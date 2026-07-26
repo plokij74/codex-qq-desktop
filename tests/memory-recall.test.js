@@ -62,9 +62,13 @@ describe('memory-recall', () => {
   });
 
   it('falls back to most recent when nothing matches', () => {
+    // 两条的 scope 故意不同，让「按 createdAt 兜底」和「按总分排序」给出相反答案：
+    // old 是 1.3333 衰减 + 0.5 项目加权 = 1.8333，new 是 1.5 + 0 = 1.5。
+    // 只有真的在 matchScore 上过滤、无命中时退回最近，才会选出 new；
+    // 若把过滤条件塌缩成总分，就会错选 old，本用例即刻失败。
     const entries = [
-      entry({ id: 'old', text: 'alpha', createdAt: NOW - 10 * DAY }),
-      entry({ id: 'new', text: 'beta', createdAt: NOW }),
+      entry({ id: 'old', text: 'alpha', createdAt: NOW - 10 * DAY, scope: 'project' }),
+      entry({ id: 'new', text: 'beta', createdAt: NOW, scope: 'user' }),
     ];
     const picked = selectForInjection(entries, {
       queryText: '完全不相干的问题', topN: 1, maxApproxTokens: 9999, now: NOW,
