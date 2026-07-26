@@ -2346,7 +2346,6 @@ async function renderMemoryList() {
   const entries = (res.entries || []).slice().sort((a, b) => b.createdAt - a.createdAt);
   if (!entries.length) {
     root.textContent = '暂无记忆。对话里用 /remember <事实> 添加。';
-    return;
   }
   for (const e of entries) {
     const row = document.createElement('div');
@@ -2363,10 +2362,14 @@ async function renderMemoryList() {
     del.className = 'btn-small';
     del.textContent = '删除';
     del.addEventListener('click', async () => {
-      const r = await window.codex.deleteMemory({ projectPath, id: e.id, scope: e.scope });
-      if (!r || r.ok === false) { toast('删除失败：' + (r?.error || '未知错误')); return; }
-      toast('已删除');
-      renderMemoryList();
+      try {
+        const r = await window.codex.deleteMemory({ projectPath, id: e.id, scope: e.scope });
+        if (!r || r.ok === false) { toast('删除失败：' + (r?.error || '未知错误')); return; }
+        toast('已删除');
+        renderMemoryList();
+      } catch (err) {
+        toast('删除失败：' + (err.message || String(err)));
+      }
     });
     row.append(badge, text, del);
     root.appendChild(row);
