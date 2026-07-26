@@ -140,3 +140,44 @@ describe('memory provider', () => {
     assert.equal(p.getSystemFragment(ctx), '');
   });
 });
+
+describe('memory provider registration', () => {
+  const { createDefaultRegistry } = require('../src/ai/providers');
+
+  function regCtx(over = {}) {
+    const c = ctxFor(over);
+    c.extensions.toolRoute = undefined;
+    return c;
+  }
+
+  function stubbedRegistry() {
+    return createDefaultRegistry({
+      getToolDefs: () => [],
+      executeTool: async () => JSON.stringify({ ok: true }),
+      runLoop: async () => ({ ok: true }),
+    });
+  }
+
+  it('default registry exposes memory tools at depth 0', async () => {
+    const reg = stubbedRegistry();
+    const names = (await reg.collectTools(regCtx())).map((t) => t.function.name);
+    assert.ok(names.includes('remember'));
+    assert.ok(names.includes('recall'));
+    assert.ok(names.includes('forget'));
+  });
+
+  it('default registry hides memory tools inside sub-agents', async () => {
+    const reg = stubbedRegistry();
+    const names = (await reg.collectTools(regCtx({ subagentDepth: 1 }))).map((t) => t.function.name);
+    assert.equal(names.includes('remember'), false);
+    assert.equal(names.includes('recall'), false);
+    assert.equal(names.includes('forget'), false);
+  });
+
+  it('default registry exposes only recall in plan mode', async () => {
+    const reg = stubbedRegistry();
+    const names = (await reg.collectTools(regCtx({ agentMode: 'plan' }))).map((t) => t.function.name);
+    assert.ok(names.includes('recall'));
+    assert.equal(names.includes('remember'), false);
+  });
+});
