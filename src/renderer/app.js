@@ -1859,9 +1859,11 @@ function handleSlashCommand(text) {
   if (lower === '/help') {
     activeSession().messages.push({
       role: 'assistant',
-      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name> /compact /export md|json\n'
+      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name> /compact /export md|json /remember /memory /forget\n'
         + '/compact：把更早的消息压缩成一条摘要，保留最近若干条原文（生成中不可用）\n'
         + '/export md｜/export json：导出当前会话，路径在保存对话框里选\n'
+        + '/remember <事实>：记入长期记忆（绑定项目时进项目级，否则用户级）\n'
+        + '/memory：列出长期记忆；/forget <id>：删除一条\n'
         + '任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）',
     });
     saveState(); renderMessages(); return true;
@@ -1898,6 +1900,45 @@ function handleSlashCommand(text) {
     } else {
       toast('用法：/export md 或 /export json');
     }
+    return true;
+  }
+  if (lower.startsWith('/remember ')) {
+    const text = cmd.slice('/remember '.length).trim();
+    if (!text) { toast('用法：/remember <要记住的事实>'); return true; }
+    const proj = sessionProject(activeSession());
+    window.codex.addMemory({ projectPath: proj?.path || null, text }).then((r) => {
+      if (!r || r.ok === false) { toast('记忆失败：' + (r?.error || '未知错误')); return; }
+      toast(r.deduped ? '已存在相同记忆' : ('已记住（' + (r.scope === 'user' ? '用户级' : '项目级') + '）'));
+    }).catch((e) => toast(e.message || String(e)));
+    return true;
+  }
+  if (lower === '/memory') {
+    const proj = sessionProject(activeSession());
+    window.codex.listMemory({ projectPath: proj?.path || null }).then((r) => {
+      if (!r || r.ok === false) { toast(r?.error || '读取记忆失败'); return; }
+      const lines = (r.entries || []).map((e) => {
+        const scope = e.scope === 'user' ? '用户' : '项目';
+        const text = e.text.length > 60 ? (e.text.slice(0, 60) + '…') : e.text;
+        return `- \`${e.id}\` (${scope}) ${text}`;
+      });
+      const head = `长期记忆：项目级 ${r.counts?.project ?? 0} 条，用户级 ${r.counts?.user ?? 0} 条`
+        + (r.skipped ? `（跳过 ${r.skipped} 行损坏数据）` : '');
+      activeSession().messages.push({
+        role: 'assistant',
+        content: lines.length ? (head + '\n' + lines.join('\n') + '\n\n删除用 /forget <id>') : (head + '\n暂无记忆。用 /remember <事实> 添加。'),
+      });
+      saveState(); renderMessages();
+    }).catch((e) => toast(e.message || String(e)));
+    return true;
+  }
+  if (lower.startsWith('/forget ')) {
+    const id = cmd.slice('/forget '.length).trim();
+    if (!id) { toast('用法：/forget <id>，id 用 /memory 查看'); return true; }
+    const proj = sessionProject(activeSession());
+    window.codex.deleteMemory({ projectPath: proj?.path || null, id }).then((r) => {
+      if (!r || r.ok === false) { toast('删除失败：' + (r?.error || '未知错误')); return; }
+      toast(r.removed ? '已删除该条记忆' : '未找到该 id');
+    }).catch((e) => toast(e.message || String(e)));
     return true;
   }
   if (lower.startsWith('/skill ')) {
@@ -2266,15 +2307,78 @@ async function openSettings() {
   if (cmm) cmm.value = String(settings.compactMaxMessages ?? 40);
   const cmt = document.getElementById('set-compact-max-tokens');
   if (cmt) cmt.value = String(settings.compactMaxApproxTokens ?? 24000);
+  const me = document.getElementById('set-memory-enabled');
+  if (me) me.checked = settings.memoryEnabled !== false;
+  const mme = document.getElementById('set-memory-max-entries');
+  if (mme) mme.value = String(settings.memoryMaxEntries ?? 200);
+  const mtn = document.getElementById('set-memory-inject-topn');
+  if (mtn) mtn.value = String(settings.memoryInjectTopN ?? 8);
+  const mmt = document.getElementById('set-memory-inject-max-tokens');
+  if (mmt) mmt.value = String(settings.memoryInjectMaxTokens ?? 1200);
   const he = document.getElementById('set-hooks-enabled');
   if (he) he.checked = settings.hooksEnabled !== false;
   document.getElementById('settings-modal').classList.remove('hidden');
   await refreshHooksSummary();
+  await renderMemoryList();
 }
 function closeSettings() {
   document.getElementById('settings-modal').classList.add('hidden');
   hideMcpImportPanel();
 }
+/* ---- Phase D.2: memory list in settings ------------------------------- */
+
+async function renderMemoryList() {
+  const root = document.getElementById('memory-list');
+  if (!root || !window.codex?.listMemory) return;
+  root.innerHTML = '';
+  const projectPath = sessionProject()?.path || null;
+  let res;
+  try {
+    res = await window.codex.listMemory({ projectPath });
+  } catch (e) {
+    root.textContent = '读取失败：' + (e.message || String(e));
+    return;
+  }
+  if (!res || res.ok === false) {
+    root.textContent = res?.error || '读取失败';
+    return;
+  }
+  const entries = (res.entries || []).slice().sort((a, b) => b.createdAt - a.createdAt);
+  if (!entries.length) {
+    root.textContent = '暂无记忆。对话里用 /remember <事实> 添加。';
+    return;
+  }
+  for (const e of entries) {
+    const row = document.createElement('div');
+    row.className = 'memory-item';
+    const badge = document.createElement('span');
+    badge.className = 'memory-scope-badge' + (e.scope === 'user' ? ' is-user' : '');
+    badge.textContent = e.scope === 'user' ? '用户' : '项目';
+    const text = document.createElement('span');
+    text.className = 'memory-text';
+    text.textContent = e.text.length > 80 ? (e.text.slice(0, 80) + '…') : e.text;
+    text.title = e.text;
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn-small';
+    del.textContent = '删除';
+    del.addEventListener('click', async () => {
+      const r = await window.codex.deleteMemory({ projectPath, id: e.id, scope: e.scope });
+      if (!r || r.ok === false) { toast('删除失败：' + (r?.error || '未知错误')); return; }
+      toast('已删除');
+      renderMemoryList();
+    });
+    row.append(badge, text, del);
+    root.appendChild(row);
+  }
+  if (res.skipped) {
+    const warn = document.createElement('div');
+    warn.className = 'field-hint';
+    warn.textContent = `跳过 ${res.skipped} 行损坏数据。`;
+    root.appendChild(warn);
+  }
+}
+
 async function refreshHooksSummary() {
   const el = document.getElementById('hooks-summary');
   if (!el || !window.codex?.hooksSummary) return;
@@ -2311,6 +2415,10 @@ async function saveSettingsFromForm() {
     mcpEnabled: Boolean(document.getElementById('set-mcp-enabled')?.checked),
     mcpServers,
     hooksEnabled: document.getElementById('set-hooks-enabled')?.checked !== false,
+    memoryEnabled: document.getElementById('set-memory-enabled')?.checked !== false,
+    memoryMaxEntries: Number(document.getElementById('set-memory-max-entries')?.value || 200),
+    memoryInjectTopN: Number(document.getElementById('set-memory-inject-topn')?.value ?? 8),
+    memoryInjectMaxTokens: Number(document.getElementById('set-memory-inject-max-tokens')?.value || 1200),
     autoCompact: Boolean(document.getElementById('set-auto-compact')?.checked),
     compactKeepMessages: Number(document.getElementById('set-compact-keep-messages')?.value || 24),
     compactMaxMessages: Number(document.getElementById('set-compact-max-messages')?.value || 40),

@@ -1371,3 +1371,35 @@ html, body {
   font-size: 11px;
   color: #6a87a3;
 }
+
+/* Phase D.2 memory list */
+.memory-list {
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid #b5cfe0;
+  background: #fff;
+  padding: 4px;
+}
+.memory-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 2px;
+  border-bottom: 1px dotted #dbe8f2;
+}
+.memory-item:last-child { border-bottom: none; }
+.memory-scope-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 0 4px;
+  border: 1px solid #7aa7c7;
+  background: #eaf4fb;
+  color: #24618c;
+}
+.memory-scope-badge.is-user { border-color: #c7a77a; background: #fbf4ea; color: #8c6124; }
+.memory-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

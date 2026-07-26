@@ -256,6 +256,25 @@
           <input id="set-compact-max-tokens" type="number" min="4000" max="200000" step="1000" value="24000" />
           <small class="field-hint">约 token 按字符数/4 估算，不依赖 tokenizer。</small>
         </label>
+        <label class="switch-row"><input type="checkbox" id="set-memory-enabled" checked /> <span>启用长期记忆（项目 .codex/memory.jsonl + 用户 memory.jsonl）</span></label>
+        <label class="field">
+          <span>记忆条数上限</span>
+          <input id="set-memory-max-entries" type="number" min="20" max="2000" step="10" value="200" />
+        </label>
+        <label class="field">
+          <span>每轮注入条数</span>
+          <input id="set-memory-inject-topn" type="number" min="0" max="30" value="8" />
+          <small class="field-hint">0 = 不自动注入，只保留 recall 工具。</small>
+        </label>
+        <label class="field">
+          <span>注入约 token 上限</span>
+          <input id="set-memory-inject-max-tokens" type="number" min="200" max="8000" step="100" value="1200" />
+        </label>
+        <div class="field memory-field">
+          <span>已记住的条目</span>
+          <div id="memory-list" class="memory-list"></div>
+          <small class="field-hint">条目会进入模型的 system 提示。不要把密钥、口令写进记忆。项目级条目随仓库共享。</small>
+        </div>
         <label class="switch-row"><input type="checkbox" id="set-hooks-enabled" checked /> <span>启用 Hooks（项目 .codex/hooks.json + 用户 hooks.json）</span></label>
         <div class="hooks-summary" id="hooks-summary">Hooks 摘要：未加载</div>
         <button type="button" id="btn-hooks-refresh" class="btn-small">刷新 Hooks</button>
