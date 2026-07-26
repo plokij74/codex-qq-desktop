@@ -384,4 +384,27 @@ describe('permission', () => {
     clearSessionAllows('shared-sess');
     assert.equal(getSessionAllows('shared-sess').size, 0);
   });
+
+  it('riskForTool maps Phase D.2 memory tools', () => {
+    assert.equal(riskForTool('recall'), 'read');
+    assert.equal(riskForTool('remember'), 'write');
+    assert.equal(riskForTool('forget'), 'write');
+  });
+
+  it('read-only mode allows recall but refuses remember and forget', async () => {
+    const gate = createPermissionGate({ permissionMode: 'read-only' });
+    assert.equal((await gate.authorize({ tool: 'recall' })).allowed, true);
+    const w = await gate.authorize({ tool: 'remember' });
+    assert.equal(w.allowed, false);
+    assert.match(w.reason, /只读模式/);
+    assert.equal((await gate.authorize({ tool: 'forget' })).allowed, false);
+  });
+
+  it('plan mode blocks remember and forget at the second gate', async () => {
+    const gate = createPermissionGate({ permissionMode: 'full-auto', agentMode: 'plan' });
+    assert.equal((await gate.authorize({ tool: 'recall' })).allowed, true);
+    const r = await gate.authorize({ tool: 'remember' });
+    assert.equal(r.allowed, false);
+    assert.match(r.reason, /计划模式/);
+  });
 });

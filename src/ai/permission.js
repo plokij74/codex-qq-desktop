@@ -5,9 +5,11 @@ const READ_TOOLS = new Set([
   'git_status', 'git_diff',
   'submit_plan',
   'list_skills', 'use_skill', 'spawn_explore', 'spawn_explores',
+  'recall',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit', 'spawn_implement', 'run_skill',
+  'remember', 'forget',
 ]);
 
 /**
