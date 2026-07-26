@@ -81,11 +81,19 @@ function scoreEntry(entry, tokens, queryLower, now) {
 
 /**
  * One injected line: scope label + text only, never id/source/tags/createdAt.
+ *
+ * Whitespace runs (newlines included) are folded to a single space so one
+ * entry can never render as more than one line: stored text is only trimmed
+ * on write, and the JSONL can be hand-edited or arrive via git clone, so an
+ * embedded newline would otherwise emit unprefixed lines that can forge the
+ * 【长期记忆】header or its closing instruction. Same fold as normalizeText in
+ * memory-store, minus the lowercasing — injected text keeps its own casing.
  * @param {any} entry
  * @returns {string}
  */
 function formatEntryLine(entry) {
-  return `- (${entry?.scope === 'user' ? '用户' : '项目'}) ${String(entry?.text || '')}`;
+  const text = String(entry?.text || '').replace(/\s+/g, ' ').trim();
+  return `- (${entry?.scope === 'user' ? '用户' : '项目'}) ${text}`;
 }
 
 /**
