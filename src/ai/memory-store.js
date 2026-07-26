@@ -115,7 +115,9 @@ function readAll({ projectPath, userDataPath } = {}) {
 }
 
 /**
- * tmp + rename so a crash mid-write cannot leave a half file.
+ * tmp + rename so a crash mid-write cannot leave a half file. The tmp name is
+ * per-process so two windows pruning at the same moment cannot share it — with
+ * a fixed name one window could rename a file the other is still writing.
  * @param {string} file
  * @param {any[]} entries
  */
@@ -126,9 +128,19 @@ function writeAllAtomic(file, entries) {
     }))
     .join('\n');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, body ? body + '\n' : '', 'utf8');
-  fs.renameSync(tmp, file);
+  const tmp = file + '.tmp-' + process.pid + '-' + Date.now().toString(36);
+  try {
+    fs.writeFileSync(tmp, body ? body + '\n' : '', 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    // A failed write must not litter .codex/ with an orphan tmp file.
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* tmp 未创建成功，忽略 */
+    }
+    throw err;
+  }
 }
 
 /**
@@ -145,7 +157,13 @@ function appendEntry({
   if (!clean) return { ok: false, error: '记忆内容为空' };
 
   const effectiveScope = scope === 'user' ? 'user' : 'project';
-  const file = memoryFilePath({ scope: effectiveScope, projectPath, userDataPath });
+  // memoryFilePath throws by contract; here the contract is an ok:false result.
+  let file;
+  try {
+    file = memoryFilePath({ scope: effectiveScope, projectPath, userDataPath });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
   const { entries } = readEntries(file, effectiveScope);
 
   const key = normalizeText(clean);
@@ -160,17 +178,21 @@ function appendEntry({
     source: source === 'slash' ? 'slash' : 'tool',
   };
 
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
-
   let pruned = 0;
-  const limit = Number(maxEntries);
-  if (Number.isFinite(limit) && limit > 0 && entries.length + 1 > limit) {
-    const all = [...entries, { ...entry, scope: effectiveScope }]
-      .sort((a, b) => a.createdAt - b.createdAt);
-    const keep = all.slice(all.length - limit);
-    pruned = all.length - keep.length;
-    writeAllAtomic(file, keep);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
+
+    const limit = Number(maxEntries);
+    if (Number.isFinite(limit) && limit > 0 && entries.length + 1 > limit) {
+      const all = [...entries, { ...entry, scope: effectiveScope }]
+        .sort((a, b) => a.createdAt - b.createdAt);
+      const keep = all.slice(all.length - limit);
+      pruned = all.length - keep.length;
+      writeAllAtomic(file, keep);
+    }
+  } catch (err) {
+    return { ok: false, error: '写入记忆失败：' + err.message };
   }
 
   return { ok: true, id: entry.id, scope: effectiveScope, pruned };
@@ -179,7 +201,7 @@ function appendEntry({
 /**
  * No scope given → project first, then user; stop at the first hit.
  * @param {{ id: string, scope?: string, projectPath?: string, userDataPath?: string }} opts
- * @returns {{ ok: true, removed: boolean, scope?: string }}
+ * @returns {{ ok: true, removed: boolean, scope?: string } | { ok: false, error: string }}
  */
 function deleteEntry({ id, scope, projectPath, userDataPath } = {}) {
   const wanted = String(id || '');
@@ -188,11 +210,21 @@ function deleteEntry({ id, scope, projectPath, userDataPath } = {}) {
   for (const sc of scopes) {
     if (sc === 'project' && !projectPath) continue;
     if (sc === 'user' && !userDataPath) continue;
-    const file = memoryFilePath({ scope: sc, projectPath, userDataPath });
+    let file;
+    try {
+      file = memoryFilePath({ scope: sc, projectPath, userDataPath });
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
     const { entries } = readEntries(file, sc);
     const next = entries.filter((e) => e.id !== wanted);
     if (next.length !== entries.length) {
-      writeAllAtomic(file, next);
+      // The rewrite is the only I/O that can fail here — report it, do not throw.
+      try {
+        writeAllAtomic(file, next);
+      } catch (err) {
+        return { ok: false, error: '删除记忆失败：' + err.message };
+      }
       return { ok: true, removed: true, scope: sc };
     }
   }

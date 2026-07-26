@@ -10,6 +10,7 @@ const {
   readAll,
   appendEntry,
   deleteEntry,
+  writeAllAtomic,
   normalizeText,
   TEXT_MAX,
 } = require('../src/ai/memory-store');
@@ -138,6 +139,87 @@ describe('memory-store', () => {
     const r = deleteEntry({ id: u.id, projectPath, userDataPath });
     assert.equal(r.removed, true);
     assert.equal(r.scope, 'user');
+  });
+
+  it('appendEntry returns ok:false in zh-CN instead of throwing on a missing path binding', () => {
+    let p;
+    assert.doesNotThrow(() => {
+      p = appendEntry({ scope: 'project', projectPath: '', text: '没有打开项目', maxEntries: 200, now: 1 });
+    });
+    assert.equal(p.ok, false);
+    assert.match(p.error, /缺少 projectPath/);
+
+    let u;
+    assert.doesNotThrow(() => {
+      u = appendEntry({ scope: 'user', userDataPath: null, text: '没有 userData', maxEntries: 200, now: 1 });
+    });
+    assert.equal(u.ok, false);
+    assert.match(u.error, /缺少 userDataPath/);
+  });
+
+  it('appendEntry returns ok:false instead of throwing when the write fails', () => {
+    const { userDataPath } = tmpDirs();
+    // A directory where the JSONL should be makes appendFileSync fail (EISDIR).
+    fs.mkdirSync(memoryFilePath({ scope: 'user', userDataPath }), { recursive: true });
+    let r;
+    assert.doesNotThrow(() => {
+      r = appendEntry({ scope: 'user', userDataPath, text: '写不进去', maxEntries: 200, now: 1 });
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /写入记忆失败/);
+  });
+
+  it('deleteEntry returns ok:false instead of throwing when the rewrite fails', () => {
+    const { projectPath, userDataPath } = tmpDirs();
+    appendEntry({ scope: 'project', projectPath, text: 'keep', maxEntries: 200, now: 1 });
+    const b = appendEntry({ scope: 'project', projectPath, text: 'drop', maxEntries: 200, now: 2 });
+    const realWrite = fs.writeFileSync;
+    fs.writeFileSync = () => { throw new Error('EACCES: permission denied'); };
+    let r;
+    try {
+      assert.doesNotThrow(() => {
+        r = deleteEntry({ id: b.id, projectPath, userDataPath });
+      });
+    } finally {
+      fs.writeFileSync = realWrite;
+    }
+    assert.equal(r.ok, false);
+    assert.match(r.error, /删除记忆失败/);
+    const dir = path.dirname(memoryFilePath({ scope: 'project', projectPath }));
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => /\.tmp/.test(f)), []);
+  });
+
+  it('a successful delete leaves no tmp file behind', () => {
+    const { projectPath, userDataPath } = tmpDirs();
+    appendEntry({ scope: 'project', projectPath, text: 'keep', maxEntries: 200, now: 1 });
+    const b = appendEntry({ scope: 'project', projectPath, text: 'drop', maxEntries: 200, now: 2 });
+    assert.equal(deleteEntry({ id: b.id, projectPath, userDataPath }).removed, true);
+    const dir = path.dirname(memoryFilePath({ scope: 'project', projectPath }));
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => /\.tmp/.test(f)), []);
+  });
+
+  it('writeAllAtomic uses a per-process tmp name and unlinks it when the rename fails', () => {
+    const { projectPath } = tmpDirs();
+    const file = memoryFilePath({ scope: 'project', projectPath });
+    const seen = [];
+    const realWrite = fs.writeFileSync;
+    const realRename = fs.renameSync;
+    fs.writeFileSync = (p, ...rest) => { seen.push(String(p)); return realWrite(p, ...rest); };
+    fs.renameSync = () => { throw new Error('EPERM: rename failed'); };
+    try {
+      assert.throws(
+        () => writeAllAtomic(file, [{ id: 'm_1', text: 'x', tags: [], createdAt: 1, source: 'tool' }]),
+        /EPERM/,
+      );
+    } finally {
+      fs.writeFileSync = realWrite;
+      fs.renameSync = realRename;
+    }
+    assert.equal(seen.length, 1);
+    assert.notEqual(seen[0], file + '.tmp');
+    assert.ok(seen[0].startsWith(file + '.tmp-'), seen[0]);
+    assert.ok(seen[0].includes(String(process.pid)), seen[0]);
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((f) => /\.tmp/.test(f)), []);
   });
 
   it('normalizeText folds whitespace and case', () => {
