@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { loadSettings, saveSettings, clampInt } = require('./ai/settings');
+const { loadSettings, saveSettings, clampInt, clampMemorySettings } = require('./ai/settings');
 const { generateLocalReply } = require('./ai/local-mock');
 const { chatCompletion } = require('./ai/openai-compatible');
 const { runAgentLoop, applyWriteFencesWithGate } = require('./ai/agent');
@@ -128,6 +128,10 @@ function toPublicSettings(s) {
     compactKeepMessages: clampInt(s.compactKeepMessages, 6, 80, 24),
     compactMaxMessages: clampInt(s.compactMaxMessages, 20, 200, 40),
     compactMaxApproxTokens: clampInt(s.compactMaxApproxTokens, 4000, 200000, 24000),
+    memoryEnabled: s.memoryEnabled !== false,
+    memoryMaxEntries: clampInt(s.memoryMaxEntries, 20, 2000, 200),
+    memoryInjectTopN: clampInt(s.memoryInjectTopN, 0, 30, 8),
+    memoryInjectMaxTokens: clampInt(s.memoryInjectMaxTokens, 200, 8000, 1200),
   };
 }
 
@@ -225,6 +229,7 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     'mcpEnabled',
     'hooksEnabled',
     'autoCompact',
+    'memoryEnabled',
   ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
@@ -232,6 +237,9 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     ['compactKeepMessages', 6, 80, 24],
     ['compactMaxMessages', 20, 200, 40],
     ['compactMaxApproxTokens', 4000, 200000, 24000],
+    ['memoryMaxEntries', 20, 2000, 200],
+    ['memoryInjectTopN', 0, 30, 8],
+    ['memoryInjectMaxTokens', 200, 8000, 1200],
   ]) {
     if (k in nextPartial) nextPartial[k] = clampInt(nextPartial[k], min, max, fallback);
   }

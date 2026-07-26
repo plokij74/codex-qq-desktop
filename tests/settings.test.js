@@ -177,4 +177,33 @@ describe('settings', () => {
     assert.equal(next.mcpServers[0].name, 'ok');
     assert.equal(loadSettings(dir).mcpServers.length, 1);
   });
+
+  it('defaults and clamps Phase D.2 memory settings', () => {
+    const { DEFAULT_SETTINGS, loadSettings, saveSettings } = require('../src/ai/settings');
+    assert.equal(DEFAULT_SETTINGS.memoryEnabled, true);
+    assert.equal(DEFAULT_SETTINGS.memoryMaxEntries, 200);
+    assert.equal(DEFAULT_SETTINGS.memoryInjectTopN, 8);
+    assert.equal(DEFAULT_SETTINGS.memoryInjectMaxTokens, 1200);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-mem-settings-'));
+    const s = loadSettings(dir);
+    assert.equal(s.memoryEnabled, true);
+    assert.equal(s.memoryInjectTopN, 8);
+
+    saveSettings(dir, {
+      memoryMaxEntries: 1,
+      memoryInjectTopN: 999,
+      memoryInjectMaxTokens: 10,
+    });
+    const s2 = loadSettings(dir);
+    assert.equal(s2.memoryMaxEntries, 20);
+    assert.equal(s2.memoryInjectTopN, 30);
+    assert.equal(s2.memoryInjectMaxTokens, 200);
+
+    // 0 是合法的「不注入」，不能被 clamp 成默认值
+    saveSettings(dir, { memoryInjectTopN: 0, memoryEnabled: false });
+    const s3 = loadSettings(dir);
+    assert.equal(s3.memoryInjectTopN, 0);
+    assert.equal(s3.memoryEnabled, false);
+  });
 });
