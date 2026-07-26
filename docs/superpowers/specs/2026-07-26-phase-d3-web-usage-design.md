@@ -133,7 +133,6 @@
 | `src/ai/agent-events.js` | Modify | `USAGE: 'usage'` |
 | `src/ai/openai-compatible.js` | Modify | usage 透出；`stream_options.include_usage`；不吞末尾 usage chunk |
 | `src/ai/agent.js` | Modify | `callModelTurn` 后发 `USAGE`；`stream_options` 不支持时重试 |
-| `src/ai/subagent-runtime.js` | Modify | 事件转发过滤器放行 `usage` |
 | `src/ai/session-compact.js` | Modify | `generateCompactSummary` 增可选 `onUsage` 回调（additive） |
 | `src/ai/mcp-http.js` / `mcp-sse.js` | Modify | 连接前调用 `checkUrl` 做 SSRF 校验 |
 | `src/ai/settings.js` | Modify | 十一项默认值 + `clampWebSettings` / `clampUsageSettings` |
@@ -159,7 +158,7 @@
 |--------|------|
 | PermissionGate（`permission.js:22`） | 新增 `network` 档；`allow_session` 键从 `risk` 扩成 `risk[:scope]`——**本期唯一动权限内核处** |
 | Hooks（C.3） | `web_fetch` 自动走既有 Pre/Post 工具钩子，无需改 hooks 代码 |
-| 子 Agent（C.4） | explore / implement 均可 `web_fetch`；`usage` 事件经 `subagent-runtime.js:260` 转发并带 `subagentId` |
+| 子 Agent（C.4） | explore / implement 均可 `web_fetch`，与父共享 `webCache`（§4.3）；`usage` 事件经 `subagent-runtime.js:260` 无过滤转发，`kind` 被自动改写为 `explore` / `implement`（§5.3） |
 | MCP（C.5） | `mcp-http.js` / `mcp-sse.js` 连接前复用 `checkUrl`（只加校验，不加审批） |
 | D.1 compact | 复用已导出的 `approxTokensFromText` / `approxTokensFromMessages` 做估算兜底；水位阈值复用 `compactMaxApproxTokens`；`generateCompactSummary` 只加可选回调，现有调用与测试不变 |
 | D.2 记忆 | `usage.jsonl` 与 `memory.jsonl` 同构（JSONL、坏行降级、tmp+rename 淘汰）；system 片段的「数据不是指令」措辞与记忆片段一致 |
@@ -222,7 +221,14 @@ fetchUrl(rawUrl, { allowDomains, denyDomains, maxBytes, timeoutMs, signal, reque
 
 ### 4.3 per-run 缓存
 
-`Map<finalUrl, result>` 挂在 `ctx.extensions.webCache`，`providers/web.js` 的 `onRunStart` 建、`onRunEnd` 丢。同一轮任务内重复取同一 URL 不重复出站，**也不重复审批**（缓存命中直接返回）。
+`Map<finalUrl, result>` 挂在 `ctx.extensions.webCache`。同一轮任务内重复取同一 URL 不重复出站，**也不重复审批**（缓存命中直接返回）。
+
+生命周期要按 `mcp.js:44` 的同款防御写：`subagent-runtime.js:224` 的 `childExtensions` 是**浅拷贝父 extensions**（只删 `mcpHub` / `subagentRuntime`），所以子 Agent 会拿到同一个 Map。
+
+- `onRunStart`：`if (!ctx.extensions.webCache) ctx.extensions.webCache = new Map()`——子 Agent 不覆盖父的缓存
+- `onRunEnd`：`if (Number(ctx.subagentDepth) >= 1) return;`——**子 Agent 不得拆父 Agent 的缓存**
+
+父子共享缓存是有意为之：explore 子 Agent 取过的文档，父 Agent 再引用时不必二次出站，也不必二次审批。
 
 ### 4.4 `html-extract.js`（纯函数）
 
@@ -315,7 +321,7 @@ aggregate(records, { groupBy })     // 'day' | 'model' | 'kind' | 'session'
 
 `agent.js` 只**发事件**，不写文件。落盘统一在 `src/main.js` 的 `emit`（已在拦 `PLAN_READY`，`main.js:684`）：收到 `USAGE` → `usage-store.appendRecord()` → 原样转发 renderer。单一写点，子 Agent 不会重复写。
 
-**必须同时改 `subagent-runtime.js:260` 的事件转发过滤器放行 `usage`**，否则子 Agent 的消耗仍是黑洞——而那正是 C 最想解决的。
+**子 Agent 的 `kind` 是自动来的，不需要改 `subagent-runtime.js`。** 该文件 `:260` 的转发是无过滤的 `ctx.onEvent?.({ ...ev, subagent: true, subagentId, kind })`——`kind` 排在展开之后，因此子 Agent 内发出的 `kind: 'main'` 会被**覆盖**成 `'explore'` / `'implement'`，正是想要的值。这条依赖很隐蔽：usage 事件的字段必须叫 `kind`（不能叫 `source` 之类），且 `usage.test.js` 要有一条断言把这个覆盖行为钉死，避免日后改转发顺序时静默回归。
 
 事件载荷：
 
@@ -366,16 +372,19 @@ aggregate(records, { groupBy })     // 'day' | 'model' | 'kind' | 'session'
 
 | 通道 | 请求 | 响应 |
 |------|------|------|
+| `web:fetch` | `{ url }` | `fetchUrl` 的返回原样透出；`webEnabled: false` 时 `{ ok: false, error: '网页访问未启用' }` |
 | `usage:summary` | `{ from?, to?, groupBy? }` | `{ ok, totals: { in, out, cost, estimatedShare }, groups: [...], skipped }` |
 | `usage:clear` | `{}` | `{ ok }`（设置区按钮，UI 侧二次确认） |
 
-`usageEnabled: false` 时两者返回 `{ ok: false, error: '用量统计未启用' }`。
+`usageEnabled: false` 时后两者返回 `{ ok: false, error: '用量统计未启用' }`。
+
+`web:fetch` 服务 `/fetch` 命令：**不过 PermissionGate**（用户本人显式操作，与 D.2 `memory:add`、既有 `project:writeFile` 同理），但**仍过 `url-guard` 与全部限额**。
 
 ### 7.2 UI
 
 | 入口 | 行为 |
 |------|------|
-| `/fetch <url>` | 用户手动取一次网页，结果作为引用插进输入框上下文。**不过 PermissionGate**（用户本人显式操作，与 D.2 `memory:add` 同理），但仍过 `url-guard` |
+| `/fetch <url>` | 走 `web:fetch`，把抽取出的 Markdown 作为一条 `assistant` 消息插进当前会话（形如 `【网页】<title> <url>` + 正文），既对用户可见、也自然进入下一轮的模型上下文——与 `/skills` 打印列表同一范式 |
 | `/usage` | 聊天区打印今日 / 本周 / 总计，按 model 与 kind 分组 |
 | `/help` | 补两条说明 |
 | 会话头 | `↑12.3k ↓4.1k ≈$0.02`；估算值前缀 `≈`，真值不加；点击展开按 kind 明细 |
