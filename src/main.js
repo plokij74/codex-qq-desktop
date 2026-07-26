@@ -39,6 +39,7 @@ const {
   exportSessionJson,
   defaultExportFilename,
 } = require('./ai/session-export');
+const { memoryList, memoryAdd, memoryDelete } = require('./ai/memory-ipc');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
@@ -387,6 +388,22 @@ ipcMain.handle('session:export', async (_e, payload = {}) => {
     return { ok: false, error: err?.message || String(err) };
   }
 });
+
+/**
+ * Phase D.2 memory channels — UI-driven, so no PermissionGate (the tiers gate
+ * the model, not the user). All the logic lives in the pure handlers.
+ */
+ipcMain.handle('memory:list', async (_e, payload = {}) => memoryList({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+
+ipcMain.handle('memory:add', async (_e, payload = {}) => memoryAdd({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+
+ipcMain.handle('memory:delete', async (_e, payload = {}) => memoryDelete({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
 
 ipcMain.handle('dialog:selectDirectory', async () => {
   const win = BrowserWindow.getFocusedWindow();

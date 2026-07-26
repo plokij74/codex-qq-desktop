@@ -32,4 +32,7 @@ contextBridge.exposeInMainWorld('codex', {
   testMcpServer: (cfg) => ipcRenderer.invoke('mcp:testServer', cfg),
   compactSession: (payload) => ipcRenderer.invoke('session:compact', payload || {}),
   exportSession: (payload) => ipcRenderer.invoke('session:export', payload || {}),
+  listMemory: (payload) => ipcRenderer.invoke('memory:list', payload || {}),
+  addMemory: (payload) => ipcRenderer.invoke('memory:add', payload || {}),
+  deleteMemory: (payload) => ipcRenderer.invoke('memory:delete', payload || {}),
 });
