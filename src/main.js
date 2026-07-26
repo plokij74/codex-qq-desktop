@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { loadSettings, saveSettings } = require('./ai/settings');
+const { loadSettings, saveSettings, clampInt } = require('./ai/settings');
 const { generateLocalReply } = require('./ai/local-mock');
 const { chatCompletion } = require('./ai/openai-compatible');
 const { runAgentLoop, applyWriteFencesWithGate } = require('./ai/agent');
@@ -28,6 +28,17 @@ const {
 const { discoverSkills, loadSkillBody } = require('./ai/skills-loader');
 const { loadHooks } = require('./ai/hooks-loader');
 const { sanitizeMcpServers } = require('./ai/mcp-config');
+const {
+  planCompact,
+  serializeOlderTranscript,
+  applyCompact,
+  generateCompactSummary,
+} = require('./ai/session-compact');
+const {
+  exportSessionMarkdown,
+  exportSessionJson,
+  defaultExportFilename,
+} = require('./ai/session-export');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
@@ -113,6 +124,10 @@ function toPublicSettings(s) {
       if (!Number.isFinite(n)) return 2;
       return Math.max(1, Math.min(3, Math.floor(n)));
     })(),
+    autoCompact: s.autoCompact === true,
+    compactKeepMessages: clampInt(s.compactKeepMessages, 6, 80, 24),
+    compactMaxMessages: clampInt(s.compactMaxMessages, 20, 200, 40),
+    compactMaxApproxTokens: clampInt(s.compactMaxApproxTokens, 4000, 200000, 24000),
   };
 }
 
@@ -209,8 +224,16 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     'subagentEnabled',
     'mcpEnabled',
     'hooksEnabled',
+    'autoCompact',
   ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
+  }
+  for (const [k, min, max, fallback] of [
+    ['compactKeepMessages', 6, 80, 24],
+    ['compactMaxMessages', 20, 200, 40],
+    ['compactMaxApproxTokens', 4000, 200000, 24000],
+  ]) {
+    if (k in nextPartial) nextPartial[k] = clampInt(nextPartial[k], min, max, fallback);
   }
   if ('maxAgentTurns' in nextPartial) {
     const n = Number(nextPartial.maxAgentTurns);
@@ -299,6 +322,62 @@ ipcMain.handle('hooks:summary', async (_e, payload = {}) => {
     countsByEvent: resolved.countsByEvent,
     errors: resolved.errors,
   };
+});
+
+/**
+ * Phase D.1 compact. The preload is sandboxed and cannot require local modules,
+ * so plan → summarize → apply all happen here in one round trip; the renderer
+ * just swaps in the returned messages array.
+ */
+ipcMain.handle('session:compact', async (_e, payload = {}) => {
+  try {
+    if (activeRun) return { ok: false, error: '有对话正在进行，请先停止再压缩' };
+    const settings = loadSettings(userDataPath());
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    const plan = planCompact(messages, {
+      keepMessages: settings.compactKeepMessages,
+      maxMessages: settings.compactMaxMessages,
+      maxApproxTokens: settings.compactMaxApproxTokens,
+      force: payload.force === true,
+    });
+    if (!plan.needed) {
+      return { ok: true, needed: false, approxTokens: plan.approxTokens };
+    }
+    const transcript = serializeOlderTranscript(plan.older);
+    const summary = await generateCompactSummary({ transcript, settings });
+    return {
+      ok: true,
+      needed: true,
+      messages: applyCompact(messages, plan, summary),
+      compactedCount: plan.older.length,
+      approxTokens: plan.approxTokens,
+      olderApproxTokens: plan.olderApproxTokens,
+    };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
+/** Phase D.1 export: serialize here, then write wherever the user picks. */
+ipcMain.handle('session:export', async (_e, payload = {}) => {
+  try {
+    const format = payload.format === 'json' ? 'json' : 'md';
+    const session = payload.session && typeof payload.session === 'object' ? payload.session : {};
+    const content = format === 'json' ? exportSessionJson(session) : exportSessionMarkdown(session);
+    const win = BrowserWindow.getFocusedWindow();
+    const result = await dialog.showSaveDialog(win || undefined, {
+      title: '导出会话',
+      defaultPath: defaultExportFilename(session, format),
+      filters: format === 'json'
+        ? [{ name: 'JSON', extensions: ['json'] }]
+        : [{ name: 'Markdown', extensions: ['md', 'markdown', 'txt'] }],
+    });
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(result.filePath, content, 'utf8');
+    return { ok: true, path: result.filePath, bytes: Buffer.byteLength(content, 'utf8') };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
 });
 
 ipcMain.handle('dialog:selectDirectory', async () => {

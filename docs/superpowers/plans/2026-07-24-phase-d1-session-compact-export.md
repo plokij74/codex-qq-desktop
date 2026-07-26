@@ -56,7 +56,7 @@
 **Interfaces:**
 - Produces: `DEFAULT_SETTINGS.autoCompact === false`；`compactKeepMessages === 24`；`compactMaxMessages === 40`；`compactMaxApproxTokens === 24000`；load/save clamp
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/settings.test.js` 追加：
 
@@ -82,12 +82,12 @@ it('defaults Phase D.1 compact settings', () => {
 });
 ```
 
-- [ ] **Step 2: Run → FAIL**
+- [x] **Step 2: Run → FAIL**
 
 Run: `node --test tests/settings.test.js`  
 Expected: FAIL — defaults undefined
 
-- [ ] **Step 3: 实现 settings.js**
+- [x] **Step 3: 实现 settings.js**
 
 ```js
 // DEFAULT_SETTINGS 增加
@@ -113,7 +113,7 @@ function clampCompactSettings(s) {
 // loadSettings / saveSettings 在 return 前 clampCompactSettings(merged|next)
 ```
 
-- [ ] **Step 4: main.js toPublicSettings + save**
+- [x] **Step 4: main.js toPublicSettings + save**
 
 ```js
 // toPublicSettings 增加：
@@ -127,7 +127,7 @@ compactMaxApproxTokens: …,
 
 优先从 `settings.js` 导出 `clampCompactSettings` 供 main 复用，避免三份拷贝；若 main 已有 exploreMaxParallel 内联风格，可同样内联但数值必须一致。
 
-- [ ] **Step 5: 测试通过 + commit**
+- [x] **Step 5: 测试通过 + commit**
 
 ```bash
 node --test tests/settings.test.js
@@ -154,7 +154,7 @@ git commit -m "feat(codex-qq): Phase D.1 compact settings defaults and clamp"
 
 `opts` for plan: `{ keepMessages, maxMessages, maxApproxTokens, force?: boolean }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```js
 'use strict';
@@ -253,11 +253,11 @@ describe('session-compact', () => {
 });
 ```
 
-- [ ] **Step 2: Run → FAIL**
+- [x] **Step 2: Run → FAIL**
 
 Run: `node --test tests/session-compact.test.js`
 
-- [ ] **Step 3: 实现 `src/ai/session-compact.js`**
+- [x] **Step 3: 实现 `src/ai/session-compact.js`**
 
 ```js
 'use strict';
@@ -372,7 +372,7 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: 测试通过 + commit**
+- [x] **Step 4: 测试通过 + commit**
 
 ```bash
 node --test tests/session-compact.test.js
@@ -393,7 +393,7 @@ git commit -m "feat(codex-qq): Phase D.1 session-compact pure helpers"
 - `exportSessionJson(session): string`（pretty JSON，`version: 1`）
 - `defaultExportFilename(session, format): string`（安全文件名）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```js
 'use strict';
@@ -451,7 +451,7 @@ describe('session-export', () => {
 
 实现时：**剥离** messages 上的 `apiKey` / `authorization` 等敏感键；content 中的密钥无法可靠清除，文档说明即可。测试用 `apiKey` 字段断言被剥。
 
-- [ ] **Step 2–4: 实现、测绿、commit**
+- [x] **Step 2–4: 实现、测绿、commit**
 
 ```js
 // session-export.js 要点
@@ -517,7 +517,7 @@ git commit -m "feat(codex-qq): Phase D.1 session export markdown and json"
   - `ipcMain.handle('session:compact', async (_e, payload) => { ... })`
   - `ipcMain.handle('dialog:saveTextFile', async (_e, payload) => { showSaveDialog; writeFile })`
 
-- [ ] **Step 1: 单测 generateCompactSummary**
+- [x] **Step 1: 单测 generateCompactSummary**
 
 ```js
 it('local mode returns placeholder without chatFn', async () => {
@@ -540,7 +540,7 @@ it('api mode uses chatFn', async () => {
 });
 ```
 
-- [ ] **Step 2: 实现 generateCompactSummary**
+- [x] **Step 2: 实现 generateCompactSummary**
 
 ```js
 async function generateCompactSummary({ transcript, settings, chatFn }) {
@@ -571,7 +571,7 @@ async function generateCompactSummary({ transcript, settings, chatFn }) {
 
 检查 `chatCompletion` / `chatRequest` 是否支持 `max_tokens`；若 `buildChatPayload` 可扩展则传 `max_tokens: 1500`，否则 YAGNI 跳过。
 
-- [ ] **Step 3: main handlers**
+- [x] **Step 3: main handlers**
 
 ```js
 const {
@@ -613,14 +613,14 @@ ipcMain.handle('dialog:saveTextFile', async (_e, payload = {}) => {
 });
 ```
 
-- [ ] **Step 4: preload**
+- [x] **Step 4: preload**
 
 ```js
 compactSession: (payload) => ipcRenderer.invoke('session:compact', payload || {}),
 saveTextFile: (payload) => ipcRenderer.invoke('dialog:saveTextFile', payload || {}),
 ```
 
-- [ ] **Step 5: 测试 + commit**
+- [x] **Step 5: 测试 + commit**
 
 ```bash
 node --test tests/session-compact.test.js tests/settings.test.js
@@ -671,9 +671,9 @@ defaultExportFilename: (session, format) => exp.defaultExportFilename(session, f
 
 preload 路径：文件在 `src/preload.js`，require 应为 `./ai/session-compact`（与 main 同级 `src/`）。
 
-- [ ] **Step 1: preload 暴露纯函数 + 已有 IPC**
+- [x] **Step 1: preload 暴露 IPC 包装**（改用 R2：`sandbox: true` 下 preload 无法 require 纯函数）
 
-- [ ] **Step 2: HTML 设置项 + 按钮**
+- [x] **Step 2: HTML 设置项 + 按钮**
 
 在设置模态 Agent 相关区域追加：
 
@@ -705,7 +705,7 @@ preload 路径：文件在 `src/preload.js`，require 应为 `./ai/session-compa
 
 若顶栏拥挤，可放在会话标题旁；实现时选 **header 操作区** 与现有按钮风格一致。
 
-- [ ] **Step 3: CSS**
+- [x] **Step 3: CSS**
 
 ```css
 .msg-compact .bubble,
@@ -719,7 +719,7 @@ preload 路径：文件在 `src/preload.js`，require 应为 `./ai/session-compa
 
 `renderMessages`：若 `msg.compact` 给 `msg` 根节点加 `msg-compact`。
 
-- [ ] **Step 4: app.js 核心逻辑**
+- [x] **Step 4: app.js 核心逻辑**
 
 ```js
 function compactSettingsFrom(s) {
@@ -856,7 +856,7 @@ document.getElementById('btn-export')?.addEventListener('click', () => {
 });
 ```
 
-- [ ] **Step 5: node --check + 手工清单 + commit**
+- [x] **Step 5: node --check + 手工清单 + commit**
 
 ```bash
 node --check src/preload.js
@@ -883,9 +883,9 @@ git commit -m "feat(codex-qq): Phase D.1 compact export UI and slash commands"
 - 进行中不可 compact
 - local 模式占位摘要
 
-- [ ] **Step 1: 写 README**  
-- [ ] **Step 2: `npm test` 全绿**  
-- [ ] **Step 3: commit**
+- [x] **Step 1: 写 README**  
+- [x] **Step 2: `npm test` 全绿**  
+- [x] **Step 3: commit**
 
 ```bash
 git commit -m "docs(codex-qq): Phase D.1 session compact and export usage"
@@ -921,3 +921,29 @@ Plan complete and saved to `docs/superpowers/plans/2026-07-24-phase-d1-session-c
 2. **Inline Execution** — 本会话连续执行  
 
 **Which approach?**
+
+---
+
+## 执行记录（2026-07-26）
+
+全部 6 个任务已实现并提交，`npm test` 319 tests / 317 pass / 0 fail / 2 skipped（skip 为既有的 `powershell.exe not available on this host`，与本阶段无关）。
+
+| 任务 | 提交 |
+|------|------|
+| T1 settings 默认值与 clamp | `bf91b48` |
+| T2 session-compact 纯函数 | `e783b95` |
+| T3 session-export 纯函数 | `988b733` |
+| T4 main IPC + preload | `26889ed` |
+| T5 renderer UI 与斜杠命令 | `ba429f1` |
+| T6 README + 全量测试 | `8e27ab5` |
+
+### 与计划的偏差
+
+1. **Task 5 改用 R2，不用 R1。** 计划拍板的 R1（preload `require('./ai/session-compact')` 再 expose 纯函数）在本项目行不通：`src/main.js` 的 `webPreferences` 是 `sandbox: true`，沙箱化 preload 只能 require `electron` 与少数 Node 内置模块，require 项目相对路径会在运行时抛错。改为 R2：`session:compact` 在主进程一次往返完成 plan → 摘要 → apply，renderer 只替换 `messages` 数组。纯函数与单测位置不变，只是调用点从 preload 换到 main。
+2. **IPC 用 `session:export` 而非 `dialog:saveTextFile`。** 规格 §3.2 本就允许二选一；序列化留在主进程，与 R2 一致，renderer 不必持有导出逻辑。
+3. **跳过 `max_tokens: 1500`。** `src/ai/openai-compatible.js` 的 `buildChatPayload` 不支持该字段，按计划的 YAGNI 分支处理；改以摘录截断（100000 字符）+ `temperature: 0.2` 控成本与漂移。
+4. **额外收紧 `planCompact`。** 实现了规格 §4.3 第 5 条那个「可选优化」：若待压缩区只剩历史摘要，即使 `force: true` 也判定 not needed，避免反复压缩摘要。
+
+### 未验证项
+
+`node_modules` 未安装且机器无 X 显示，Electron 应用**没有实际启动过**。渲染层靠 `node --check` 与 7 个新 DOM id 的 html/app.js 双向核对确认接线，等价于静态检查，不等于真机点击验证。装依赖后建议手工过：生成中 `/compact` 被拒、空闲时出摘要气泡、`/export md|json` 保存对话框写盘、设置四项读写与 clamp。

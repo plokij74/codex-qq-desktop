@@ -68,6 +68,9 @@
             </div>
             <div class="session-actions">
               <button type="button" class="ghost-btn hidden" id="btn-bind-project">绑定目录</button>
+              <button type="button" class="ghost-btn" id="btn-compact" title="把更早的消息压缩成一条摘要">压缩</button>
+              <button type="button" class="ghost-btn" id="btn-export" title="导出为 Markdown">导出</button>
+              <button type="button" class="ghost-btn" id="btn-export-json" title="导出为 JSON">导出 JSON</button>
               <button type="button" class="ghost-btn" id="btn-clear-chat" title="清空当前会话">清空</button>
             </div>
           </div>
@@ -239,6 +242,20 @@
           </div>
           <small class="field-hint">stdio 填命令；sse/http 填 URL。保存时过滤无效项。远程 URL 请仅连接信任源。</small>
         </div>
+        <label class="switch-row"><input type="checkbox" id="set-auto-compact" /> <span>发送前自动压缩会话（超阈值时，默认关）</span></label>
+        <label class="field">
+          <span>压缩保留最近消息数</span>
+          <input id="set-compact-keep-messages" type="number" min="6" max="80" value="24" />
+        </label>
+        <label class="field">
+          <span>压缩条数阈值</span>
+          <input id="set-compact-max-messages" type="number" min="20" max="200" value="40" />
+        </label>
+        <label class="field">
+          <span>压缩约 token 阈值</span>
+          <input id="set-compact-max-tokens" type="number" min="4000" max="200000" step="1000" value="24000" />
+          <small class="field-hint">约 token 按字符数/4 估算，不依赖 tokenizer。</small>
+        </label>
         <label class="switch-row"><input type="checkbox" id="set-hooks-enabled" checked /> <span>启用 Hooks（项目 .codex/hooks.json + 用户 hooks.json）</span></label>
         <div class="hooks-summary" id="hooks-summary">Hooks 摘要：未加载</div>
         <button type="button" id="btn-hooks-refresh" class="btn-small">刷新 Hooks</button>

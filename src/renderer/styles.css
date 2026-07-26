@@ -172,6 +172,13 @@ html, body {
 .msg-assistant { justify-content: flex-start; }
 .msg-user { justify-content: flex-end; margin-left: auto; }
 .msg-error .bubble { border-color: #e39; color: #a12; background: #fff5f7; }
+.msg-compact .bubble {
+  border: 1px dashed #8a9bcc;
+  background: #f4f6fc;
+  color: #243a6a;
+  font-size: 12px;
+}
+.msg-compact .msg-meta { color: #5a6ea8; }
 
 .bubble {
   border: 1px solid #a8c4de;

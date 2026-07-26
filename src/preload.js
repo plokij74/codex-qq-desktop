@@ -30,4 +30,6 @@ contextBridge.exposeInMainWorld('codex', {
   getSkill: (payload) => ipcRenderer.invoke('skills:get', payload || {}),
   hooksSummary: (payload) => ipcRenderer.invoke('hooks:summary', payload || {}),
   testMcpServer: (cfg) => ipcRenderer.invoke('mcp:testServer', cfg),
+  compactSession: (payload) => ipcRenderer.invoke('session:compact', payload || {}),
+  exportSession: (payload) => ipcRenderer.invoke('session:export', payload || {}),
 });

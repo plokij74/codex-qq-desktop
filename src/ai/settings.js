@@ -30,6 +30,11 @@ const DEFAULT_SETTINGS = {
   hooksEnabled: true,
   // Phase C.4
   exploreMaxParallel: 2, // Phase C.4; clamp 1..3 on load
+  // Phase D.1 session compact
+  autoCompact: false, // send-time auto compact; manual by default
+  compactKeepMessages: 24, // clamp 6..80
+  compactMaxMessages: 40, // clamp 20..200
+  compactMaxApproxTokens: 24000, // clamp 4000..200000; heuristic len/4
 };
 
 function getSettingsPath(userDataPath) {
@@ -42,6 +47,21 @@ function clampExploreMaxParallel(v) {
   return Math.max(1, Math.min(3, Math.floor(n)));
 }
 
+function clampInt(v, min, max, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+/** Phase D.1: normalize compact settings in place; shared by load/save and main. */
+function clampCompactSettings(s) {
+  s.autoCompact = s.autoCompact === true;
+  s.compactKeepMessages = clampInt(s.compactKeepMessages, 6, 80, 24);
+  s.compactMaxMessages = clampInt(s.compactMaxMessages, 20, 200, 40);
+  s.compactMaxApproxTokens = clampInt(s.compactMaxApproxTokens, 4000, 200000, 24000);
+  return s;
+}
+
 function loadSettings(userDataPath) {
   const file = getSettingsPath(userDataPath);
   try {
@@ -50,7 +70,7 @@ function loadSettings(userDataPath) {
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
     merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
     merged.mcpServers = sanitizeMcpServers(merged.mcpServers);
-    return merged;
+    return clampCompactSettings(merged);
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -60,6 +80,7 @@ function saveSettings(userDataPath, partial) {
   const next = { ...loadSettings(userDataPath), ...partial };
   next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
   next.mcpServers = sanitizeMcpServers(next.mcpServers);
+  clampCompactSettings(next);
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
   return next;
@@ -70,4 +91,6 @@ module.exports = {
   getSettingsPath,
   loadSettings,
   saveSettings,
+  clampInt,
+  clampCompactSettings,
 };

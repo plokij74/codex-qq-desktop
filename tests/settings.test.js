@@ -101,6 +101,50 @@ describe('settings', () => {
     assert.equal(loadSettings(dir).exploreMaxParallel, 1);
   });
 
+  it('defaults Phase D.1 compact settings', () => {
+    assert.equal(DEFAULT_SETTINGS.autoCompact, false);
+    assert.equal(DEFAULT_SETTINGS.compactKeepMessages, 24);
+    assert.equal(DEFAULT_SETTINGS.compactMaxMessages, 40);
+    assert.equal(DEFAULT_SETTINGS.compactMaxApproxTokens, 24000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const s = loadSettings(dir);
+    assert.equal(s.autoCompact, false);
+    assert.equal(s.compactKeepMessages, 24);
+    assert.equal(s.compactMaxMessages, 40);
+    assert.equal(s.compactMaxApproxTokens, 24000);
+  });
+
+  it('clamps Phase D.1 compact settings on save', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    saveSettings(dir, { compactKeepMessages: 1, compactMaxMessages: 999, compactMaxApproxTokens: 100 });
+    const s = loadSettings(dir);
+    assert.equal(s.compactKeepMessages, 6);
+    assert.equal(s.compactMaxMessages, 200);
+    assert.equal(s.compactMaxApproxTokens, 4000);
+    saveSettings(dir, { autoCompact: true, compactKeepMessages: 50 });
+    assert.equal(loadSettings(dir).autoCompact, true);
+    assert.equal(loadSettings(dir).compactKeepMessages, 50);
+  });
+
+  it('clamps Phase D.1 compact settings on load of hand-edited file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    fs.writeFileSync(
+      getSettingsPath(dir),
+      JSON.stringify({
+        autoCompact: 'yes',
+        compactKeepMessages: 1000,
+        compactMaxMessages: 'abc',
+        compactMaxApproxTokens: 999999,
+      }),
+      'utf8'
+    );
+    const s = loadSettings(dir);
+    assert.equal(s.autoCompact, false);
+    assert.equal(s.compactKeepMessages, 80);
+    assert.equal(s.compactMaxMessages, 40);
+    assert.equal(s.compactMaxApproxTokens, 200000);
+  });
+
   it('loadSettings sanitizes mcpServers (drops non-http url)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
     const file = getSettingsPath(dir);

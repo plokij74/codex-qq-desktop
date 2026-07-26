@@ -1,0 +1,106 @@
+'use strict';
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  exportSessionMarkdown,
+  exportSessionJson,
+  defaultExportFilename,
+  stripSecrets,
+} = require('../src/ai/session-export');
+
+function sampleSession() {
+  return {
+    id: 's1',
+    title: '修 bug/登录',
+    kind: 'task',
+    peer: 'codex',
+    projectId: null,
+    agentMode: 'agent',
+    pinned: false,
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'hi', tool: 'write_file', toolSummary: 'ok a.js' },
+      { role: 'assistant', content: 'secret', apiKey: 'sk-leak' },
+      { role: 'assistant', content: '要点若干', compact: true, compactedCount: 9 },
+    ],
+  };
+}
+
+describe('session-export', () => {
+  it('markdown includes title, metadata and roles', () => {
+    const md = exportSessionMarkdown(sampleSession());
+    assert.match(md, /修 bug\/登录/);
+    assert.match(md, /s1/);
+    assert.match(md, /我/);
+    assert.match(md, /助手/);
+    assert.match(md, /hello/);
+    assert.match(md, /write_file/);
+    assert.match(md, /ok a\.js/);
+  });
+
+  it('markdown marks compacted summary messages', () => {
+    const md = exportSessionMarkdown(sampleSession());
+    assert.match(md, /摘要/);
+    assert.match(md, /9/);
+  });
+
+  it('markdown never carries an apiKey field value', () => {
+    const md = exportSessionMarkdown(sampleSession());
+    assert.ok(!md.includes('sk-leak'));
+  });
+
+  it('markdown tolerates an empty session', () => {
+    const md = exportSessionMarkdown({ id: 'x' });
+    assert.match(md, /x/);
+    assert.equal(typeof md, 'string');
+  });
+
+  it('json has version 1, exportedAt and session fields', () => {
+    const raw = exportSessionJson(sampleSession());
+    const obj = JSON.parse(raw);
+    assert.equal(obj.version, 1);
+    assert.match(obj.exportedAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(obj.session.id, 's1');
+    assert.equal(obj.session.title, '修 bug/登录');
+    assert.equal(obj.session.agentMode, 'agent');
+    assert.equal(obj.session.messages.length, 4);
+    assert.equal(obj.session.messages[1].tool, 'write_file');
+  });
+
+  it('json strips secret keys from messages', () => {
+    const raw = exportSessionJson(sampleSession());
+    assert.ok(!raw.includes('sk-leak'));
+    assert.ok(!raw.includes('apiKey'));
+  });
+
+  it('stripSecrets removes banned keys at any depth', () => {
+    const out = stripSecrets({
+      a: 1,
+      apiKey: 'k',
+      nested: { token: 't', keep: 'yes', deeper: [{ password: 'p', ok: 1 }] },
+    });
+    assert.equal(out.a, 1);
+    assert.equal('apiKey' in out, false);
+    assert.equal('token' in out.nested, false);
+    assert.equal(out.nested.keep, 'yes');
+    assert.equal('password' in out.nested.deeper[0], false);
+    assert.equal(out.nested.deeper[0].ok, 1);
+  });
+
+  it('defaultExportFilename sanitizes title and adds extension', () => {
+    const s = sampleSession();
+    const md = defaultExportFilename(s, 'md');
+    assert.match(md, /\.md$/);
+    assert.ok(!md.includes('/'));
+    assert.ok(!md.includes('\\'));
+    assert.match(defaultExportFilename(s, 'json'), /\.json$/);
+    assert.match(defaultExportFilename({}, 'md'), /^session-\d{4}-\d{2}-\d{2}\.md$/);
+  });
+
+  it('defaultExportFilename falls back when the title has no safe chars', () => {
+    const name = defaultExportFilename({ title: '///***' }, 'md');
+    assert.match(name, /^session-\d{4}-\d{2}-\d{2}\.md$/);
+  });
+});

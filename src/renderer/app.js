@@ -634,9 +634,10 @@ function renderMessages() {
   list.innerHTML = msgs.map((msg) => {
     const roleClass = msg.role === 'user' ? 'msg-user' : 'msg-assistant';
     const errClass = msg.error ? ' msg-error' : '';
-    const who = msg.role === 'user' ? '我' : botName;
+    const compactClass = msg.compact ? ' msg-compact' : '';
+    const who = msg.role === 'user' ? '我' : (msg.compact ? '会话摘要' : botName);
     const strip = msg.role === 'assistant' ? fileChangesStripHtml(msg.fileChanges) : '';
-    return '<div class="msg '+roleClass+errClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+strip+renderMarkdownLite(msg.content)+'</div></div>';
+    return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+strip+renderMarkdownLite(msg.content)+'</div></div>';
   }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '');
   bindFileChangesToggles(list);
   if (liveRun && chatRun.el) {
@@ -1858,7 +1859,10 @@ function handleSlashCommand(text) {
   if (lower === '/help') {
     activeSession().messages.push({
       role: 'assistant',
-      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name>\n任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）',
+      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name> /compact /export md|json\n'
+        + '/compact：把更早的消息压缩成一条摘要，保留最近若干条原文（生成中不可用）\n'
+        + '/export md｜/export json：导出当前会话，路径在保存对话框里选\n'
+        + '任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）',
     });
     saveState(); renderMessages(); return true;
   }
@@ -1881,6 +1885,21 @@ function handleSlashCommand(text) {
     }).catch((e) => toast(e.message || String(e)));
     return true;
   }
+  if (lower === '/compact') {
+    runCompactOnSession(activeSession(), { force: true }).catch((e) => toast(e.message || String(e)));
+    return true;
+  }
+  if (lower === '/export' || lower.startsWith('/export ')) {
+    const arg = lower === '/export' ? '' : lower.slice('/export '.length).trim();
+    if (!arg || arg === 'md' || arg === 'markdown') {
+      runExportOnSession(activeSession(), 'md').catch((e) => toast(e.message || String(e)));
+    } else if (arg === 'json') {
+      runExportOnSession(activeSession(), 'json').catch((e) => toast(e.message || String(e)));
+    } else {
+      toast('用法：/export md 或 /export json');
+    }
+    return true;
+  }
   if (lower.startsWith('/skill ')) {
     const name = cmd.slice(7).trim();
     const proj = sessionProject(activeSession());
@@ -1899,6 +1918,86 @@ function handleSlashCommand(text) {
 }
 function clearCurrentChat() {
   const s = activeSession(); s.messages = [{ role: 'assistant', content: '会话已清空。继续说吧。' }]; s.updatedAt = Date.now(); saveState(); renderMessages(); toast('已清空当前会话');
+}
+
+/* ---- Phase D.1: session compact + export ------------------------------- */
+
+/** Structured-clone safe copy; session objects come from localStorage so this is cheap. */
+function cloneForIpc(value) {
+  return JSON.parse(JSON.stringify(value ?? null));
+}
+
+/**
+ * One IPC round trip: main plans, summarizes and applies, then hands back the
+ * new messages array. The sandboxed preload cannot require the pure helpers.
+ */
+function requestCompact(session, force) {
+  return window.codex.compactSession({
+    force: !!force,
+    messages: cloneForIpc(session?.messages || []),
+  });
+}
+
+/** Manual `/compact` and the 压缩 button. Refuses while a run is live. */
+async function runCompactOnSession(session, { force } = {}) {
+  if (!session) return false;
+  if (sending || (chatRun && !chatRun.finalized)) {
+    toast('请先停止生成，再压缩会话');
+    return false;
+  }
+  const btn = document.getElementById('btn-compact');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await requestCompact(session, force);
+    if (!res || res.ok === false) {
+      toast('压缩失败：' + (res?.error || '未知错误'));
+      return false;
+    }
+    if (!res.needed) {
+      toast(force ? '无需压缩：没有可压缩的更早消息' : '未达压缩阈值');
+      return false;
+    }
+    session.messages = res.messages;
+    session.updatedAt = Date.now();
+    saveState();
+    renderMessages();
+    toast('已压缩更早 ' + res.compactedCount + ' 条消息');
+    return true;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/** Send-time auto compact. Never blocks the send — failures are swallowed. */
+async function maybeAutoCompact(session) {
+  if (!session) return false;
+  try {
+    const st = await window.codex.getSettings();
+    if (st?.autoCompact !== true) return false;
+    const res = await requestCompact(session, false);
+    if (!res?.ok || !res.needed) return false;
+    session.messages = res.messages;
+    session.updatedAt = Date.now();
+    saveState();
+    toast('发送前已自动压缩 ' + res.compactedCount + ' 条');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `/export md|json` and the 导出 buttons. Allowed even while a run is live. */
+async function runExportOnSession(session, format) {
+  if (!session) return false;
+  const fmt = format === 'json' ? 'json' : 'md';
+  const res = await window.codex.exportSession({ format: fmt, session: cloneForIpc(session) });
+  if (res?.canceled) return false;
+  if (!res?.ok) {
+    toast('导出失败：' + (res?.error || '未知错误'));
+    return false;
+  }
+  toast('已导出：' + res.path);
+  return true;
 }
 /** In-memory MCP server list for settings UI (list is source of truth). */
 let mcpServerDrafts = [];
@@ -2159,6 +2258,14 @@ async function openSettings() {
   if (mcpEn) mcpEn.checked = Boolean(settings.mcpEnabled);
   setMcpServerDrafts(Array.isArray(settings.mcpServers) ? settings.mcpServers : []);
   hideMcpImportPanel();
+  const ac = document.getElementById('set-auto-compact');
+  if (ac) ac.checked = settings.autoCompact === true;
+  const ckm = document.getElementById('set-compact-keep-messages');
+  if (ckm) ckm.value = String(settings.compactKeepMessages ?? 24);
+  const cmm = document.getElementById('set-compact-max-messages');
+  if (cmm) cmm.value = String(settings.compactMaxMessages ?? 40);
+  const cmt = document.getElementById('set-compact-max-tokens');
+  if (cmt) cmt.value = String(settings.compactMaxApproxTokens ?? 24000);
   const he = document.getElementById('set-hooks-enabled');
   if (he) he.checked = settings.hooksEnabled !== false;
   document.getElementById('settings-modal').classList.remove('hidden');
@@ -2204,6 +2311,10 @@ async function saveSettingsFromForm() {
     mcpEnabled: Boolean(document.getElementById('set-mcp-enabled')?.checked),
     mcpServers,
     hooksEnabled: document.getElementById('set-hooks-enabled')?.checked !== false,
+    autoCompact: Boolean(document.getElementById('set-auto-compact')?.checked),
+    compactKeepMessages: Number(document.getElementById('set-compact-keep-messages')?.value || 24),
+    compactMaxMessages: Number(document.getElementById('set-compact-max-messages')?.value || 40),
+    compactMaxApproxTokens: Number(document.getElementById('set-compact-max-tokens')?.value || 24000),
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
   await window.codex.saveSettings(partial);
@@ -2239,6 +2350,10 @@ async function sendMessage() {
       session.updatedAt = Date.now(); setSending(false); saveState(); renderMessages(); input.focus();
     }, 450); return;
   }
+
+  // Phase D.1: optional compact before the model call. Runs while activeRun is
+  // still null so the main-side gate lets it through; failures never block send.
+  await maybeAutoCompact(session);
 
   // Live assistant placeholder driven by onChatEvent
   createAssistantRunPlaceholder(session.id);
@@ -2357,6 +2472,15 @@ function bindEvents() {
   document.getElementById('contact-randy').addEventListener('click', () => openFriendChat('randy'));
   document.getElementById('robot-card').addEventListener('click', () => openFriendChat('codex'));
   document.getElementById('btn-clear-chat').addEventListener('click', clearCurrentChat);
+  document.getElementById('btn-compact')?.addEventListener('click', () => {
+    runCompactOnSession(activeSession(), { force: true }).catch((e) => toast(e.message || String(e)));
+  });
+  document.getElementById('btn-export')?.addEventListener('click', () => {
+    runExportOnSession(activeSession(), 'md').catch((e) => toast(e.message || String(e)));
+  });
+  document.getElementById('btn-export-json')?.addEventListener('click', () => {
+    runExportOnSession(activeSession(), 'json').catch((e) => toast(e.message || String(e)));
+  });
   document.getElementById('btn-bind-project').addEventListener('click', () => { const p = sessionProject(); if (p) bindProjectPath(p.id); });
   document.getElementById('btn-emoji').addEventListener('click', () => document.getElementById('emoji-panel').classList.toggle('hidden'));
   document.getElementById('btn-image').addEventListener('click', () => document.getElementById('file-image').click());
