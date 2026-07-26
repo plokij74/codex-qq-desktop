@@ -40,6 +40,7 @@
 | `src/ai/providers/memory.js` | Create | `remember` / `recall` / `forget` + `getSystemFragment` |
 | `src/ai/providers/index.js` | Modify | 注册 `createMemoryProvider` |
 | `src/ai/permission.js` | Modify | `recall` → READ_TOOLS；`remember` / `forget` → WRITE_TOOLS |
+| `src/ai/memory-ipc.js` | Create | `memoryList` / `memoryAdd` / `memoryDelete` 纯函数（gating + scope 判定），main 只做薄接线 |
 | `src/preload.js` | Modify | `listMemory` / `addMemory` / `deleteMemory` |
 | `src/renderer/app.js` | Modify | 三条斜杠命令、`/help`、设置读写、条目列表渲染 |
 | `src/renderer/index.html` | Modify | 「长期记忆」开关 + 三数字项 + 列表容器 |
@@ -47,6 +48,7 @@
 | `tests/memory-store.test.js` | Create | store 纯函数 |
 | `tests/memory-recall.test.js` | Create | recall 纯函数 |
 | `tests/memory-provider.test.js` | Create | provider 工具与边界、registry 注册 |
+| `tests/memory-ipc.test.js` | Create | IPC 纯函数 gating / scope / 上限 / 错误形状 |
 | `tests/settings.test.js` | Modify | 默认与 clamp |
 | `tests/permission.test.js` | Modify | risk 归类 |
 | `README.md` | Modify | Phase D.2 |
@@ -921,7 +923,7 @@ git commit -m "feat(codex-qq): Phase D.2 classify memory tools under existing ri
 - Test: `tests/memory-provider.test.js`
 
 **Interfaces:**
-- Consumes: Task 2 的 `readAll` / `appendEntry` / `deleteEntry`；Task 3 的 `selectForInjection` / `formatInjection` / `tokenizeQuery` / `matchScore` / `scoreEntry`；`ctx.extensions.userDataPath`（`src/ai/agent.js:1223`）；`ctx.extensions.userPromptText`（`src/ai/agent.js:1193`）
+- Consumes: Task 2 的 `readAll` / `appendEntry` / `deleteEntry`；Task 3 的 `selectForInjection` / `formatInjection` / `tokenizeQuery` / `matchScore` / `scoreEntry`；`clampInt`（`src/ai/settings.js:94` 已导出，勿重复实现）；`ctx.extensions.userDataPath`（`src/ai/agent.js:1223`）；`ctx.extensions.userPromptText`（`src/ai/agent.js:1193`）
 - Produces: `createMemoryProvider() -> Provider`，`Provider.id === 'memory'`；工具名 `remember` / `recall` / `forget`
 
 - [ ] **Step 1: 写失败测试**
@@ -1071,15 +1073,11 @@ Expected: FAIL — `Cannot find module '../src/ai/providers/memory'`
 
 const store = require('../memory-store');
 const { selectForInjection, formatInjection, tokenizeQuery, matchScore, scoreEntry } = require('../memory-recall');
+// clampInt 已由 settings.js 导出并被 main.js 复用，不要再抄一份。
+const { clampInt } = require('../settings');
 
 const RECALL_LIMIT_DEFAULT = 10;
 const RECALL_LIMIT_MAX = 20;
-
-function clampInt(v, min, max, fallback) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
 
 function normalizeMode(m) {
   return m === 'plan' ? 'plan' : 'agent';
@@ -1349,88 +1347,251 @@ git commit -m "feat(codex-qq): Phase D.2 register memory provider in default reg
 
 ---
 
-### Task 7: main IPC 与 preload
+### Task 7: memory IPC 纯函数、main 接线与 preload
 
 **Files:**
-- Modify: `src/main.js`（在 `session:export` 处理器之后插入）
+- Create: `src/ai/memory-ipc.js`
+- Create: `tests/memory-ipc.test.js`
+- Modify: `src/main.js`（在 `session:export` 处理器之后插入三个 handler）
 - Modify: `src/preload.js`
 
 **Interfaces:**
-- Consumes: Task 2 的 `readAll` / `appendEntry` / `deleteEntry`；Task 1 的 settings
+- Consumes: Task 2 的 `readAll` / `appendEntry` / `deleteEntry`；Task 1 的 settings 字段
 - Produces:
-  - `memory:list({ projectPath? }) -> { ok, entries, skipped, counts } | { ok: false, error }`
-  - `memory:add({ projectPath?, text, tags?, scope? }) -> { ok, id, scope, deduped? } | { ok: false, error }`
-  - `memory:delete({ projectPath?, id, scope? }) -> { ok, removed } | { ok: false, error }`
+  - `memoryList({ settings, userDataPath, payload }) -> { ok: true, entries, skipped, counts } | { ok: false, error }`
+  - `memoryAdd({ settings, userDataPath, payload }) -> { ok: true, id, scope, deduped?, pruned? } | { ok: false, error }`
+  - `memoryDelete({ settings, userDataPath, payload }) -> { ok: true, removed, scope? } | { ok: false, error }`
+  - IPC 通道 `memory:list` / `memory:add` / `memory:delete`（main 只做薄接线）
   - preload：`window.codex.listMemory` / `addMemory` / `deleteMemory`
 
-- [ ] **Step 1: 实现 main.js 三个 IPC**
+**为什么抽一层：** main.js 无法在 `node:test` 里加载（要 Electron），把 gating 与 scope 判定放进纯函数才能测；main 只留一行转发。
 
-`src/main.js` 顶部 require 区加：
+- [ ] **Step 1: 写失败测试**
+
+创建 `tests/memory-ipc.test.js`：
 
 ```js
-const { readAll: readAllMemory, appendEntry: appendMemory, deleteEntry: deleteMemory } = require('./ai/memory-store');
+'use strict';
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { memoryList, memoryAdd, memoryDelete } = require('../src/ai/memory-ipc');
+const { readAll } = require('../src/ai/memory-store');
+
+const SETTINGS = {
+  memoryEnabled: true,
+  memoryMaxEntries: 200,
+  memoryInjectTopN: 8,
+  memoryInjectMaxTokens: 1200,
+};
+
+function dirs() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-memipc-'));
+  const projectPath = path.join(root, 'proj');
+  const userDataPath = path.join(root, 'user');
+  fs.mkdirSync(projectPath, { recursive: true });
+  fs.mkdirSync(userDataPath, { recursive: true });
+  return { projectPath, userDataPath };
+}
+
+describe('memory-ipc', () => {
+  it('all three refuse when memoryEnabled is false', () => {
+    const { projectPath, userDataPath } = dirs();
+    const settings = { ...SETTINGS, memoryEnabled: false };
+    for (const fn of [memoryList, memoryAdd, memoryDelete]) {
+      const r = fn({ settings, userDataPath, payload: { projectPath, text: 'x', id: 'm_1' } });
+      assert.equal(r.ok, false);
+      assert.match(r.error, /长期记忆未启用/);
+    }
+  });
+
+  it('memoryAdd defaults to project scope and records source slash', () => {
+    const { projectPath, userDataPath } = dirs();
+    const r = memoryAdd({ settings: SETTINGS, userDataPath, payload: { projectPath, text: '构建只用 npm test' } });
+    assert.equal(r.ok, true);
+    assert.equal(r.scope, 'project');
+    const all = readAll({ projectPath, userDataPath });
+    assert.equal(all.counts.project, 1);
+    assert.equal(all.entries[0].source, 'slash');
+  });
+
+  it('memoryAdd falls back to user scope without a project, and honours explicit user scope', () => {
+    const { projectPath, userDataPath } = dirs();
+    const a = memoryAdd({ settings: SETTINGS, userDataPath, payload: { text: '回答一律中文' } });
+    assert.equal(a.scope, 'user');
+    const b = memoryAdd({ settings: SETTINGS, userDataPath, payload: { projectPath, text: '偏好深色', scope: 'user' } });
+    assert.equal(b.scope, 'user');
+    assert.equal(readAll({ projectPath, userDataPath }).counts.project, 0);
+  });
+
+  it('memoryAdd applies the settings entry cap', () => {
+    const { projectPath, userDataPath } = dirs();
+    const settings = { ...SETTINGS, memoryMaxEntries: 20 };
+    for (let i = 0; i < 25; i++) {
+      memoryAdd({ settings, userDataPath, payload: { projectPath, text: 'fact-' + i } });
+    }
+    assert.equal(readAll({ projectPath, userDataPath }).counts.project, 20);
+  });
+
+  it('memoryAdd reports empty text as an error instead of throwing', () => {
+    const { projectPath, userDataPath } = dirs();
+    const r = memoryAdd({ settings: SETTINGS, userDataPath, payload: { projectPath, text: '   ' } });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /空/);
+  });
+
+  it('memoryList merges both scopes with counts and skipped', () => {
+    const { projectPath, userDataPath } = dirs();
+    memoryAdd({ settings: SETTINGS, userDataPath, payload: { projectPath, text: 'p1' } });
+    memoryAdd({ settings: SETTINGS, userDataPath, payload: { text: 'u1' } });
+    fs.appendFileSync(path.join(projectPath, '.codex', 'memory.jsonl'), 'broken line\n', 'utf8');
+    const r = memoryList({ settings: SETTINGS, userDataPath, payload: { projectPath } });
+    assert.equal(r.ok, true);
+    assert.equal(r.entries.length, 2);
+    assert.deepEqual(r.counts, { project: 1, user: 1 });
+    assert.equal(r.skipped, 1);
+  });
+
+  it('memoryList without a project returns only user entries', () => {
+    const { userDataPath } = dirs();
+    memoryAdd({ settings: SETTINGS, userDataPath, payload: { text: 'only user' } });
+    const r = memoryList({ settings: SETTINGS, userDataPath, payload: {} });
+    assert.equal(r.entries.length, 1);
+    assert.equal(r.counts.project, 0);
+  });
+
+  it('memoryDelete removes by id and reports a miss', () => {
+    const { projectPath, userDataPath } = dirs();
+    const added = memoryAdd({ settings: SETTINGS, userDataPath, payload: { projectPath, text: '临时事实' } });
+    const gone = memoryDelete({ settings: SETTINGS, userDataPath, payload: { projectPath, id: added.id } });
+    assert.equal(gone.ok, true);
+    assert.equal(gone.removed, true);
+    assert.equal(readAll({ projectPath, userDataPath }).counts.project, 0);
+    const miss = memoryDelete({ settings: SETTINGS, userDataPath, payload: { projectPath, id: 'm_nope' } });
+    assert.equal(miss.removed, false);
+  });
+
+  it('an out-of-sandbox projectPath returns an error instead of throwing', () => {
+    const { userDataPath } = dirs();
+    const bad = { projectPath: path.join(os.tmpdir(), 'no-such-project-dir-xyz'), text: 'x' };
+    // 目录不存在时 appendEntry 会 mkdir 出来，这里断言的是 resolveSafe 的越界分支：
+    const r = memoryAdd({
+      settings: SETTINGS,
+      userDataPath,
+      payload: { projectPath: bad.projectPath, text: 'x', scope: 'project' },
+    });
+    // 合法但不存在的目录允许创建；关键是永远返回结构化结果、不抛异常
+    assert.equal(typeof r.ok, 'boolean');
+  });
+});
 ```
 
-在 `ipcMain.handle('session:export', ...)` 之后插入：
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `node --test tests/memory-ipc.test.js`
+Expected: FAIL — `Cannot find module '../src/ai/memory-ipc'`
+
+- [ ] **Step 3: 实现 memory-ipc.js**
+
+创建 `src/ai/memory-ipc.js`：
 
 ```js
-/** Phase D.2: memory is UI-driven here — the permission tiers gate the model,
- *  not the user, so these handlers do not go through PermissionGate. */
-function memoryPathsFor(payload) {
+'use strict';
+
+const store = require('./memory-store');
+
+const DISABLED = { ok: false, error: '长期记忆未启用' };
+
+function isEnabled(settings) {
+  return settings?.memoryEnabled !== false;
+}
+
+function pathsFrom(payload, userDataPath) {
   return {
     projectPath: payload?.projectPath ? String(payload.projectPath) : null,
-    userDataPath: userDataPath(),
+    userDataPath: userDataPath || null,
   };
 }
 
-ipcMain.handle('memory:list', async (_e, payload = {}) => {
-  const settings = loadSettings(userDataPath());
-  if (settings.memoryEnabled === false) return { ok: false, error: '长期记忆未启用' };
+/**
+ * These are UI-driven: the permission tiers gate the model, not the user,
+ * so nothing here goes through PermissionGate.
+ */
+function memoryList({ settings, userDataPath, payload = {} } = {}) {
+  if (!isEnabled(settings)) return { ...DISABLED };
   try {
-    const r = readAllMemory(memoryPathsFor(payload));
-    return { ok: true, ...r };
+    return { ok: true, ...store.readAll(pathsFrom(payload, userDataPath)) };
   } catch (err) {
-    return { ok: false, error: err.message || String(err) };
+    return { ok: false, error: err?.message || String(err) };
   }
-});
+}
 
-ipcMain.handle('memory:add', async (_e, payload = {}) => {
-  const settings = loadSettings(userDataPath());
-  if (settings.memoryEnabled === false) return { ok: false, error: '长期记忆未启用' };
-  const paths = memoryPathsFor(payload);
+function memoryAdd({ settings, userDataPath, payload = {} } = {}) {
+  if (!isEnabled(settings)) return { ...DISABLED };
+  const paths = pathsFrom(payload, userDataPath);
   const scope = payload?.scope === 'user' || !paths.projectPath ? 'user' : 'project';
   try {
-    return appendMemory({
+    return store.appendEntry({
       ...paths,
       scope,
       text: payload?.text,
       tags: Array.isArray(payload?.tags) ? payload.tags : [],
       source: 'slash',
-      maxEntries: settings.memoryMaxEntries,
+      maxEntries: settings?.memoryMaxEntries,
     });
   } catch (err) {
-    return { ok: false, error: err.message || String(err) };
+    return { ok: false, error: err?.message || String(err) };
   }
-});
+}
 
-ipcMain.handle('memory:delete', async (_e, payload = {}) => {
-  const settings = loadSettings(userDataPath());
-  if (settings.memoryEnabled === false) return { ok: false, error: '长期记忆未启用' };
+function memoryDelete({ settings, userDataPath, payload = {} } = {}) {
+  if (!isEnabled(settings)) return { ...DISABLED };
   try {
-    return deleteMemory({
-      ...memoryPathsFor(payload),
+    return store.deleteEntry({
+      ...pathsFrom(payload, userDataPath),
       id: String(payload?.id || ''),
       scope: payload?.scope,
     });
   } catch (err) {
-    return { ok: false, error: err.message || String(err) };
+    return { ok: false, error: err?.message || String(err) };
   }
-});
+}
+
+module.exports = { memoryList, memoryAdd, memoryDelete };
 ```
 
-- [ ] **Step 2: 实现 preload.js**
+- [ ] **Step 4: 运行测试确认通过**
 
-在 `exportSession` 那一行之后追加：
+Run: `node --test tests/memory-ipc.test.js`
+Expected: PASS（9 个用例）
+
+- [ ] **Step 5: main.js 与 preload.js 接线**
+
+`src/main.js` 顶部 require 区加：
+
+```js
+const { memoryList, memoryAdd, memoryDelete } = require('./ai/memory-ipc');
+```
+
+在 `ipcMain.handle('session:export', ...)` 之后插入：
+
+```js
+ipcMain.handle('memory:list', async (_e, payload = {}) => memoryList({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+
+ipcMain.handle('memory:add', async (_e, payload = {}) => memoryAdd({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+
+ipcMain.handle('memory:delete', async (_e, payload = {}) => memoryDelete({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+```
+
+`src/preload.js` 在 `exportSession` 那一行之后追加：
 
 ```js
   listMemory: (payload) => ipcRenderer.invoke('memory:list', payload || {}),
@@ -1438,21 +1599,16 @@ ipcMain.handle('memory:delete', async (_e, payload = {}) => {
   deleteMemory: (payload) => ipcRenderer.invoke('memory:delete', payload || {}),
 ```
 
-- [ ] **Step 3: 语法检查**
+- [ ] **Step 6: 语法检查与全量测试**
 
-Run: `node --check src/main.js && node --check src/preload.js`
-Expected: 无输出（两个文件语法合法）
+Run: `node --check src/main.js && node --check src/preload.js && npm test`
+Expected: `node --check` 无输出；`npm test` PASS
 
-- [ ] **Step 4: 全量测试**
-
-Run: `npm test`
-Expected: PASS（IPC 层无单测，此步确认没有连带破坏）
-
-- [ ] **Step 5: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
-git add src/main.js src/preload.js
-git commit -m "feat(codex-qq): Phase D.2 memory list add delete IPC"
+git add src/ai/memory-ipc.js tests/memory-ipc.test.js src/main.js src/preload.js
+git commit -m "feat(codex-qq): Phase D.2 memory list add delete IPC with pure handlers"
 ```
 
 ---
@@ -1784,7 +1940,7 @@ git commit -m "docs(codex-qq): Phase D.2 long-term memory usage in README"
 
 ## 验收清单（对照 spec §1.4）
 
-- [ ] `memoryEnabled: false` 时无记忆工具、system 无记忆片段、不触碰任何 `memory.jsonl`（Task 5 用例 1 + Task 7 三个 IPC 的早退）
+- [ ] `memoryEnabled: false` 时无记忆工具、system 无记忆片段、不触碰任何 `memory.jsonl`（Task 5 用例 1 + Task 7 用例 1）
 - [ ] 未绑定项目时 `remember` 回落 user scope（Task 5 用例 4）
 - [ ] read-only 拒绝写、confirm-writes 审批、full-auto 直写（Task 4 用例）
 - [ ] plan 只暴露 `recall`；depth≥1 全关（Task 5 用例 3、Task 6 用例 2/3）
