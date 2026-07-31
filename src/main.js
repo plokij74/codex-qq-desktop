@@ -1,10 +1,18 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { loadSettings, saveSettings, clampInt, clampMemorySettings } = require('./ai/settings');
+const {
+  loadSettings,
+  saveSettings,
+  clampInt,
+  clampMemorySettings,
+  normalizeDomainList,
+  sanitizePricing,
+} = require('./ai/settings');
 const { generateLocalReply } = require('./ai/local-mock');
 const { chatCompletion } = require('./ai/openai-compatible');
 const { runAgentLoop, applyWriteFencesWithGate } = require('./ai/agent');
+const { createMemoryOnlyRegistry } = require('./ai/providers');
 const { AGENT_EVENTS } = require('./ai/agent-events');
 const { createPermissionGate } = require('./ai/permission');
 const { runTerminal } = require('./ai/terminal');
@@ -24,6 +32,7 @@ const { computeUnifiedDiff, truncateDiff } = require('./ai/diff');
 const {
   normalizeAgentMode,
   buildApproveExecutionMessage,
+  shouldUseAgent,
 } = require('./ai/agent-mode');
 const { discoverSkills, loadSkillBody } = require('./ai/skills-loader');
 const { loadHooks } = require('./ai/hooks-loader');
@@ -133,6 +142,17 @@ function toPublicSettings(s) {
     memoryMaxEntries: clampInt(s.memoryMaxEntries, 20, 2000, 200),
     memoryInjectTopN: clampInt(s.memoryInjectTopN, 0, 30, 8),
     memoryInjectMaxTokens: clampInt(s.memoryInjectMaxTokens, 200, 8000, 1200),
+    webEnabled: s.webEnabled === true,
+    webRequireConfirm: s.webRequireConfirm !== false,
+    webAllowDomains: normalizeDomainList(s.webAllowDomains),
+    webDenyDomains: normalizeDomainList(s.webDenyDomains),
+    webTimeoutMs: clampInt(s.webTimeoutMs, 3000, 60000, 15000),
+    webMaxBytes: clampInt(s.webMaxBytes, 32768, 4194304, 524288),
+    webMaxChars: clampInt(s.webMaxChars, 1000, 50000, 15000),
+    usageEnabled: s.usageEnabled !== false,
+    usageMaxRecords: clampInt(s.usageMaxRecords, 500, 50000, 5000),
+    usagePricing: sanitizePricing(s.usagePricing),
+    usageCurrency: String(s.usageCurrency ?? '$').slice(0, 4) || '$',
   };
 }
 
@@ -231,6 +251,8 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     'hooksEnabled',
     'autoCompact',
     'memoryEnabled',
+    'webEnabled',
+    'usageEnabled',
   ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
@@ -241,6 +263,10 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     ['memoryMaxEntries', 20, 2000, 200],
     ['memoryInjectTopN', 0, 30, 8],
     ['memoryInjectMaxTokens', 200, 8000, 1200],
+    ['webTimeoutMs', 3000, 60000, 15000],
+    ['webMaxBytes', 32768, 4194304, 524288],
+    ['webMaxChars', 1000, 50000, 15000],
+    ['usageMaxRecords', 500, 50000, 5000],
   ]) {
     if (k in nextPartial) nextPartial[k] = clampInt(nextPartial[k], min, max, fallback);
   }
@@ -842,10 +868,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
     }
 
     // Multi-turn Agent (API + project + agentEnabled)
-    const useAgent = settings.mode === 'api'
-      && settings.agentEnabled !== false
-      && project?.path
-      && settings.apiKey;
+    const useAgent = shouldUseAgent({ settings, project });
 
     if (useAgent) {
       const result = await runAgentLoop({
@@ -857,6 +880,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
         sessionKey: sessionId,
         signal,
         agentMode,
+        registry: project?.path ? undefined : createMemoryOnlyRegistry(),
         extensions: {
           userDataPath: userDataPath(),
         },

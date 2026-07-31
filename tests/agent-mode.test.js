@@ -7,6 +7,7 @@ const {
   buildApproveExecutionMessage,
   truncatePlanMarkdown,
   PLAN_MARKDOWN_MAX,
+  shouldUseAgent,
 } = require('../src/ai/agent-mode');
 
 describe('agent-mode', () => {
@@ -93,5 +94,20 @@ describe('agent-mode', () => {
     const r = truncatePlanMarkdown(big);
     assert.equal(r.truncated, true);
     assert.ok(r.text.length <= PLAN_MARKDOWN_MAX + 80);
+  });
+
+  it('uses a memory-only Agent for unbound API chats only when memory is enabled', () => {
+    assert.equal(shouldUseAgent({
+      settings: { mode: 'api', agentEnabled: true, apiKey: 'k', memoryEnabled: true },
+      project: null,
+    }), true);
+    assert.equal(shouldUseAgent({
+      settings: { mode: 'api', agentEnabled: true, apiKey: 'k', memoryEnabled: false },
+      project: null,
+    }), false);
+    assert.equal(shouldUseAgent({
+      settings: { mode: 'api', agentEnabled: true, apiKey: 'k', memoryEnabled: false },
+      project: { path: 'C:\\project' },
+    }), true);
   });
 });

@@ -9,6 +9,7 @@ const {
   formatEntryLine,
   formatInjection,
 } = require('../src/ai/memory-recall');
+const { approxTokensFromText } = require('../src/ai/session-compact');
 
 const NOW = 1785000000000;
 const DAY = 86400000;
@@ -154,5 +155,23 @@ describe('memory-recall', () => {
     const text = formatInjection([entry({ text: '构建只用 npm test' })]);
     assert.equal(text.endsWith('\n更多条目用 recall 检索；需要记住新事实用 remember。'), true);
     assert.equal(text, formatInjection([entry({ text: '构建只用 npm test' })], { writeHint: true }));
+  });
+
+  it('caps the complete formatted fragment and truncates the first entry if needed', () => {
+    const maxApproxTokens = 200;
+    const text = formatInjection([
+      entry({ text: 'x'.repeat(1000), scope: 'project' }),
+    ], { maxApproxTokens });
+    assert.ok(text.includes('【长期记忆】'));
+    assert.ok(text.includes('- (项目)'));
+    assert.ok(approxTokensFromText(text) <= maxApproxTokens);
+  });
+
+  it('caps hand-edited oversized entries without losing the boundary header', () => {
+    const text = formatInjection([
+      entry({ text: 'x'.repeat(100000), scope: 'project' }),
+    ], { maxApproxTokens: 200, writeHint: false });
+    assert.ok(text.startsWith('【长期记忆】'));
+    assert.ok(approxTokensFromText(text) <= 200);
   });
 });

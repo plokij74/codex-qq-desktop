@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { createMemoryProvider } = require('../src/ai/providers/memory');
 const { readAll, appendEntry } = require('../src/ai/memory-store');
+const { approxTokensFromText } = require('../src/ai/session-compact');
 
 function ctxFor(over = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-memprov-'));
@@ -107,6 +108,16 @@ describe('memory provider', () => {
     assert.match(frag, /构建只用 npm test/);
   });
 
+  it('getSystemFragment caps the complete fragment at memoryInjectMaxTokens', () => {
+    const p = createMemoryProvider();
+    const ctx = ctxFor({ settings: { memoryInjectMaxTokens: 200 } });
+    appendEntry({
+      scope: 'project', projectPath: ctx._paths.projectPath, text: 'x'.repeat(1000), maxEntries: 200, now: Date.now(),
+    });
+    const frag = p.getSystemFragment(ctx);
+    assert.ok(approxTokensFromText(frag) <= 200);
+  });
+
   it('getSystemFragment does not advertise remember in plan mode', () => {
     const p = createMemoryProvider();
     const ctx = ctxFor({ userPromptText: 'npm test 怎么跑' });
@@ -142,7 +153,7 @@ describe('memory provider', () => {
 });
 
 describe('memory provider registration', () => {
-  const { createDefaultRegistry } = require('../src/ai/providers');
+  const { createDefaultRegistry, createMemoryOnlyRegistry } = require('../src/ai/providers');
 
   function regCtx(over = {}) {
     const c = ctxFor(over);
@@ -179,5 +190,12 @@ describe('memory provider registration', () => {
     const names = (await reg.collectTools(regCtx({ agentMode: 'plan' }))).map((t) => t.function.name);
     assert.ok(names.includes('recall'));
     assert.equal(names.includes('remember'), false);
+    assert.equal(names.includes('forget'), false);
+  });
+
+  it('memory-only registry exposes exactly the three memory tools', async () => {
+    const reg = createMemoryOnlyRegistry();
+    const names = (await reg.collectTools(regCtx())).map((t) => t.function.name).sort();
+    assert.deepEqual(names, ['forget', 'recall', 'remember']);
   });
 });

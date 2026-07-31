@@ -288,6 +288,18 @@ function agentSystemPrompt(project, settings, opts = {}) {
   const exploreReadonly = !!opts.exploreReadonly || depth >= 1;
   const mode = normalizeAgentMode(opts.agentMode);
 
+  if (!project?.path) {
+    const parts = [
+      '你是 Codex 编程助手。当前会话未绑定本地项目目录。',
+      '只能使用本轮实际提供的非项目工具；未提供的文件、终端、Git、Skill、子 Agent 和 MCP 工具均不可用。',
+      '不要声称已经读取或修改本机项目；无需调用工具时直接用简体中文回答。',
+    ];
+    if (mode === 'plan') {
+      parts.push('当前为计划模式，只能使用实际提供的只读非项目工具。');
+    }
+    return parts.join('\n');
+  }
+
   // Nested sub-agent: short specialized prompt only.
   if (depth >= 1 || exploreReadonly) {
     if (kind === 'implement') {
@@ -372,6 +384,17 @@ function createDefaultRegistry() {
     executeTool: executeToolFixed,
     runLoop: runAgentLoop,
   });
+}
+
+function isMemoryOnlyRegistry(registry) {
+  try {
+    const providers = registry?.listProviders?.();
+    return Array.isArray(providers)
+      && providers.length === 1
+      && providers[0]?.id === 'memory';
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -502,6 +525,12 @@ function toolSummary(name, args) {
       return `提交计划${args.title ? `: ${String(args.title).slice(0, 60)}` : ''}`;
     case 'spawn_explore':
       return `子 Agent 调研: ${String(args.goal || '').slice(0, 80)}`;
+    case 'remember': {
+      const preview = String(args.text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      return `记住: ${preview}`;
+    }
+    case 'forget':
+      return `忘记记忆: ${String(args.id || '?').trim().slice(0, 80)}`;
     default:
       return name;
   }
@@ -1178,8 +1207,9 @@ async function runAgentLoop({
   registry: registryOpt,
   extensions: extensionsOpt,
 }) {
-  if (!project?.path) {
-    throw new Error('Agent 需要绑定真实项目目录');
+  const hasProject = Boolean(project?.path);
+  if (!hasProject && !isMemoryOnlyRegistry(registryOpt)) {
+    throw new Error('Agent 未绑定项目时只能使用记忆专用 registry');
   }
 
   const mode = normalizeAgentMode(agentMode);
@@ -1197,7 +1227,7 @@ async function runAgentLoop({
   const unlimited = rawTurns === 0;
   const maxTurns = unlimited ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(50, rawTurns || 8));
 
-  const verifyCmd = settings.verifyBeforeDone === false
+  const verifyCmd = !hasProject || settings.verifyBeforeDone === false
     ? null
     : resolveVerifyCommand(project.path, settings);
   let verifyPrompted = false;
@@ -1227,7 +1257,7 @@ async function runAgentLoop({
   try {
     await registry.onRunStart(runCtx);
 
-    if (depth === 0 && settings.hooksEnabled !== false && userDataPath) {
+    if (hasProject && depth === 0 && settings.hooksEnabled !== false && userDataPath) {
       const resolved = loadHooks({ userDataPath, projectPath: project.path });
       hooksRunner = createHooksRunner({
         hooks: resolved,
@@ -1321,9 +1351,12 @@ async function runAgentLoop({
               ...working,
               {
                 role: 'system',
-                content:
-                  '当前 API 不支持 tools。请用文本协议调用工具：\n```tool list_dir\n{"path":"."}\n```\n可用: '
-                  + TOOL_NAMES,
+                content: hasProject
+                  ? '当前 API 不支持 tools。请用文本协议调用工具：\n```tool list_dir\n{"path":"."}\n```\n可用: '
+                    + TOOL_NAMES
+                  : '当前 API 不支持 tools。请用文本协议调用实际提供的非项目工具：\n'
+                    + '```tool recall\n{"query":"关键词"}\n```\n可用: '
+                    + tools.map((t) => t?.function?.name).filter(Boolean).join(', '),
               },
             ],
             tools,
@@ -1398,7 +1431,7 @@ async function runAgentLoop({
             // Note: between preview and write there is still a TOCTOU window if the file changes externally.
             let mutatePreview = null;
 
-            if (MUTATING_TOOLS.has(name)) {
+            if (hasProject && MUTATING_TOOLS.has(name)) {
               // Preview before authorize so gate can show unified diff; write only if allowed.
               try {
                 mutatePreview = previewMutatingTool(name, args, project.path, relPath || '');
@@ -1531,7 +1564,7 @@ async function runAgentLoop({
                   diffStats = null;
                   fileOp = null;
 
-                  if (MUTATING_TOOLS.has(name)) {
+                  if (hasProject && MUTATING_TOOLS.has(name)) {
                     try {
                       mutatePreview = previewMutatingTool(
                         name,
@@ -1788,19 +1821,21 @@ async function runAgentLoop({
       let content = msg.content || '';
       // write fences: preview diff → authorize → write only if allowed
       // Pass agentMode so plan mode cannot land fence writes.
-      const fence = await applyWriteFencesWithGate(project.path, content, {
-        gate: effectiveGate,
-        confirmTerminal,
-        settings,
-        sessionKey,
-        signal,
-        onEvent,
-        fileChanges,
-        agentMode: mode,
-      });
-      if (fence.applied.length) {
-        applied.push(...fence.applied);
-        content = fence.displayContent;
+      if (hasProject) {
+        const fence = await applyWriteFencesWithGate(project.path, content, {
+          gate: effectiveGate,
+          confirmTerminal,
+          settings,
+          sessionKey,
+          signal,
+          onEvent,
+          fileChanges,
+          agentMode: mode,
+        });
+        if (fence.applied.length) {
+          applied.push(...fence.applied);
+          content = fence.displayContent;
+        }
       }
 
       const hadSuccessfulWrite = applied.some((a) => a && a.ok && !a.error)

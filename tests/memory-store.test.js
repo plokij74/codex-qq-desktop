@@ -159,12 +159,16 @@ describe('memory-store', () => {
 
   it('appendEntry returns ok:false instead of throwing when the write fails', () => {
     const { userDataPath } = tmpDirs();
-    // A directory where the JSONL should be makes appendFileSync fail (EISDIR).
-    fs.mkdirSync(memoryFilePath({ scope: 'user', userDataPath }), { recursive: true });
+    const realAppend = fs.appendFileSync;
+    fs.appendFileSync = () => { throw new Error('EACCES: permission denied'); };
     let r;
-    assert.doesNotThrow(() => {
-      r = appendEntry({ scope: 'user', userDataPath, text: '写不进去', maxEntries: 200, now: 1 });
-    });
+    try {
+      assert.doesNotThrow(() => {
+        r = appendEntry({ scope: 'user', userDataPath, text: '写不进去', maxEntries: 200, now: 1 });
+      });
+    } finally {
+      fs.appendFileSync = realAppend;
+    }
     assert.equal(r.ok, false);
     assert.match(r.error, /写入记忆失败/);
   });
@@ -220,6 +224,56 @@ describe('memory-store', () => {
     assert.ok(seen[0].startsWith(file + '.tmp-'), seen[0]);
     assert.ok(seen[0].includes(String(process.pid)), seen[0]);
     assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((f) => /\.tmp/.test(f)), []);
+  });
+
+  it('normalizes hand-edited rows to the persisted safety limits', () => {
+    const { userDataPath } = tmpDirs();
+    const file = memoryFilePath({ scope: 'user', userDataPath });
+    fs.writeFileSync(file, JSON.stringify({
+      id: 'm_manual', text: 'x'.repeat(TEXT_MAX + 500),
+      tags: Array.from({ length: 12 }, (_, i) => ' TAG-' + i + '-'.repeat(10)),
+      createdAt: 1, source: 'tool',
+    }) + '\n');
+    const { entries } = readEntries(file, 'user');
+    assert.equal(entries[0].text.length, TEXT_MAX);
+    assert.equal(entries[0].text.endsWith('…'), true);
+    assert.equal(entries[0].tags.length, 8);
+    assert.equal(entries[0].tags.every((tag) => tag.length <= 24), true);
+  });
+
+  it('dedupes repeated over-long input after canonical truncation', () => {
+    const { userDataPath } = tmpDirs();
+    const text = 'x'.repeat(TEXT_MAX + 500);
+    const first = appendEntry({ scope: 'user', userDataPath, text, maxEntries: 200, now: 1 });
+    const second = appendEntry({ scope: 'user', userDataPath, text, maxEntries: 200, now: 2 });
+    assert.equal(second.deduped, true);
+    assert.equal(second.id, first.id);
+    assert.equal(readEntries(memoryFilePath({ scope: 'user', userDataPath }), 'user').entries.length, 1);
+  });
+
+  it('treats ENOENT as empty but surfaces other read errors', () => {
+    const { userDataPath } = tmpDirs();
+    const file = memoryFilePath({ scope: 'user', userDataPath });
+    assert.deepEqual(readEntries(file, 'user'), { entries: [], skipped: 0 });
+    const realRead = fs.readFileSync;
+    fs.readFileSync = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+    try {
+      assert.throws(() => readEntries(file, 'user'), /denied/);
+    } finally {
+      fs.readFileSync = realRead;
+    }
+  });
+
+  it('append and delete translate read failures to ok:false', () => {
+    const { userDataPath } = tmpDirs();
+    const realRead = fs.readFileSync;
+    fs.readFileSync = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+    try {
+      assert.equal(appendEntry({ scope: 'user', userDataPath, text: 'x' }).ok, false);
+      assert.equal(deleteEntry({ scope: 'user', userDataPath, id: 'm_x' }).ok, false);
+    } finally {
+      fs.readFileSync = realRead;
+    }
   });
 
   it('normalizeText folds whitespace and case', () => {

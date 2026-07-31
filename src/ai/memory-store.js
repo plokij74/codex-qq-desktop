@@ -21,6 +21,11 @@ function normalizeText(s) {
   return String(s || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+function normalizeEntryText(raw) {
+  const clean = String(raw || '').trim();
+  return clean.length > TEXT_MAX ? clean.slice(0, TEXT_MAX - 1) + '…' : clean;
+}
+
 function nextId() {
   return 'm_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
@@ -61,8 +66,9 @@ function readEntries(file, scope) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return { entries: [], skipped: 0 };
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return { entries: [], skipped: 0 };
+    throw err;
   }
   const entries = [];
   let skipped = 0;
@@ -77,8 +83,8 @@ function readEntries(file, scope) {
       }
       entries.push({
         id: String(o.id || ''),
-        text: o.text,
-        tags: Array.isArray(o.tags) ? o.tags.map((t) => String(t)) : [],
+        text: normalizeEntryText(o.text),
+        tags: normalizeTags(o.tags),
         createdAt: Number(o.createdAt) || 0,
         source: o.source === 'slash' ? 'slash' : 'tool',
         scope,
@@ -153,7 +159,7 @@ function writeAllAtomic(file, entries) {
 function appendEntry({
   scope, projectPath, userDataPath, text, tags, source, maxEntries, now,
 } = {}) {
-  const clean = String(text || '').trim();
+  const clean = normalizeEntryText(text);
   if (!clean) return { ok: false, error: '记忆内容为空' };
 
   const effectiveScope = scope === 'user' ? 'user' : 'project';
@@ -164,7 +170,12 @@ function appendEntry({
   } catch (err) {
     return { ok: false, error: err.message };
   }
-  const { entries } = readEntries(file, effectiveScope);
+  let entries;
+  try {
+    ({ entries } = readEntries(file, effectiveScope));
+  } catch (err) {
+    return { ok: false, error: '读取记忆失败：' + err.message };
+  }
 
   const key = normalizeText(clean);
   const dup = entries.find((e) => normalizeText(e.text) === key);
@@ -172,7 +183,7 @@ function appendEntry({
 
   const entry = {
     id: nextId(),
-    text: clean.length > TEXT_MAX ? clean.slice(0, TEXT_MAX - 1) + '…' : clean,
+    text: clean,
     tags: normalizeTags(tags),
     createdAt: Number.isFinite(Number(now)) ? Number(now) : Date.now(),
     source: source === 'slash' ? 'slash' : 'tool',
@@ -216,7 +227,12 @@ function deleteEntry({ id, scope, projectPath, userDataPath } = {}) {
     } catch (err) {
       return { ok: false, error: err.message };
     }
-    const { entries } = readEntries(file, sc);
+    let entries;
+    try {
+      ({ entries } = readEntries(file, sc));
+    } catch (err) {
+      return { ok: false, error: '删除记忆失败：' + err.message };
+    }
     const next = entries.filter((e) => e.id !== wanted);
     if (next.length !== entries.length) {
       // The rewrite is the only I/O that can fail here — report it, do not throw.

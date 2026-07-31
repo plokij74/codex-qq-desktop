@@ -206,4 +206,59 @@ describe('settings', () => {
     assert.equal(s3.memoryInjectTopN, 0);
     assert.equal(s3.memoryEnabled, false);
   });
+
+  it('D.3 defaults: web off, usage on', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    const s = loadSettings(dir);
+    assert.equal(s.webEnabled, false);
+    assert.equal(s.webRequireConfirm, true);
+    assert.deepEqual(s.webAllowDomains, []);
+    assert.deepEqual(s.webDenyDomains, []);
+    assert.equal(s.webTimeoutMs, 15000);
+    assert.equal(s.webMaxBytes, 524288);
+    assert.equal(s.webMaxChars, 15000);
+    assert.equal(s.usageEnabled, true);
+    assert.equal(s.usageMaxRecords, 5000);
+    assert.deepEqual(s.usagePricing, []);
+    assert.equal(s.usageCurrency, '$');
+  });
+
+  it('D.3 clamps numeric web/usage settings', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    saveSettings(dir, {
+      webTimeoutMs: 1, webMaxBytes: 99999999, webMaxChars: 999999,
+      usageMaxRecords: 1,
+    });
+    const s = loadSettings(dir);
+    assert.equal(s.webTimeoutMs, 3000);
+    assert.equal(s.webMaxBytes, 4194304);
+    assert.equal(s.webMaxChars, 50000);
+    assert.equal(s.usageMaxRecords, 500);
+  });
+
+  it('D.3 normalizes domain lists and drops junk', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    saveSettings(dir, {
+      webAllowDomains: ['  HTTPS://Example.COM/docs  ', 'example.com', '', 'a.b.cn'],
+    });
+    assert.deepEqual(loadSettings(dir).webAllowDomains, ['example.com', 'a.b.cn']);
+  });
+
+  it('D.3 sanitizes pricing rows and caps at 20', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-settings-'));
+    saveSettings(dir, {
+      usagePricing: [
+        { modelPrefix: ' gpt-4o ', inputPerM: '2.5', outputPerM: 10 },
+        { modelPrefix: '', inputPerM: 1, outputPerM: 1 },
+        { modelPrefix: 'bad', inputPerM: -5, outputPerM: 99999 },
+      ],
+      usageCurrency: '\uFFE5\uFFE5\uFFE5\uFFE5\uFFE5\uFFE5',
+    });
+    const s = loadSettings(dir);
+    assert.deepEqual(s.usagePricing, [
+      { modelPrefix: 'gpt-4o', inputPerM: 2.5, outputPerM: 10 },
+      { modelPrefix: 'bad', inputPerM: 0, outputPerM: 10000 },
+    ]);
+    assert.equal(s.usageCurrency, '\uFFE5\uFFE5\uFFE5\uFFE5');
+  });
 });

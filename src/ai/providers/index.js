@@ -37,8 +37,15 @@ function createDefaultRegistry(deps) {
   return reg;
 }
 
+function createMemoryOnlyRegistry() {
+  const reg = createRegistry();
+  reg.register(createMemoryProvider());
+  return reg;
+}
+
 module.exports = {
   createDefaultRegistry,
+  createMemoryOnlyRegistry,
   createBuiltinProvider,
   createSkillsProvider,
   createExploreProvider,

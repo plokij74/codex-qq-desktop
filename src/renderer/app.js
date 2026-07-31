@@ -1902,45 +1902,20 @@ function handleSlashCommand(text) {
     }
     return true;
   }
-  if (lower.startsWith('/remember ')) {
-    const text = cmd.slice('/remember '.length).trim();
-    if (!text) { toast('用法：/remember <要记住的事实>'); return true; }
-    const proj = sessionProject(activeSession());
-    window.codex.addMemory({ projectPath: proj?.path || null, text }).then((r) => {
-      if (!r || r.ok === false) { toast('记忆失败：' + (r?.error || '未知错误')); return; }
-      toast(r.deduped ? '已存在相同记忆' : ('已记住（' + (r.scope === 'user' ? '用户级' : '项目级') + '）'));
-    }).catch((e) => toast(e.message || String(e)));
-    return true;
-  }
-  if (lower === '/memory') {
-    const proj = sessionProject(activeSession());
-    window.codex.listMemory({ projectPath: proj?.path || null }).then((r) => {
-      if (!r || r.ok === false) { toast(r?.error || '读取记忆失败'); return; }
-      const lines = (r.entries || []).map((e) => {
-        const scope = e.scope === 'user' ? '用户' : '项目';
-        const text = e.text.length > 60 ? (e.text.slice(0, 60) + '…') : e.text;
-        return `- \`${e.id}\` (${scope}) ${text}`;
-      });
-      const head = `长期记忆：项目级 ${r.counts?.project ?? 0} 条，用户级 ${r.counts?.user ?? 0} 条`
-        + (r.skipped ? `（跳过 ${r.skipped} 行损坏数据）` : '');
-      activeSession().messages.push({
-        role: 'assistant',
-        content: lines.length ? (head + '\n' + lines.join('\n') + '\n\n删除用 /forget <id>') : (head + '\n暂无记忆。用 /remember <事实> 添加。'),
-      });
-      saveState(); renderMessages();
-    }).catch((e) => toast(e.message || String(e)));
-    return true;
-  }
-  if (lower.startsWith('/forget ')) {
-    const id = cmd.slice('/forget '.length).trim();
-    if (!id) { toast('用法：/forget <id>，id 用 /memory 查看'); return true; }
-    const proj = sessionProject(activeSession());
-    window.codex.deleteMemory({ projectPath: proj?.path || null, id }).then((r) => {
-      if (!r || r.ok === false) { toast('删除失败：' + (r?.error || '未知错误')); return; }
-      toast(r.removed ? '已删除该条记忆' : '未找到该 id');
-    }).catch((e) => toast(e.message || String(e)));
-    return true;
-  }
+  const memorySession = activeSession();
+  if (window.CodexMemoryCommands?.handleMemoryCommand(cmd, {
+    session: memorySession,
+    projectPath: sessionProject(memorySession)?.path || null,
+    addMemory: (payload) => window.codex.addMemory(payload),
+    listMemory: (payload) => window.codex.listMemory(payload),
+    deleteMemory: (payload) => window.codex.deleteMemory(payload),
+    toast,
+    onMessagesChanged: (session) => {
+      session.updatedAt = Date.now();
+      saveState();
+      if (activeSession() === session) renderMessages();
+    },
+  })) return true;
   if (lower.startsWith('/skill ')) {
     const name = cmd.slice(7).trim();
     const proj = sessionProject(activeSession());
@@ -2364,9 +2339,8 @@ async function renderMemoryList() {
     del.addEventListener('click', async () => {
       try {
         const r = await window.codex.deleteMemory({ projectPath, id: e.id, scope: e.scope });
-        if (!r || r.ok === false) { toast('删除失败：' + (r?.error || '未知错误')); return; }
-        toast('已删除');
-        renderMemoryList();
+        toast(window.CodexMemoryCommands.deleteResultMessage(r));
+        if (r?.ok !== false && r?.removed) renderMemoryList();
       } catch (err) {
         toast('删除失败：' + (err.message || String(err)));
       }

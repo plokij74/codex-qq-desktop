@@ -156,14 +156,18 @@ function createMemoryProvider() {
         const { projectPath, userDataPath } = pathsFor(ctx);
         const { entries } = store.readAll({ projectPath, userDataPath });
         if (!entries.length) return '';
+        const memoryInjectMaxTokens = clampInt(ctx?.settings?.memoryInjectMaxTokens, 200, 8000, 1200);
         const picked = selectForInjection(entries, {
           queryText: ctx?.extensions?.userPromptText || '',
           topN: clampInt(ctx?.settings?.memoryInjectTopN, 0, 30, 8),
-          maxApproxTokens: clampInt(ctx?.settings?.memoryInjectMaxTokens, 200, 8000, 1200),
+          maxApproxTokens: memoryInjectMaxTokens,
           now: Date.now(),
         });
         // plan mode withholds remember (see getTools) — don't advertise it.
-        return formatInjection(picked, { writeHint: normalizeMode(ctx?.agentMode) !== 'plan' });
+        return formatInjection(picked, {
+          writeHint: normalizeMode(ctx?.agentMode) !== 'plan',
+          maxApproxTokens: memoryInjectMaxTokens,
+        });
       } catch {
         // A broken store must never break the run.
         return '';

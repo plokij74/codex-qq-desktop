@@ -406,5 +406,8 @@ describe('permission', () => {
     const r = await gate.authorize({ tool: 'remember' });
     assert.equal(r.allowed, false);
     assert.match(r.reason, /计划模式/);
+    const f = await gate.authorize({ tool: 'forget' });
+    assert.equal(f.allowed, false);
+    assert.match(f.reason, /计划模式/);
   });
 });

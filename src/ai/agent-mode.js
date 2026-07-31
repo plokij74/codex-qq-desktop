@@ -24,6 +24,15 @@ function normalizeAgentMode(value) {
   return value === 'plan' ? 'plan' : 'agent';
 }
 
+function shouldUseAgent({ settings, project } = {}) {
+  return Boolean(
+    settings?.mode === 'api'
+      && settings?.agentEnabled !== false
+      && settings?.apiKey
+      && (project?.path || settings?.memoryEnabled !== false)
+  );
+}
+
 /**
  * @param {string} risk
  * @returns {boolean}
@@ -90,6 +99,7 @@ module.exports = {
   PLAN_HIDDEN_TOOLS,
   PLAN_MARKDOWN_MAX,
   normalizeAgentMode,
+  shouldUseAgent,
   isPlanBlockedRisk,
   filterToolsForMode,
   makePlanId,

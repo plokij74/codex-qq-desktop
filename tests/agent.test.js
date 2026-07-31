@@ -10,7 +10,10 @@ const {
   runAgentLoop,
   TOOL_DEFS,
   toolsForSettings,
+  createDefaultRegistry,
 } = require('../src/ai/agent');
+const { createMemoryOnlyRegistry } = require('../src/ai/providers');
+const { memoryFilePath, readEntries } = require('../src/ai/memory-store');
 const { createPermissionGate } = require('../src/ai/permission');
 const { AGENT_EVENTS } = require('../src/ai/agent-events');
 const { isBlockedCommand, runTerminal } = require('../src/ai/terminal');
@@ -742,6 +745,136 @@ describe('agent tools', () => {
       { agentMode: 'agent' },
     )).map((t) => t.function.name);
     assert.ok(!names.includes('list_skills'));
+  });
+
+  it('runAgentLoop supports an unbound memory-only chat', async () => {
+    const userDataPath = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-memory-only-'));
+    let turn = 0;
+    const chatFn = async (opts) => {
+      turn += 1;
+      if (turn === 1) {
+        const names = (opts.tools || []).map((t) => t.function.name).sort();
+        assert.deepEqual(names, ['forget', 'recall', 'remember']);
+        const systemText = String((opts.messages || []).find((m) => m.role === 'system')?.content || '');
+        assert.match(systemText, /未绑定本地项目目录/);
+        assert.match(systemText, /只能使用本轮实际提供的非项目工具/);
+        assert.equal(systemText.includes('项目根目录（真实路径）'), false);
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'remember_unbound',
+            type: 'function',
+            function: {
+              name: 'remember',
+              arguments: JSON.stringify({ text: '回答一律使用简体中文' }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '已经记住' };
+    };
+
+    const result = await runAgentLoop({
+      project: null,
+      settings: {
+        terminalEnabled: false,
+        memoryEnabled: true,
+        memoryMaxEntries: 200,
+        maxAgentTurns: 4,
+        permissionMode: 'full-auto',
+      },
+      messages: [{ role: 'user', content: '以后请用中文回答' }],
+      gate: fullAutoGate(),
+      chatFn,
+      registry: createMemoryOnlyRegistry(),
+      extensions: { userDataPath },
+      sessionKey: 'memory-only-unbound',
+    });
+
+    const file = memoryFilePath({ scope: 'user', userDataPath });
+    const { entries } = readEntries(file, 'user');
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].text, '回答一律使用简体中文');
+    assert.match(result.content, /已经记住/);
+  });
+
+  it('unbound chats reject a project-capable registry', async () => {
+    await assert.rejects(
+      () => runAgentLoop({
+        project: null,
+        settings: { terminalEnabled: false, maxAgentTurns: 1 },
+        messages: [{ role: 'user', content: 'hi' }],
+        gate: fullAutoGate(),
+        chatFn: async () => ({ role: 'assistant', content: 'nope' }),
+        registry: createDefaultRegistry(),
+        sessionKey: 'unsafe-unbound-registry',
+      }),
+      /项目目录|memory-only|记忆专用/,
+    );
+  });
+
+  it('memory write approval summaries preview remember text and forget id', async () => {
+    const approvals = [];
+    const rawText = `  ${'x'.repeat(40)}   ${'y'.repeat(39)}Z_FORBIDDEN  `;
+    const expectedPreview = `${'x'.repeat(40)} ${'y'.repeat(39)}`;
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'remember_preview',
+            type: 'function',
+            function: { name: 'remember', arguments: JSON.stringify({ text: rawText }) },
+          }],
+        };
+      }
+      if (turn === 2) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'forget_preview',
+            type: 'function',
+            function: { name: 'forget', arguments: JSON.stringify({ id: 'm_forget_123' }) },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '未写入' };
+    };
+
+    await runAgentLoop({
+      project: null,
+      settings: {
+        terminalEnabled: false,
+        hooksEnabled: false,
+        verifyBeforeDone: false,
+        memoryEnabled: true,
+        maxAgentTurns: 4,
+        permissionMode: 'confirm-writes',
+      },
+      messages: [{ role: 'user', content: '记住一条很长的事实' }],
+      gate: {
+        authorize: async (request) => {
+          approvals.push(request);
+          return { allowed: false, reason: 'test deny' };
+        },
+      },
+      chatFn,
+      registry: createMemoryOnlyRegistry(),
+      extensions: { userDataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agent-memory-preview-')) },
+      sessionKey: 'memory-preview',
+    });
+
+    assert.equal(approvals.length, 2);
+    assert.equal(approvals[0].tool, 'remember');
+    assert.ok(String(approvals[0].summary).includes(expectedPreview));
+    assert.equal(String(approvals[0].summary).includes('Z_FORBIDDEN'), false);
+    assert.equal(approvals[1].tool, 'forget');
+    assert.match(String(approvals[1].summary), /m_forget_123/);
   });
 
   it('plan mode submit_plan emits plan-ready', async () => {

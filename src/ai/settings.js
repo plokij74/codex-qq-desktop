@@ -40,6 +40,19 @@ const DEFAULT_SETTINGS = {
   memoryMaxEntries: 200, // clamp 20..2000
   memoryInjectTopN: 8, // clamp 0..30; 0 = 不注入，只保留 recall 工具
   memoryInjectMaxTokens: 1200, // clamp 200..8000; 复用 char/4 估算
+  // Phase D.3 web fetch
+  webEnabled: false,
+  webRequireConfirm: true,
+  webAllowDomains: [], // 空 = 不限制公网域名；私网硬拦不受此影响
+  webDenyDomains: [],
+  webTimeoutMs: 15000, // clamp 3000..60000
+  webMaxBytes: 524288, // clamp 32768..4194304
+  webMaxChars: 15000, // clamp 1000..50000
+  // Phase D.3 usage metering
+  usageEnabled: true,
+  usageMaxRecords: 5000, // clamp 500..50000
+  usagePricing: [], // { modelPrefix, inputPerM, outputPerM }[]，上限 20 行
+  usageCurrency: '$',
 };
 
 function getSettingsPath(userDataPath) {
@@ -76,6 +89,76 @@ function clampMemorySettings(s) {
   return s;
 }
 
+const DOMAIN_LIST_MAX = 100;
+const PRICING_ROWS_MAX = 20;
+
+/** Phase D.3: '  HTTPS://Example.COM/docs ' → 'example.com'；不合法返回 ''。 */
+function normalizeDomainEntry(raw) {
+  let s = String(raw ?? '').trim().toLowerCase();
+  if (!s) return '';
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, ''); // 剥协议
+  s = s.split('/')[0].split('?')[0].split('#')[0];
+  s = s.replace(/^\[|\]$/g, '').split(':')[0]; // 剥端口与 v6 方括号
+  s = s.replace(/^\.+|\.+$/g, '');
+  if (!s || /\s/.test(s)) return '';
+  return s;
+}
+
+function normalizeDomainList(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const item of list) {
+    const d = normalizeDomainEntry(item);
+    if (d && !out.includes(d)) out.push(d);
+    if (out.length >= DOMAIN_LIST_MAX) break;
+  }
+  return out;
+}
+
+function clampFloat(v, min, max, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+/** Phase D.3: 价格行归一化；modelPrefix 为空的行整行丢弃。 */
+function sanitizePricing(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const row of list) {
+    const modelPrefix = String(row?.modelPrefix ?? '').trim();
+    if (!modelPrefix) continue;
+    out.push({
+      modelPrefix,
+      inputPerM: clampFloat(row?.inputPerM, 0, 10000, 0),
+      outputPerM: clampFloat(row?.outputPerM, 0, 10000, 0),
+    });
+    if (out.length >= PRICING_ROWS_MAX) break;
+  }
+  return out;
+}
+
+/** Phase D.3: normalize web settings in place; shared by load/save and main. */
+function clampWebSettings(s) {
+  s.webEnabled = s.webEnabled === true;
+  s.webRequireConfirm = s.webRequireConfirm !== false;
+  s.webAllowDomains = normalizeDomainList(s.webAllowDomains);
+  s.webDenyDomains = normalizeDomainList(s.webDenyDomains);
+  s.webTimeoutMs = clampInt(s.webTimeoutMs, 3000, 60000, 15000);
+  s.webMaxBytes = clampInt(s.webMaxBytes, 32768, 4194304, 524288);
+  s.webMaxChars = clampInt(s.webMaxChars, 1000, 50000, 15000);
+  return s;
+}
+
+/** Phase D.3: normalize usage settings in place; shared by load/save and main. */
+function clampUsageSettings(s) {
+  s.usageEnabled = s.usageEnabled !== false;
+  s.usageMaxRecords = clampInt(s.usageMaxRecords, 500, 50000, 5000);
+  s.usagePricing = sanitizePricing(s.usagePricing);
+  s.usageCurrency = String(s.usageCurrency ?? '$').slice(0, 4) || '$';
+  return s;
+}
+
 function loadSettings(userDataPath) {
   const file = getSettingsPath(userDataPath);
   try {
@@ -85,7 +168,9 @@ function loadSettings(userDataPath) {
     merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
     merged.mcpServers = sanitizeMcpServers(merged.mcpServers);
     clampCompactSettings(merged);
-    return clampMemorySettings(merged);
+    clampMemorySettings(merged);
+    clampWebSettings(merged);
+    return clampUsageSettings(merged);
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -97,6 +182,8 @@ function saveSettings(userDataPath, partial) {
   next.mcpServers = sanitizeMcpServers(next.mcpServers);
   clampCompactSettings(next);
   clampMemorySettings(next);
+  clampWebSettings(next);
+  clampUsageSettings(next);
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
   return next;
@@ -110,4 +197,8 @@ module.exports = {
   clampInt,
   clampCompactSettings,
   clampMemorySettings,
+  clampWebSettings,
+  clampUsageSettings,
+  sanitizePricing,
+  normalizeDomainList,
 };
