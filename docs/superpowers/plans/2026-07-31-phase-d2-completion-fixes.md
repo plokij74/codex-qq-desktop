@@ -34,7 +34,7 @@
 - Add internal `normalizeEntryText(raw) -> string` and use it before dedupe and persistence.
 - `readEntries(file, scope)` returns an empty store only for `ENOENT`; it throws other I/O errors for callers to translate.
 
-- [ ] **Step 1: Add failing storage regression tests**
+- [x] **Step 1: Add failing storage regression tests**
 
 Append tests equivalent to:
 
@@ -85,13 +85,13 @@ it('append and delete translate read failures to ok:false', () => {
 });
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test tests/memory-store.test.js`
 
 Expected: the new assertions fail because over-long input is deduped before truncation, hand-edited rows are not normalized, and `EACCES` is swallowed.
 
-- [ ] **Step 3: Implement canonical storage boundaries**
+- [x] **Step 3: Implement canonical storage boundaries**
 
 Use one canonical text function for input and parsed rows:
 
@@ -104,7 +104,7 @@ function normalizeEntryText(raw) {
 
 In `readEntries`, catch only `ENOENT`; rethrow all other read errors. Normalize `text` and `tags` before returning an entry. In `appendEntry`, canonicalize before deriving the dedupe key. Wrap its read in the existing `{ ok:false }` operation contract. In `deleteEntry`, translate a read failure to `{ ok:false, error:'删除记忆失败：...' }`.
 
-- [ ] **Step 4: Run GREEN and adjacent tests**
+- [x] **Step 4: Run GREEN and adjacent tests**
 
 Run:
 
@@ -114,7 +114,7 @@ node --test tests/memory-store.test.js tests/memory-ipc.test.js tests/memory-pro
 
 Expected: all pass.
 
-- [ ] **Step 5: Record report**
+- [x] **Step 5: Record report**
 
 Write the RED command/output, implementation summary, GREEN command/output, and self-review to the task report. Git commit may remain pending because the sandbox has a read-only Git index.
 
@@ -133,7 +133,7 @@ Write the RED command/output, implementation summary, GREEN command/output, and 
 - Extend `formatInjection(entries, { writeHint?, maxApproxTokens? }) -> string`.
 - The provider passes its clamped `memoryInjectMaxTokens` to both selection and final formatting.
 
-- [ ] **Step 1: Add failing final-fragment budget tests**
+- [x] **Step 1: Add failing final-fragment budget tests**
 
 Add literal-budget assertions:
 
@@ -159,19 +159,19 @@ it('caps hand-edited oversized entries without losing the boundary header', () =
 
 Add a provider test that writes or supplies a maximum-size entry, sets `memoryInjectMaxTokens: 200`, and asserts the complete `getSystemFragment` result is at most 200 approximate tokens.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test tests/memory-recall.test.js tests/memory-provider.test.js`
 
 Expected: complete fragments exceed 200 approximate tokens.
 
-- [ ] **Step 3: Bound the final formatter**
+- [x] **Step 3: Bound the final formatter**
 
 Build the fragment from fixed header/footer and entry lines under `maxApproxTokens * 4` characters, because D.1 defines `approxTokensFromText` as `ceil(chars / 4)`. Fold whitespace before measuring. Add complete lines while they fit; if the first line does not fit, keep its scope prefix and a truncated text ending in `…`. Return `''` only if even the fixed security header cannot fit. Do not slice the already-joined block because that can cut the boundary header or create a malformed line.
 
 Pass the same clamped budget from `getSystemFragment` into `formatInjection`.
 
-- [ ] **Step 4: Run GREEN and mutation checks**
+- [x] **Step 4: Run GREEN and mutation checks**
 
 Run:
 
@@ -182,7 +182,7 @@ node -e "const r=require('./src/ai/memory-recall');const c=require('./src/ai/ses
 
 Expected: all tests pass and the probe prints a value no greater than 200.
 
-- [ ] **Step 5: Record report**
+- [x] **Step 5: Record report**
 
 Record RED/GREEN evidence and self-review.
 
@@ -205,7 +205,7 @@ Record RED/GREEN evidence and self-review.
 - Add `shouldUseAgent({ settings, project }) -> boolean`, exporting it from `agent-mode.js` and consuming it in main.
 - `runAgentLoop` accepts `project: null` only when its supplied registry is safe for that context.
 
-- [ ] **Step 1: Add failing routing and unbound-loop tests**
+- [x] **Step 1: Add failing routing and unbound-loop tests**
 
 Add routing expectations:
 
@@ -224,7 +224,7 @@ Add an Agent integration test using `createMemoryOnlyRegistry`, a temporary `use
 
 Add a confirm-writes integration assertion that a `remember` approval summary contains at most the first 80 characters of its text. Strengthen the existing plan-mode assertions so both `remember` and `forget` are absent/blocked.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -234,7 +234,7 @@ node --test tests/agent-mode.test.js tests/agent.test.js tests/permission.test.j
 
 Expected: routing helper/export is absent, unbound `runAgentLoop` throws, and approval summary is only `remember`.
 
-- [ ] **Step 3: Implement the memory-only path**
+- [x] **Step 3: Implement the memory-only path**
 
 In `providers/index.js`, create a registry containing only `createMemoryProvider()`.
 
@@ -251,7 +251,7 @@ In `runAgentLoop`:
 
 Add `remember` and `forget` cases to `toolSummary`; `remember` uses the first 80 characters of normalized text.
 
-- [ ] **Step 4: Run GREEN and focused integration**
+- [x] **Step 4: Run GREEN and focused integration**
 
 Run:
 
@@ -263,7 +263,7 @@ node --check src/main.js
 
 Expected: all pass.
 
-- [ ] **Step 5: Record report**
+- [x] **Step 5: Record report**
 
 Record RED/GREEN evidence and explicitly list the unbound tool names observed by the fake model.
 
@@ -282,7 +282,7 @@ Record RED/GREEN evidence and explicitly list the unbound tool names observed by
 - `deps` contains the captured `session`, `projectPath`, memory IPC functions, `toast`, and `onMessagesChanged(session)`.
 - Export `deleteResultMessage(result) -> string` for settings-list deletion feedback.
 
-- [ ] **Step 1: Create the failing CommonJS tests**
+- [x] **Step 1: Create the failing CommonJS tests**
 
 Test these observable behaviors with real promises and dependency functions:
 
@@ -361,19 +361,19 @@ it('returns false for unrelated slash commands', () => {
 
 The async race test passes session A in `deps`, changes a separate active-session variable to B before resolving `listMemory`, and asserts only A receives the assistant message.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test tests/renderer-memory-commands.test.js`
 
 Expected: module not found.
 
-- [ ] **Step 3: Implement and wire the controller**
+- [x] **Step 3: Implement and wire the controller**
 
 Create a dependency-injected module with no DOM access. Recognize both the bare command and the command-plus-argument forms. Capture the passed session before starting any promise. For `/memory`, append to that captured session and call `onMessagesChanged(session)`.
 
 Load `memory-commands.js` before `app.js` in `index.html`. Replace the three inline memory branches in `handleSlashCommand` with one delegation call. In `renderMemoryList`, use `deleteResultMessage` so `{ ok:true, removed:false }` is not reported as deleted.
 
-- [ ] **Step 4: Run GREEN and syntax checks**
+- [x] **Step 4: Run GREEN and syntax checks**
 
 Run:
 
@@ -385,7 +385,7 @@ node --check src/renderer/app.js
 
 Expected: all pass.
 
-- [ ] **Step 5: Record report**
+- [x] **Step 5: Record report**
 
 Record RED/GREEN evidence and self-review.
 
@@ -397,7 +397,7 @@ Record RED/GREEN evidence and self-review.
 - Modify: `.superpowers/sdd/2026-07-31-phase-d2-completion-fixes/progress.md`
 - No production edits unless review finds a defect.
 
-- [ ] **Step 1: Run the complete D.2-focused suite**
+- [x] **Step 1: Run the complete D.2-focused suite**
 
 Run:
 
@@ -405,7 +405,7 @@ Run:
 node --test tests/settings.test.js tests/memory-store.test.js tests/memory-recall.test.js tests/permission.test.js tests/memory-provider.test.js tests/memory-ipc.test.js tests/agent-mode.test.js tests/agent.test.js tests/renderer-memory-commands.test.js
 ```
 
-- [ ] **Step 2: Run the broad suite excluding the intentional D.3 RED file**
+- [x] **Step 2: Run the broad suite excluding the intentional D.3 RED file**
 
 Run:
 
@@ -415,7 +415,7 @@ node --test (Get-ChildItem tests -Filter '*.test.js' -Recurse | Where-Object { $
 
 Expected: all executed tests pass. Also run `npm test` and confirm its only failure remains `tests/web-fetch.test.js` requiring the not-yet-created D.3 module.
 
-- [ ] **Step 3: Run syntax and diff hygiene checks**
+- [x] **Step 3: Run syntax and diff hygiene checks**
 
 Run:
 
@@ -430,10 +430,18 @@ node --check src/renderer/app.js
 git diff --check
 ```
 
-- [ ] **Step 4: Dispatch final D.2 completion review**
+- [x] **Step 4: Dispatch final D.2 completion review**
 
 The reviewer receives the task reports and a working-tree review package containing only this repair plan's files. It must separately verdict spec compliance and code quality, and re-check the previously verified probes.
 
-- [ ] **Step 5: Update the ledger**
+- [x] **Step 5: Update the ledger**
 
 Record test totals, the expected D.3-only failure, final review verdict, deferred minors, and the fact that Git commits remain pending if the read-only index still blocks them.
+
+#### Task 5 completion record (2026-08-02)
+
+- D.2 专项：`161` tests，`160` pass、`1` skip（宿主没有 `powershell.exe`）。
+- 宽回归（排除 `tests/web-fetch.test.js`）：`429` tests，`427` pass、`2` skip（宿主没有 `powershell.exe`）。
+- 上述两项是 D.3 `web-fetch` 进入 GREEN 前的 D.2 检查点记录；当前完整 `npm test`：`461` tests，`459` pass、`0` fail、`2` skip（宿主没有 `powershell.exe`）。
+- `node --check`（D.2 相关主进程、preload、renderer 文件）和 `git diff --check` 通过。
+- 最终只读复审：无 Critical、Important 或 Minor findings；无 deferred minors。

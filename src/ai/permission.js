@@ -26,6 +26,7 @@ function riskForTool(toolName) {
   if (name.startsWith('mcp_')) return 'mcp';
   if (READ_TOOLS.has(name)) return 'read';
   if (WRITE_TOOLS.has(name)) return 'write';
+  if (name === 'web_fetch') return 'network';
   if (name === 'delete_path') return 'delete';
   if (name === 'run_terminal') return 'terminal';
   return 'write';
@@ -79,6 +80,8 @@ function createPermissionGate({
   permissionMode = 'confirm-writes',
   terminalEnabled = false,
   terminalRequireConfirm = true,
+  webEnabled = false,
+  webRequireConfirm = true,
   agentMode = 'agent',
   onApprovalNeeded,
 } = {}) {
@@ -140,6 +143,7 @@ function createPermissionGate({
           summary: payload.summary,
           detail: payload.detail,
           path: payload.path,
+          scope: payload.scope,
           diff: payload.diff, // may be undefined
         });
       }
@@ -160,7 +164,7 @@ function createPermissionGate({
   }
 
   async function authorize({
-    tool, risk, summary, detail, path, sessionKey, signal, diff, agentMode: callAgentMode,
+    tool, risk, summary, detail, path, scope, sessionKey, signal, diff, agentMode: callAgentMode,
   } = {}) {
     const effectiveRisk = risk || riskForTool(tool);
     const mode = normalizeAgentMode(
@@ -179,6 +183,31 @@ function createPermissionGate({
     // Terminal disabled always denies terminal tools
     if (effectiveRisk === 'terminal' && terminalEnabled === false) {
       return { allowed: false, reason: '终端未启用，不允许执行终端命令' };
+    }
+
+    // Network access has its own switch and approval policy. In particular,
+    // read-only protects disk writes but still requires approval for egress.
+    if (effectiveRisk === 'network') {
+      if (webEnabled === false) {
+        return { allowed: false, reason: '网页访问未启用，请在设置中打开' };
+      }
+      if (permissionMode === 'full-auto' && webRequireConfirm === false) {
+        return { allowed: true };
+      }
+      const allowKey = scope ? `network:${scope}` : 'network';
+      if (isSessionAllowed(sessionKey, allowKey)) {
+        return { allowed: true };
+      }
+      const decision = await waitForApproval(
+        { tool, risk: effectiveRisk, summary, detail, path, scope, diff },
+        signal,
+      );
+      if (decision.decision === 'allow_session') {
+        rememberSession(sessionKey, allowKey);
+        return { allowed: true };
+      }
+      if (decision.decision === 'allow') return { allowed: true };
+      return { allowed: false, reason: '用户拒绝' };
     }
 
     if (permissionMode === 'read-only') {

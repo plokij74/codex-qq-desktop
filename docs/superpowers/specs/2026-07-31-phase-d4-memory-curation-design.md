@@ -2,7 +2,7 @@
 
 **日期:** 2026-07-31
 **项目:** `codex-qq-desktop`
-**状态:** 已批准（brainstorming）
+**状态:** 已完成本轮设计，待用户复核
 **前置:** Phase D.3 网页读取与用量计量（设计已批准；D.4 实施前须先完成 D.3 实施与回归）
 
 **依据:**
@@ -112,7 +112,7 @@ Renderer session.messages
   |
   | /compact | 按钮 | send 前 auto compact
   v
-session:compact({ messages, force, candidateLimit })
+session:compact({ sessionId, messages, force, candidateLimit })
   |
   +--> planCompact(messages)
   |       `-- older + keep
@@ -184,7 +184,7 @@ D.4 规格可以先落文档，但实施必须基于已完成的 D.3：
 3. main 已有 compact usage 的单点落盘与 renderer 转发方式；
 4. D.3 全量测试已绿。
 
-D.4 的 `generateMemoryCandidates` 采用与 `generateCompactSummary` 相同的 `onUsage` 契约，不另建 usage 写点。
+D.4 的 `generateMemoryCandidates` 采用与 `generateCompactSummary` 相同的 `onUsage` 契约，不另建 usage 写点。Renderer 传入 `sessionId`，main 用它作为 usage 的 session key；usage 落盘和 renderer 转发仍由 main 的既有 D.3 callback 负责。
 
 `session-compact.js` 新增可注入、可单测的编排 helper：
 
@@ -194,7 +194,7 @@ generateCompactArtifacts({
 }) -> Promise<{ summary, candidates, candidateWarning }>
 ```
 
-它必须先 await summary；summary 失败原样抛出且不调用 candidates。summary 成功后才调用候选提炼，并只捕获候选分支错误，将其转成空数组与稳定 warning。`main.js` 的 IPC handler 只负责 plan、调用该 helper、apply 与响应组装，避免 Electron handler 承担不可单测的失败语义。
+它必须先 await summary；summary 失败原样抛出且不调用 candidates。summary 成功后才调用候选提炼，并只捕获候选分支错误，将其转成空数组与稳定 warning。helper 给两次模型调用包一层 best-effort usage reporter：`onUsage` 抛错或返回 rejected Promise 都不能改变 compact 成功/失败边界。`main.js` 的 IPC handler 只负责 plan、调用该 helper、apply 与响应组装，避免 Electron handler 承担不可单测的失败语义。
 
 ---
 
@@ -239,6 +239,7 @@ candidateLimit = Math.max(
 ```js
 {
   force: true | false,
+  sessionId: session.id,
   messages: [...],
   candidateLimit: 0..5
 }
@@ -281,6 +282,8 @@ main 必须独立 clamp `candidateLimit` 到 `0..5`；不能信任 renderer 传�
 候选 UI 的失败不能阻止 messages 落 localStorage。Renderer 必须先应用成功的 compact 结果，再处理候选合并。
 
 手动 compact 完成后，只要当前 session 的待审核总数 > 0（包括压缩前已有候选），就打开候选箱；这样候选箱已满或本批提炼失败时，用户仍能处理旧候选腾出空间。
+
+手动 compact 如果返回 `needed:false`，虽然不改变消息，也要沿用“无需压缩”反馈；只要当前 session 已有待审核候选，仍打开候选箱。自动 compact 在 `needed:false` 时不打开候选箱。
 
 ---
 
@@ -343,11 +346,10 @@ system prompt 必须声明：
 2. 剥单层完整 JSON 围栏；
 3. `JSON.parse`；
 4. 校验顶层 `candidates` array；
-5. 只保留允许字段并做 text/tags/evidence 长度规范化；
-6. 将 transcript 与 evidence 都折叠连续空白后，用精确 substring 校验证据；
-7. 过滤疑似敏感值；
-8. 按 `normalizeText(text)` 做批内去重；
-9. 截到 `candidateLimit`。
+5. 对原始 trim 后的 `text` 与 `evidence` 先做敏感值检查，再按字段上限截断并规范化 tags；
+6. 将 serialized transcript 与 evidence 都折叠连续空白后，用精确 substring 校验证据；不得添加 transcript 中不存在的“用户：”等前缀；
+7. 候选模型不输出 scope，因此 parser 在单批内先按 `normalizeText(text)` 去重；候选赋予 scope 后，renderer 再按“同一 scope + `normalizeText(text)`”去重；
+8. 截到 `candidateLimit`。
 
 任一步的**响应级**错误使整批降级为空；单条字段、证据或敏感检查失败只丢该条。
 
@@ -363,19 +365,21 @@ system prompt 必须声明：
 
 检查 `text` 与 `evidence`。这是降低误收的第二道防线，不承诺识别所有秘密；最终安全边界仍是人工审核和“永不自动写盘”。
 
+候选被用户编辑后接受时，`memory:accept` 在 main 侧再次检查**原始 text 与全部 tags** 的敏感值；检查发生在 memory store 的截断/规范化前，命中则返回不含原文的固定错误并保留候选。该复检只约束 compact 候选接受，不改变已有 `/remember`（`memory:add`）契约，也不把 evidence 送入 IPC。
+
 ### 5.6 去重
 
 去重分三层：
 
-1. main 在当前模型批次内按 `normalizeText(text)` 去重；
-2. renderer 合并时对当前 session 待审核候选去重；
-3. renderer 打开审核前 best-effort 调 `memory:list`，过滤与已存记忆精确重复的候选；若列表失败，不阻断审核，最终由 D.2 `appendEntry` 再次去重。
+1. parser 在当前模型批次内按 `normalizeText(text)` 去重（模型响应尚未带 scope）；
+2. renderer 赋予 scope 后，对当前 session 待审核候选按“同一 scope + `normalizeText(text)`”去重；project/user 两层允许相同文本；
+3. renderer 打开审核前 best-effort 调 `memory:list`，只过滤与同 scope 已存记忆精确重复且尚未被编辑的候选；若列表失败，不阻断审核，最终由 D.2 `appendEntry` 再次去重。
 
-本期不做语义近似去重；措辞不同的近似条目交给用户审核，避免引入 embedding 或激进字符串算法。
+本期不做语义近似去重；措辞不同的近似条目交给用户审核，避免引入 embedding 或激进字符串算法。用户编辑 text/tags/scope 后即使产生重复，也不在保存或打开审核时静默删除，留到接受阶段由 `deduped` 结果处理。
 
 ### 5.7 usage
 
-`generateMemoryCandidates({ transcript, settings, limit, chatFn, signal, onUsage })` 与 D.3 compact summary 复用同一 callback 形状。模型响应到达后先上报 usage，再解析候选，因此 JSON 非法仍记录已发生的真实消耗。kind 固定为 `compact`。
+`generateMemoryCandidates({ transcript, settings, limit, chatFn, signal, onUsage })` 与 D.3 compact summary 复用同一 callback 形状：每次真实模型响应最多调用一次 `onUsage({ rawUsage, messages, content })`，`rawUsage` 可为 `null`。模型响应到达后先上报 usage，再解析候选，因此 JSON 非法仍记录已发生的真实消耗。kind 固定为 `compact`。
 
 ---
 
@@ -396,6 +400,7 @@ Renderer 保存规范化后的候选：
     "id": "project_123",
     "path": "D:/repo"
   },
+  "edited": false,
   "createdAt": 1785480000000
 }
 ```
@@ -407,6 +412,7 @@ Renderer 保存规范化后的候选：
 | `evidence` | 只读、可展开；接受后不写入长期记忆 |
 | `scope` | `project | user`；按会话绑定设置默认值，用户可在接受前切换 |
 | `projectRef` | project 候选产生或被切换为 project 时的 `{ id, path }` 快照；user 候选为 `null` |
+| `edited` | renderer-only 标记；text/tags/scope 被用户改过后为 `true`，避免 best-effort store dedupe 静默丢掉用户草稿；不进入 accept payload |
 | `createdAt` | 候选产生时间，用于稳定排序；不是最终记忆 `createdAt` |
 
 候选不需要保存 `sessionId`，因为数组本身嵌在对应 session 中。
@@ -424,6 +430,7 @@ session.pendingMemoryCandidates = [];
 为避免把状态规则继续堆进已很大的 `app.js`，`memory-candidate-state.js` 固定导出：
 
 ```js
+candidateKey(candidate)
 normalizePendingCandidates(raw, { max = 20 })
 mergePendingCandidates(existing, incoming, { max = 20 })
 removePendingCandidates(existing, ids)
@@ -432,11 +439,14 @@ candidateLimit(existing, { perBatch = 5, max = 20 })
 
 文件不依赖 DOM：在 Node 下走 `module.exports` 供 `node:test` 使用，在 sandboxed renderer 中挂只读 `window.MemoryCandidateState`，并由 `index.html` 在 `app.js` 前加载。业务 UI 只消费这些纯函数，不在 `app.js` 复制第二套规范化与上限逻辑。
 
+`normalizePendingCandidates` 只规范化每行并保留合法顺序，不因 text 重复而静默删除；`mergePendingCandidates` 只对 incoming 与既有候选做同 scope exact dedupe，并保留旧候选优先。这样用户输入为空或编辑成重复文本时，草稿仍可保存、显示错误并在接受阶段处理。
+
 ### 6.3 合并与上限
 
 - 每会话固定上限 20；
 - 先保留既有候选，再按模型返回顺序添加新且不重复的候选；
 - 空间不足时丢弃**新增尾部**，不静默淘汰尚未审核的旧候选；
+- project/user 作用域的相同文本分别计数，允许两层各有一条；
 - UI 提示“候选箱已满，部分新候选未保存”；
 - 候选箱已满时下一次 `candidateLimit === 0`，从源头跳过额外模型调用。
 
@@ -476,6 +486,8 @@ D.1 JSON 导出本来只挑选固定 session 字段，不包含 `pendingMemoryCa
 `source: 'compact'` 只适用于本次真正追加的新条目。若候选与已有 `tool` / `slash` / `compact` 条目精确重复，返回该已有条目的 id 与 `deduped: true`，不得为了改写来源而重写旧行。
 
 handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source。scope 为 project 但无有效项目路径时返回错误，**不**静默回落 user，避免项目事实意外进入全局记忆。
+
+main 在调用 `appendEntry` 前对候选 text 和 tags 做敏感值复检；命中时返回固定的“候选疑似包含敏感信息，未写入记忆”错误，不写文件、不透露命中的值。该检查只适用于此 IPC。
 
 审核 UI 对选中项按显示顺序**串行**调用 `memory:accept`：
 
@@ -556,11 +568,11 @@ handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source�
 
 ### 8.1 设置
 
-长期记忆区新增候选开关及成本提示。现有条目列表增加编辑图标按钮（带 tooltip），不新建第二套长期记忆管理页。
+长期记忆区新增候选开关及成本提示。现有条目列表增加编辑图标按钮（带 tooltip），不新建第二套长期记忆管理页。设置 modal 的内容区可滚动，至少在最小窗口高度下不让保存/取消操作被挤出视口。
 
 ### 8.2 聊天头入口
 
-- 显示“记忆候选”入口与固定宽度数量徽标；0 时入口仍可保留但不突出；
+- 始终显示“记忆候选”入口与固定宽度数量徽标，空箱明确显示 `0`；数量大于 `0` 时入口高亮；
 - 点击打开当前 session 候选审核弹窗；
 - 切换 session 时数量同步切换，不展示其它会话候选。
 
@@ -568,7 +580,7 @@ handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source�
 
 ### 8.3 审核弹窗
 
-使用紧凑列表，不把卡片嵌套进卡片。每行包含：
+弹窗宽度约 700px（窄窗口按可用宽度收缩），不把卡片嵌套进卡片。列表内部独立滚动，底部操作栏固定在弹窗内，不随候选列表滚动。每行包含：
 
 1. 默认未选中的 checkbox；
 2. 可编辑 text textarea；
@@ -582,9 +594,11 @@ handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source�
 - “接受所选”：至少选一条才启用；
 - “拒绝所选”：二次确认后从当前 session 删除；
 - “稍后处理”：只关闭弹窗；
-- 关闭按钮等价“稍后处理”。
+- 关闭按钮、遮罩点击和 Escape 等价“稍后处理”；它们不清除任何草稿。
 
-批量按钮执行期间锁定本弹窗操作，完成后只移除成功项。长文本必须换行，不得撑破弹窗；列表区域滚动，操作栏稳定不位移。
+text 与 tags 使用 `input` 事件即时写回当前 session 的 localStorage；空 text 仍保留为可修复草稿并显示校验错误。批量按钮执行期间锁定 checkbox、编辑框、作用域切换、关闭和其它操作，完成后只移除成功项，失败项保留。长文本必须换行，不得撑破弹窗；项目快照失效时显示“项目已变更”，禁止旧 project 接受，但允许切换为 user 后再接受。
+
+`memoryEnabled:false` 时仍可打开弹窗、编辑 text/tags、切换作用域和拒绝候选；“接受所选”禁用并提示先启用长期记忆。
 
 ### 8.4 手动与自动反馈
 
@@ -593,6 +607,7 @@ handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source�
 | 手动 compact，新候选 > 0 | toast“已压缩更早 N 条，提炼 M 条候选”并打开弹窗 |
 | 手动 compact，本批无候选且无旧候选 | 沿用“已压缩”toast，不打开空弹窗 |
 | 手动 compact，本批无候选但已有旧候选 | 沿用“已压缩”toast，并打开旧候选列表 |
+| 手动 compact，无需压缩但已有旧候选 | 沿用“无需压缩”toast，并打开旧候选列表 |
 | 手动 compact，候选失败 | toast“已完成压缩；候选提炼失败”；若已有旧候选仍打开列表 |
 | 自动 compact，新候选 > 0 | 不弹窗；轻提示“已新增 M 条记忆候选”并更新数量 |
 | 自动 compact，候选失败 | 不打断、不 toast；仅开发日志与 usage 可观察 |
@@ -605,6 +620,7 @@ handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source�
 - 保存与取消为明确图标按钮并带 tooltip；
 - 保存成功后就地刷新条目；
 - `CONFLICT` 时退出保存中状态、保留用户草稿，并提示刷新；
+- 设置 modal 内容区保持可滚动，窄窗口下不发生按钮或字段溢出；
 - 删除行为保持 D.2 契约不变。
 
 ---
@@ -617,7 +633,9 @@ handler 固定传 `source: 'compact'`，忽略 renderer 提供的任何 source�
 | candidate 调用超时/网络失败 | compact 成功，`candidates: []` | 手动 warning；自动静默 |
 | candidate JSON 非法/超限 | compact 成功，整批为空 | 同上；usage 仍记 |
 | 单条证据/敏感校验失败 | 丢该条，其余保留 | 不逐条暴露内部原因 |
+| usage callback 抛错 | 不改变 compact 或候选结果 | usage best-effort；开发日志可记录 |
 | memory:list 去重读取失败 | 候选仍可审核 | 接受时由 append 再去重 |
+| 接受 text/tags 命中敏感值 | 不写入 memory.jsonl，候选保留 | 行级显示固定安全错误 |
 | memory:accept 部分失败 | 成功项落盘并移除，失败项保留 | 弹窗行级错误 + 汇总 |
 | memory:update validation 失败 | 不写文件 | 行级错误，保留草稿 |
 | memory:update duplicate | 不写文件 | 提示已有相同记忆，保留草稿 |
@@ -663,10 +681,11 @@ preload 只暴露窄方法，不暴露文件路径写 API。project 记忆路径
 - 最大 5 或 caller limit；
 - text/tags/evidence trim、截断、去重；
 - evidence 空白折叠后可回指；伪造 evidence 丢弃；
-- 常见 secret value 过滤且不误杀普通“不要保存 API key”规则文本；
+- 常见 secret value 过滤且不误杀普通“不要保存 API key”规则文本；原始超长 text/evidence 在截断前也会被检查；
 - 批内 exact dedupe；
 - local / disabled / zero limit 不调用 chatFn；
 - API 调用成功但 JSON 非法时先触发 onUsage，再返回受控失败。
+- usage callback 抛错时 summary/candidate 仍按正常 compact 边界完成。
 
 ### 11.2 `tests/session-compact.test.js`
 
@@ -693,6 +712,7 @@ preload 只暴露窄方法，不暴露文件路径写 API。project 记忆路径
 
 - memory disabled 时 accept/update 均拒绝；
 - accept 固定 source compact，不能由 payload 伪造；
+- accept 在截断/规范化前复检 text + tags 敏感值，命中不写文件且候选保留；
 - project scope 缺 projectPath 明确失败，不回落 user；
 - user scope 有项目时仍写 user；
 - accept 复用 memoryMaxEntries 与 dedupe；
@@ -704,7 +724,7 @@ preload 只暴露窄方法，不暴露文件路径写 API。project 记忆路径
 - settings：默认 true；显式 false 往返不被重置；public settings 与 save whitelist 一致；
 - export：pending candidates/evidence 不出现在 MD/JSON，JSON version 仍为 1；
 - usage：第二个 compact call 记 kind compact；parse failure 也记；skip 时不记；
-- `tests/memory-candidate-state.test.js`：旧 session 缺字段、坏项过滤、候选规范化、merge dedupe、20 条上限、稳定顺序、reject/accept 后移除、candidateLimit；
+- `tests/memory-candidate-state.test.js`：旧 session 缺字段、坏项过滤、同 scope merge dedupe、project/user 同文并存、编辑后重复/空草稿保留、20 条上限、稳定顺序、reject/accept 后移除、candidateLimit；
 - DOM/manual smoke：手动弹窗、自动不弹、session 切换数量、项目改绑后拒绝旧 project 候选、禁用记忆后的候选状态、编辑冲突/重复提示、窄窗口不溢出。
 
 全量测试禁止真实网络请求；模型调用均注入 fake `chatFn`。
@@ -720,7 +740,7 @@ preload 只暴露窄方法，不暴露文件路径写 API。project 记忆路径
 | 项目事实泄漏到用户级 | scope 不由模型决定；默认按会话；审核可改；project 无路径时拒绝而非回落 |
 | compact 成本/延迟增加 | 独立默认开关、清晰成本文案、limit 0/满箱/关闭/local 时跳过、D.3 usage 可见 |
 | 待审核项无限堆积 | 每会话固定 20；满箱跳过新模型调用；聊天头持续显示数量 |
-| 候选重复 | 批内、pending、已有 store 三层 exact dedupe；最终 append 再兜底 |
+| 候选重复 | 按同 scope + normalized text 做批内、pending、已有 store 三层 exact dedupe；编辑过的草稿留到 accept 阶段；最终 append 再兜底 |
 | 编辑覆盖新内容 | expected 字段乐观冲突检查；执行时重读；原子重写；冲突保留 UI 草稿 |
 | schema 回归 | source/updatedAt 向后兼容；旧 JSONL 无迁移；专门测试 recall 不变 |
 | D.3 未完成导致接口漂移 | D.4 实施硬前置 D.3 全绿；plan 阶段以落地后的 onUsage 契约为准重新核对行号 |
@@ -755,3 +775,4 @@ preload 只暴露窄方法，不暴露文件路径写 API。project 记忆路径
 | 日期 | 说明 |
 |------|------|
 | 2026-07-31 | 初版：锁定 compact 独立候选调用、会话候选箱、人工接受和已有记忆编辑 |
+| 2026-08-03 | 确认审核箱交互、草稿持久化、作用域去重、敏感值复检与 usage best-effort 边界，待用户复核 |

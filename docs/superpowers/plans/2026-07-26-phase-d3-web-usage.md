@@ -98,12 +98,12 @@
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/settings.test.js`
 Expected: FAIL，形如 `Expected values to be strictly equal: undefined !== false`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/ai/settings.js`——在 `DEFAULT_SETTINGS` 的 `memoryInjectMaxTokens` 行后追加：
 
@@ -243,7 +243,7 @@ function clampUsageSettings(s) {
     ['usageMaxRecords', 500, 50000, 5000],
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/settings.test.js`
 Expected: PASS，全部 `it` 绿
@@ -854,12 +854,12 @@ git add src/ai/html-extract.js tests/html-extract.test.js && git commit -m "feat
 - Consumes: Task 2 的 `checkUrl` / `isBlockedIp`；Task 3 的 `extractFromHtml`
 - Produces:
   - `fetchUrl(rawUrl, opts) → Promise<Result>`；`opts = { allowDomains?, denyDomains?, maxBytes?, timeoutMs?, maxChars?, signal?, requestFn?, dnsLookup? }`
-  - `Result` 成功形状：`{ ok: true, url, status, contentType, title, text, truncated, bytes, redirects: [{ from, to, status }] }`；失败：`{ ok: false, code, error }`，`code` 额外含 `REDIRECT_LIMIT | TIMEOUT | NETWORK | CONTENT_TYPE | HTTP_<status>`
+  - `Result` 成功形状：`{ ok: true, url, status, contentType, title, text, truncated, bytes, redirects: [{ from, to, status }] }`；失败：`{ ok: false, code, error }`，`code` 额外含 `REDIRECT_LIMIT | TIMEOUT | NETWORK | CONTENT_TYPE | DECOMPRESSION | HTTP_<status>`
   - `makeSafeLookup(dnsLookupImpl) → lookup(hostname, opts, cb)`（默认请求路径内部用；单独导出便于测试）
   - `requestFn` 注入契约：`(urlString, { headers, timeoutMs, maxBytes, signal }) → Promise<{ status, headers, body: Buffer, truncated: boolean }>`（`headers` 键为小写；`truncated` 表示传输层已按 `maxBytes` 截断）
 - Task 6 的 provider 与 Task 9 的 `web:fetch` IPC 都只调 `fetchUrl`，不感知内部分层。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/web-fetch.test.js`：
 
@@ -1065,12 +1065,12 @@ describe('makeSafeLookup', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/web-fetch.test.js`
 Expected: FAIL with `Cannot find module '../src/ai/web-fetch'`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 创建 `src/ai/web-fetch.js`：
 
@@ -1190,10 +1190,10 @@ function decompressCapped(body, encoding, maxBytes) {
     const chunks = [];
     let out = 0;
     let done = false;
-    const finish = (truncated) => {
+    const finish = (truncated, error = null) => {
       if (done) return;
       done = true;
-      resolve({ buf: Buffer.concat(chunks), truncated });
+      resolve({ buf: Buffer.concat(chunks), truncated, error });
     };
     stream.on('data', (c) => {
       out += c.length;
@@ -1207,7 +1207,7 @@ function decompressCapped(body, encoding, maxBytes) {
       chunks.push(c);
     });
     stream.on('end', () => finish(false));
-    stream.on('error', () => finish(chunks.length > 0)); // 坏压缩流：能解多少算多少
+    stream.on('error', (error) => finish(false, error));
     stream.end(body);
   });
 }
@@ -1232,7 +1232,6 @@ function classifyContentType(contentType) {
   if (ct.startsWith('text/')) return 'text';
   if (ct === 'application/json' || ct.endsWith('+json')) return 'json';
   if (ct === 'application/xml' || ct.endsWith('+xml')) return 'xml';
-  if (ct === '') return 'text'; // 无 content-type 按文本尝试
   return 'binary';
 }
 
@@ -1346,12 +1345,16 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+实现以本 Task 的 RED/GREEN 回归为准：生产代码通过 `requestWithDeadline` 在入口建立单一整体截止时间，并将调用方 `AbortSignal` 作为独立的立即拒绝分支；重定向只使用剩余时间。解压错误返回 `DECOMPRESSION`，缺失 `Content-Type` 按不支持类型拒绝，`makeSafeLookup` 在 `opts.all === true` 时返回完整地址对象数组。
+
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/web-fetch.test.js`
 Expected: PASS，`# fail 0`
 
-- [ ] **Step 5: 回归 Task 2/3 并提交**
+- [x] **Step 5: 回归 Task 2/3 并提交**
+
+> Task 4 completion record (2026-08-02): `tests/web-fetch.test.js` and the combined URL guard / HTML extractor / web fetch regression pass. `node --check src/ai/web-fetch.js` and `git diff --check` pass. The implementation also covers the later timeout and caller-abort regression cases present in the checkpoint test file.
 
 Run: `node --test tests/url-guard.test.js tests/html-extract.test.js tests/web-fetch.test.js`
 Expected: 全 PASS
@@ -1382,7 +1385,7 @@ git add src/ai/web-fetch.js tests/web-fetch.test.js && git commit -m "feat(codex
   - `confirm-writes` → 走审批
   - `full-auto` + `webRequireConfirm:true` → 走审批；`false` → 直放
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/permission.test.js`（文件顶部 require 处补 `clearSessionAllows`，若已有则不动）：
 
@@ -1480,12 +1483,12 @@ describe('D.3 network risk', () => {
 
 若文件顶部的 require 缺 `getSessionAllows` / `clearSessionAllows` / `riskForTool` / `createPermissionGate`，补齐到既有解构里。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/permission.test.js`
 Expected: 新 describe 全 FAIL（`riskForTool('web_fetch')` 现在返回 `'write'`），既有用例全 PASS
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/ai/permission.js` 四处修改：
 
@@ -1542,16 +1545,18 @@ function createPermissionGate({
 
 注意：这个分支在 plan 二次门**之后**（plan 不拦 network，无需动 `agent-mode.js`），在 `read-only` 分支**之前**（避免被「只读一律拒」吃掉）。其余档位代码一行不动。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/permission.test.js`
 Expected: 全 PASS（既有用例零回归）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/permission.js tests/permission.test.js && git commit -m "feat(codex-qq): D.3 network permission tier with per-host allow_session"
 ```
+
+> Task 5 completion record (2026-08-02): RED showed 6 new network assertions failing while existing permission tests passed. GREEN passed `tests/permission.test.js`; the permission/agent-mode regression, syntax check, and `git diff --check` also passed. Final read-only review found no findings.
 
 ---
 

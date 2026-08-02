@@ -22,8 +22,11 @@
 - project 候选必须携带生成时的 `{ id, path }` 快照；项目解绑/改绑后不得写入另一项目或静默回落 user。
 - 候选 evidence 只存 session localStorage，不进入长期记忆或会话导出。
 - 接受候选真正新增的行固定 `source:'compact'`；精确重复返回既有 id，不改写既有 `tool/slash/compact` source。
+- 候选 pending 去重键是 `scope + normalizeText(text)`；project/user 可以保留相同文本；用户编辑后的重复或空草稿不得被规范化静默删除。
+- `memory:accept` 在 store 截断/规范化前复检原始 text + tags 敏感值；只影响 compact accept，不改变 `/remember`。
 - 已有记忆编辑只改 text/tags；保留 id/createdAt/source/scope，设置 updatedAt；scope 不迁移。
 - D.3 usage callback 必须对摘要与候选两次调用都记 `kind:'compact'`；候选 JSON 解析失败也要记已发生消耗。
+- usage callback 是 best-effort；其同步异常或 rejected Promise 不得阻断 compact。
 - 单测风格保持 `describe` / `it` + `node:assert/strict`；单文件运行 `node --test tests/<name>.test.js`，全量运行 `npm test`。
 - 提交信息使用仓库现有格式：`feat(codex-qq): ...`、`fix(codex-qq): ...`、`docs(codex-qq): ...`。
 - 设计权威：`docs/superpowers/specs/2026-07-31-phase-d4-memory-curation-design.md`。
@@ -372,6 +375,16 @@ describe('D.4 memory candidates', () => {
     assert.equal(containsSensitiveValue('https://alice:secret@example.com/x'), true);
   });
 
+  it('checks raw text and evidence before truncation', () => {
+    const paddedText = '稳定约定' + 'x'.repeat(1000) + ' password = hidden-secret-value';
+    const paddedEvidence = TRANSCRIPT + ' ' + 'x'.repeat(240) + ' api_key = hidden-secret-value';
+    const out = parseCandidateResponse(JSON.stringify({ candidates: [
+      { text: paddedText, tags: [], evidence: TRANSCRIPT },
+      { text: '稳定约定', tags: [], evidence: paddedEvidence },
+    ] }), { transcript: paddedEvidence, limit: 5 });
+    assert.deepEqual(out, []);
+  });
+
   it('skips model calls for every disabled boundary', async () => {
     let calls = 0;
     const usage = [];
@@ -499,11 +512,14 @@ function parseCandidateResponse(raw, { transcript, limit = MAX_CANDIDATES } = {}
   const seen = new Set();
   for (const row of parsed.candidates.slice(0, cap)) {
     if (!row || typeof row !== 'object') continue;
-    const text = truncate(row.text, TEXT_MAX);
-    const evidence = truncateEvidence(row.evidence);
+    const rawText = String(row.text ?? '').trim();
+    const rawEvidence = String(row.evidence ?? '').trim();
+    if (!rawText || !rawEvidence) continue;
+    if (containsSensitiveValue(rawText) || containsSensitiveValue(rawEvidence)) continue;
+    const text = truncate(rawText, TEXT_MAX);
+    const evidence = truncateEvidence(rawEvidence);
     if (!text || !evidence) continue;
     if (!foldedTranscript.includes(foldWhitespace(evidence))) continue;
-    if (containsSensitiveValue(text) || containsSensitiveValue(evidence)) continue;
     const key = normalizeText(text);
     if (!key || seen.has(key)) continue;
     seen.add(key);
@@ -547,7 +563,12 @@ async function generateMemoryCandidates({
   }
   const output = String(content ?? '').trim();
   if (typeof onUsage === 'function') {
-    onUsage({ rawUsage, messages, content: output });
+    try {
+      const result = onUsage({ rawUsage, messages, content: output });
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch {
+      // usage 失败不能改变候选解析边界。
+    }
   }
   return parseCandidateResponse(output, { transcript: text, limit: cap });
 }
@@ -658,6 +679,19 @@ describe('D.4 compact artifacts', () => {
     assert.equal(result.candidateWarning.includes('sk-'), false);
   });
 
+  it('does not let a usage callback failure change compact results', async () => {
+    let calls = 0;
+    const result = await generateCompactArtifacts({
+      transcript, settings, candidateLimit: 5,
+      chatFn: async () => (++calls === 1 ? '摘要成功' : JSON.stringify({ candidates: [] })),
+      onUsage: async () => { throw new Error('usage store unavailable'); },
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.summary, '摘要成功');
+    assert.deepEqual(result.candidates, []);
+    assert.equal(result.candidateWarning, null);
+  });
+
   it('does not start candidates when summary fails', async () => {
     let calls = 0;
     await assert.rejects(
@@ -725,16 +759,29 @@ const { generateMemoryCandidates } = require('./memory-candidates');
 在 `generateCompactSummary` 后添加：
 
 ```js
+function bestEffortUsageReporter(onUsage) {
+  if (typeof onUsage !== 'function') return undefined;
+  return (event) => {
+    try {
+      const result = onUsage(event);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch {
+      // usage 失败不能改变 compact 的消息结果。
+    }
+  };
+}
+
 async function generateCompactArtifacts({
   transcript, settings, candidateLimit, chatFn, signal, onUsage,
 } = {}) {
+  const reportUsage = bestEffortUsageReporter(onUsage);
   const summary = await generateCompactSummary({
-    transcript, settings, chatFn, signal, onUsage,
+    transcript, settings, chatFn, signal, onUsage: reportUsage,
   });
   try {
     const candidates = await generateMemoryCandidates({
       transcript, settings, limit: candidateLimit,
-      chatFn, signal, onUsage,
+      chatFn, signal, onUsage: reportUsage,
     });
     return { summary, candidates, candidateWarning: null };
   } catch {
@@ -777,6 +824,8 @@ const artifacts = await generateCompactArtifacts({
 });
 ```
 
+Renderer 请求必须同时传 `sessionId`；沿用 D.3 的 usage 落盘/转发实现时，用该值作为本次两个 compact 调用的 session key。若最终 D.3 callback 已经封装了 session key，则只把同一个 callback 传入 artifacts，不新增第二个 usage 写点；callback 的异常由 artifacts 的 best-effort wrapper 吞掉。
+
 4. 保留 handler 其它字段与错误处理，只把成功响应的 summary 引用改为 artifacts，并追加候选字段：
 
 ```js
@@ -815,7 +864,7 @@ git commit -m "feat(codex-qq): integrate D.4 candidates with compact"
 
 **Interfaces:**
 - Produces browser global `window.MemoryCandidateState` 与同形状 CommonJS export
-- Produces `textKey`、`normalizeProjectRef`、`projectRefMatches`、`normalizePendingCandidates`、`mergePendingCandidates`、`removePendingCandidates`、`candidateLimit`
+- Produces `textKey`、`candidateKey`、`normalizeProjectRef`、`projectRefMatches`、`normalizePendingCandidates`、`mergePendingCandidates`、`removePendingCandidates`、`candidateLimit`
 - Task 9 再追加 `buildAcceptPayload` 与 `filterStoredDuplicates`
 
 - [ ] **Step 1: 写失败测试**
@@ -829,6 +878,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   textKey,
+  candidateKey,
   normalizeProjectRef,
   projectRefMatches,
   normalizePendingCandidates,
@@ -852,7 +902,7 @@ describe('D.4 renderer candidate state', () => {
     ]);
     assert.deepEqual(out, [{
       id: 'mc_1', text: '偏好中文', tags: ['ui'], evidence: '用户：偏好中文',
-      scope: 'user', projectRef: null, createdAt: 10,
+      scope: 'user', projectRef: null, edited: false, createdAt: 10,
     }]);
   });
 
@@ -933,6 +983,26 @@ describe('D.4 renderer candidate state', () => {
 
   it('uses folded case-insensitive keys for exact dedupe', () => {
     assert.equal(textKey('  NPM   TEST '), textKey('npm test'));
+    assert.notEqual(
+      candidateKey({ scope: 'user', text: 'npm test' }),
+      candidateKey({ scope: 'project', text: 'npm test' })
+    );
+  });
+
+  it('dedupes only within the same scope and keeps invalid drafts', () => {
+    const result = mergePendingCandidates([], [
+      { text: '同一文本', tags: [], evidence: '证据', scope: 'user' },
+      { text: '同一文本', tags: [], evidence: '证据', scope: 'project', projectRef },
+      { text: '同一文本', tags: [], evidence: '证据', scope: 'user' },
+    ], { max: 20 });
+    assert.deepEqual(result.items.map((item) => item.scope), ['user', 'project']);
+
+    const draft = normalizePendingCandidates([{
+      id: 'mc_draft', text: '', tags: ['x'], evidence: '证据', scope: 'user', edited: true,
+    }]);
+    assert.equal(draft.length, 1);
+    assert.equal(draft[0].text, '');
+    assert.equal(draft[0].edited, true);
   });
 });
 ```
@@ -966,6 +1036,14 @@ Expected: FAIL，module 不存在。
 
   function textKey(value) {
     return String(value ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  function candidateKey(candidate) {
+    const text = textKey(candidate?.text);
+    const scope = candidate?.scope === 'project' || candidate?.scope === 'user'
+      ? candidate.scope
+      : '';
+    return text && scope ? scope + '\0' + text : '';
   }
 
   function normalizeTags(raw) {
@@ -1013,7 +1091,7 @@ Expected: FAIL，module 不存在。
     if (!raw || typeof raw !== 'object') return null;
     const text = trimTo(raw.text, TEXT_MAX);
     const evidence = trimTo(raw.evidence, EVIDENCE_MAX);
-    if (!text || !evidence) return null;
+    if ((!text && options.allowEmptyText !== true) || !evidence) return null;
     const scope = raw.scope === 'project' || raw.scope === 'user'
       ? raw.scope
       : (options.defaultScope === 'project' ? 'project' : 'user');
@@ -1032,18 +1110,16 @@ Expected: FAIL，module 不存在。
       evidence,
       scope,
       projectRef,
+      edited: raw.edited === true,
       createdAt: Number(raw.createdAt) || now,
     };
   }
 
-  function normalizePendingCandidates(raw, { max = PENDING_MAX } = {}) {
+  function normalizePendingCandidates(raw, { max = PENDING_MAX, allowDrafts = true } = {}) {
     const out = [];
-    const seen = new Set();
     for (const value of Array.isArray(raw) ? raw : []) {
-      const item = normalizeOne(value);
-      const key = item && textKey(item.text);
-      if (!item || !key || seen.has(key)) continue;
-      seen.add(key);
+      const item = normalizeOne(value, { allowEmptyText: allowDrafts });
+      if (!item) continue;
       out.push(item);
       if (out.length >= max) break;
     }
@@ -1052,13 +1128,13 @@ Expected: FAIL，module 不存在。
 
   function mergePendingCandidates(existing, incoming, options = {}) {
     const max = Number(options.max) > 0 ? Number(options.max) : PENDING_MAX;
-    const items = normalizePendingCandidates(existing, { max });
-    const seen = new Set(items.map((item) => textKey(item.text)));
+    const items = normalizePendingCandidates(existing, { max, allowDrafts: true });
+    const seen = new Set(items.map(candidateKey).filter(Boolean));
     let added = 0;
     let dropped = 0;
     for (const raw of Array.isArray(incoming) ? incoming : []) {
-      const item = normalizeOne(raw, options);
-      const key = item && textKey(item.text);
+      const item = normalizeOne(raw, { ...options, allowEmptyText: false });
+      const key = candidateKey(item);
       if (!item || !key || seen.has(key)) continue;
       if (items.length >= max) { dropped++; continue; }
       seen.add(key);
@@ -1070,7 +1146,7 @@ Expected: FAIL，module 不存在。
 
   function removePendingCandidates(existing, ids) {
     const wanted = new Set((Array.isArray(ids) ? ids : []).map(String));
-    return normalizePendingCandidates(existing).filter((item) => !wanted.has(item.id));
+    return normalizePendingCandidates(existing, { allowDrafts: true }).filter((item) => !wanted.has(item.id));
   }
 
   function candidateLimit(existing, { perBatch = PER_BATCH_MAX, max = PENDING_MAX } = {}) {
@@ -1082,6 +1158,7 @@ Expected: FAIL，module 不存在。
     PENDING_MAX,
     PER_BATCH_MAX,
     textKey,
+    candidateKey,
     normalizeProjectRef,
     projectRefMatches,
     normalizePendingCandidates,
@@ -1521,6 +1598,19 @@ const { readAll } = memoryStore;
     assert.equal(all.entries.find((entry) => entry.id === duplicate.id).source, 'slash');
   });
 
+  it('memoryAccept rejects sensitive values in edited text or tags before writing', () => {
+    const { userDataPath } = dirs();
+    for (const payload of [
+      { scope: 'user', text: 'api_key = abcdefghijklmnop', tags: [] },
+      { scope: 'user', text: '部署约定', tags: ['password = abcdefghijklmnop'] },
+    ]) {
+      const result = memoryAccept({ settings: SETTINGS, userDataPath, payload });
+      assert.equal(result.ok, false);
+      assert.match(result.error, /敏感信息/);
+    }
+    assert.equal(readAll({ userDataPath }).counts.user, 0);
+  });
+
   it('memoryAccept honors explicit user scope even when a project is bound', () => {
     const { projectPath, userDataPath } = dirs();
     const result = memoryAccept({
@@ -1617,6 +1707,12 @@ Expected: FAIL，`memoryAccept is not a function`。
 
 - [ ] **Step 3: 实现两个纯 handler**
 
+在 `src/ai/memory-ipc.js` 顶部复用候选模块的值形态检测器：
+
+```js
+const { containsSensitiveValue } = require('./memory-candidates');
+```
+
 在 `pathsFrom` 后添加：
 
 ```js
@@ -1644,6 +1740,11 @@ function memoryAccept({ settings, userDataPath, payload = {} } = {}) {
   const scope = requestedScope(payload);
   const invalid = validateExplicitScope(scope, paths);
   if (invalid) return invalid;
+  const rawTags = Array.isArray(payload?.tags) ? payload.tags : [];
+  const rawMemoryText = [String(payload?.text ?? ''), ...rawTags.map((tag) => String(tag ?? ''))].join('\n');
+  if (containsSensitiveValue(rawMemoryText)) {
+    return { ok: false, error: '候选疑似包含敏感信息，未写入记忆' };
+  }
   try {
     return store.appendEntry({
       ...paths,
@@ -1764,6 +1865,7 @@ git commit -m "feat(codex-qq): add D.4 memory accept and update IPC"
   - `updateMemoryCandidateCount()`
   - `openMemoryCandidateReview(session, { notice? })` / `closeMemoryCandidateReview()`
   - modal state `memoryCandidateSessionId`、`memoryCandidateSelected`、`memoryCandidateErrors`、`memoryCandidateInvalidIds`、`memoryCandidateBusy`
+- Draft text/tags/scope edits set a renderer-only `edited:true` marker and persist on every `input` event; empty text remains a visible invalid draft.
 - Task 9 owns accept/reject side effects; this task makes the persisted drafts visible and editable while those action buttons remain disabled
 
 - [ ] **Step 1: 写 renderer 静态契约测试**
@@ -1805,6 +1907,7 @@ describe('D.4 renderer memory UI contract', () => {
       html,
       /压缩时提炼记忆候选（每次压缩可能增加一次模型调用；候选需审核后才写入）/
     );
+    assert.match(html, /btn-memory-candidate-close[\s\S]*稍后处理/);
   });
 
   it('normalizes pending candidates on load/save and wires the setting both ways', () => {
@@ -1812,6 +1915,9 @@ describe('D.4 renderer memory UI contract', () => {
     assert.match(app, /memoryCandidateEnabled\s*:\s*document\.getElementById/);
     assert.match(app, /settings\.memoryCandidateEnabled\s*!==\s*false/);
     assert.match(app, /updateMemoryCandidateCount\(\)/);
+    assert.match(app, /memory-candidate-text[\s\S]*addEventListener\('input'/);
+    assert.match(app, /memory-candidate-tags[\s\S]*addEventListener\('input'/);
+    assert.match(app, /e\.key === 'Escape'[\s\S]*closeMemoryCandidateReview/);
   });
 });
 ```
@@ -1984,26 +2090,25 @@ function updateCandidateDraft(id, patch) {
   const item = ensureSessionCandidateState(session).find((candidate) => candidate.id === id);
   if (!item || memoryCandidateBusy) return;
   const changesText = Object.hasOwn(patch, 'text');
-  if (changesText && !String(patch.text || '').trim()) {
+  Object.assign(item, { ...patch, edited: true });
+  if (changesText && !String(item.text || '').trim()) {
     memoryCandidateInvalidIds.add(id);
     memoryCandidateErrors.set(id, '记忆内容不能为空');
-    const row = document.querySelector(`.memory-candidate-row[data-candidate-id="${id}"]`);
-    const error = row?.querySelector('.memory-candidate-error');
-    if (error) error.textContent = '记忆内容不能为空';
-    return;
-  }
-  if (changesText) {
+  } else if (changesText) {
     memoryCandidateInvalidIds.delete(id);
     memoryCandidateErrors.delete(id);
   } else if (!memoryCandidateInvalidIds.has(id)) {
     memoryCandidateErrors.delete(id);
   }
-  Object.assign(item, patch);
   session.pendingMemoryCandidates = MemoryCandidateState.normalizePendingCandidates(
-    session.pendingMemoryCandidates
+    session.pendingMemoryCandidates,
+    { max: MemoryCandidateState.PENDING_MAX, allowDrafts: true }
   );
   saveState();
   updateMemoryCandidateCount();
+  const row = document.querySelector(`.memory-candidate-row[data-candidate-id="${id}"]`);
+  const error = row?.querySelector('.memory-candidate-error');
+  if (error) error.textContent = memoryCandidateErrors.get(id) || '';
 }
 
 function renderMemoryCandidateReview() {
@@ -2043,7 +2148,7 @@ function renderMemoryCandidateReview() {
     text.maxLength = 1000;
     text.value = candidate.text;
     text.disabled = memoryCandidateBusy;
-    text.addEventListener('change', () => updateCandidateDraft(candidate.id, { text: text.value }));
+    text.addEventListener('input', () => updateCandidateDraft(candidate.id, { text: text.value }));
 
     const tags = document.createElement('input');
     tags.type = 'text';
@@ -2051,7 +2156,7 @@ function renderMemoryCandidateReview() {
     tags.placeholder = '标签，用逗号分隔';
     tags.value = candidate.tags.join(', ');
     tags.disabled = memoryCandidateBusy;
-    tags.addEventListener('change', () => updateCandidateDraft(candidate.id, {
+    tags.addEventListener('input', () => updateCandidateDraft(candidate.id, {
       tags: tags.value.split(',').map((tag) => tag.trim()).filter(Boolean),
     }));
 
@@ -2138,6 +2243,11 @@ function closeMemoryCandidateReview() {
   document.getElementById('memory-candidate-modal')?.addEventListener('click', (event) => {
     if (event.target.id === 'memory-candidate-modal') closeMemoryCandidateReview();
   });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    const modal = document.getElementById('memory-candidate-modal');
+    if (modal && !modal.classList.contains('hidden')) closeMemoryCandidateReview();
+  });
 ```
 
 - [ ] **Step 6: 添加稳定、可滚动且不溢出的样式**
@@ -2168,6 +2278,7 @@ function closeMemoryCandidateReview() {
   display: flex;
   flex-direction: column;
   min-height: 260px;
+  overflow: hidden;
 }
 .memory-candidate-modal-head { display: flex; align-items: flex-start; justify-content: space-between; }
 .memory-candidate-modal-head .modal-title { margin-bottom: 8px; }
@@ -2225,7 +2336,17 @@ function closeMemoryCandidateReview() {
 .memory-candidate-error { min-height: 16px; color: #a12c38; font-size: 11px; }
 .memory-candidate-empty { padding: 28px 8px; color: #6a87a3; text-align: center; }
 .memory-candidate-summary { min-height: 20px; padding-top: 6px; color: #4c6274; }
-.memory-candidate-actions { flex: 0 0 auto; margin-top: 4px; }
+.memory-candidate-actions {
+  flex: 0 0 auto;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid #c5d9ee;
+  background: #f7fbff;
+}
+#settings-modal .modal-card {
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
 @media (max-width: 760px) {
   .memory-candidate-modal-card { width: calc(100% - 16px); max-width: none; }
 }
@@ -2280,6 +2401,15 @@ git commit -m "feat(codex-qq): add D.4 memory candidate review shell"
     const firstSave = app.indexOf('saveState()', messageSwap);
     const merge = app.indexOf('MemoryCandidateState.mergePendingCandidates', start);
     assert.ok(start >= 0 && messageSwap > start && firstSave > messageSwap && merge > firstSave);
+  });
+
+  it('opens existing candidates after a manual no-op compact but never from auto compact', () => {
+    const noNeed = app.indexOf("if (!res.needed)");
+    const manualOpen = app.indexOf('openMemoryCandidateReview(session)', noNeed);
+    const autoStart = app.indexOf('async function maybeAutoCompact');
+    const autoOpen = app.indexOf('openMemoryCandidateReview', autoStart);
+    assert.ok(noNeed >= 0 && manualOpen > noNeed);
+    assert.equal(autoOpen, -1);
   });
 ```
 
@@ -2354,6 +2484,9 @@ function applyCompactResult(session, response, originProjectRef) {
     }
     if (!res.needed) {
       toast(force ? '无需压缩：没有可压缩的更早消息' : '未达压缩阈值');
+      if (force && activeSessionId === session.id && ensureSessionCandidateState(session).length > 0) {
+        openMemoryCandidateReview(session);
+      }
       return false;
     }
     const merged = applyCompactResult(session, res, originProjectRef);
@@ -2401,7 +2534,7 @@ node --check src/renderer/app.js
 node --test tests/renderer-memory-ui.test.js tests/memory-candidate-state.test.js tests/session-compact.test.js tests/usage.test.js tests/usage-store.test.js
 ```
 
-Expected: PASS，0 failed；满 20 条时 request 的 `candidateLimit` 为 0，自动 compact 不打开审核 modal。
+Expected: PASS，0 failed；满 20 条时 request 的 `candidateLimit` 为 0，自动 compact 不打开审核 modal；手动 compact 无需压缩但已有候选时仍打开审核 modal。
 
 - [ ] **Step 7: 提交**
 
@@ -2412,7 +2545,7 @@ git commit -m "feat(codex-qq): persist D.4 compact memory candidates"
 
 ---
 
-### Task 9: 审核接受/拒绝、store 去重与项目快照校验
+### Task 9: 审核接受/拒绝、同作用域去重与项目快照校验
 
 **Files:**
 - Modify: `src/renderer/memory-candidate-state.js`
@@ -2477,11 +2610,12 @@ git commit -m "feat(codex-qq): persist D.4 compact memory candidates"
   it('filters exact stored duplicates without mutating the pending input', () => {
     const pending = [
       { id: 'mc_1', text: '项目约定', tags: [], evidence: '项目约定', scope: 'project', projectRef, createdAt: 1 },
-      { id: 'mc_2', text: '保留候选', tags: [], evidence: '保留候选', scope: 'user', projectRef: null, createdAt: 2 },
+      { id: 'mc_2', text: '项目约定', tags: [], evidence: '项目约定', scope: 'user', projectRef: null, createdAt: 2 },
+      { id: 'mc_3', text: '已编辑重复', tags: [], evidence: '已编辑重复', scope: 'project', projectRef, edited: true, createdAt: 3 },
     ];
-    const out = filterStoredDuplicates(pending, [{ text: '  项目约定  ' }]);
-    assert.deepEqual(out.map((item) => item.id), ['mc_2']);
-    assert.equal(pending.length, 2);
+    const out = filterStoredDuplicates(pending, [{ scope: 'project', text: '  项目约定  ' }]);
+    assert.deepEqual(out.map((item) => item.id), ['mc_2', 'mc_3']);
+    assert.equal(pending.length, 3);
   });
 ```
 
@@ -2509,7 +2643,7 @@ Expected: FAIL，`buildAcceptPayload` / `filterStoredDuplicates` 尚未导出。
 
 - [ ] **Step 3: 实现纯 accept payload 与 store exact dedupe**
 
-在 `memory-candidate-state.js` 的 `candidateLimit` 后添加：
+在 `memory-candidate-state.js` 的 `candidateLimit` 后添加；`filterStoredDuplicates` 必须按同 scope key 比较，并保留 `edited:true` 的草稿：
 
 ```js
   function buildAcceptPayload(candidate, currentProjectRef) {
@@ -2532,11 +2666,11 @@ Expected: FAIL，`buildAcceptPayload` / `filterStoredDuplicates` 尚未导出。
   function filterStoredDuplicates(pending, storedEntries) {
     const stored = new Set(
       (Array.isArray(storedEntries) ? storedEntries : [])
-        .map((entry) => textKey(entry?.text))
+        .map((entry) => candidateKey(entry))
         .filter(Boolean)
     );
-    return normalizePendingCandidates(pending).filter(
-      (candidate) => !stored.has(textKey(candidate.text))
+    return normalizePendingCandidates(pending, { allowDrafts: true }).filter(
+      (candidate) => candidate.edited || !stored.has(candidateKey(candidate))
     );
   }
 ```
@@ -3075,13 +3209,15 @@ D.4 把会话压缩与长期记忆连成一个人工审核闭环。成功 compac
 
 ### 审核候选
 
-会话头部“记忆候选”显示当前会话的待审核数量。候选文本和标签可修改，证据可展开查看，作用域可在项目/用户之间选择。
+会话头部“记忆候选”始终显示当前会话的待审核数量（空箱为 `0`，有候选时高亮）。候选文本和标签可修改，证据可展开查看，作用域可在项目/用户之间选择。
 
 - 手动 `/compact` 或“压缩”：有待审核候选时打开审核窗口。
 - 发送前自动压缩：只累积候选并更新数量，不打断发送流程。
 - 接受所选：按显示顺序逐条写入；成功项移出候选箱，失败项保留并显示原因。
 - 拒绝所选：确认后只删除候选草稿。
-- 稍后处理或关闭：候选继续随当前 session 保存在 localStorage。
+- 稍后处理、关闭、遮罩点击或 Escape：候选继续随当前 session 保存在 localStorage；text/tags 在输入时即时保存。
+
+候选审核窗口约 700px 宽，列表独立滚动、底部操作栏固定。长期记忆关闭时仍可编辑或拒绝候选，但不能接受；接受遇到项目快照失效时必须先切换为用户记忆或拒绝。
 
 项目候选记录生成时的项目 id 与路径。项目解绑、换绑或路径变化后，旧项目候选不会写入新项目；可显式切换为用户记忆，或拒绝该候选。
 
@@ -3093,6 +3229,7 @@ D.4 把会话压缩与长期记忆连成一个人工审核闭环。成功 compac
 
 - transcript、旧摘要和工具输出都按不可信数据处理；候选需要原文 evidence，并经过常见密钥形态过滤。
 - 人工审核是最终安全边界。不要把 API key、密码、token 或其它秘密接受为长期记忆。
+- 接受前会再次检查候选 text 与 tags 的常见敏感值形态；命中时不写入且保留候选。
 - candidate id 与 evidence 不写入项目/用户 `memory.jsonl`，也不进入 Markdown 或 JSON 会话导出。
 - 候选 evidence 是会话原文的短副本，与原会话一起存放在 renderer localStorage；接受、拒绝或删除整个会话后移除。
 ```

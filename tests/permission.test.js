@@ -411,3 +411,109 @@ describe('permission', () => {
     assert.match(f.reason, /计划模式/);
   });
 });
+
+describe('D.3 network risk', () => {
+  beforeEach(() => {
+    clearSessionAllows();
+  });
+
+  it('classifies web_fetch as network', () => {
+    assert.equal(riskForTool('web_fetch'), 'network');
+  });
+
+  it('denies when webEnabled is false, regardless of permission mode', async () => {
+    for (const permissionMode of ['read-only', 'confirm-writes', 'full-auto']) {
+      const gate = createPermissionGate({ permissionMode, webEnabled: false });
+      const r = await gate.authorize({ tool: 'web_fetch', scope: 'example.com' });
+      assert.equal(r.allowed, false, permissionMode);
+      assert.match(r.reason, /网页访问未启用/);
+    }
+  });
+
+  it('requires approval in read-only mode instead of auto-deny', async () => {
+    let asked = null;
+    const gate = createPermissionGate({
+      permissionMode: 'read-only',
+      webEnabled: true,
+      onApprovalNeeded: async (p) => {
+        asked = p;
+        gate.resolveApproval(p.approvalId, 'allow');
+      },
+    });
+    const r = await gate.authorize({
+      tool: 'web_fetch',
+      scope: 'example.com',
+      summary: '读取网页 example.com',
+    });
+    assert.equal(r.allowed, true);
+    assert.equal(asked.risk, 'network');
+    assert.equal(asked.scope, 'example.com');
+  });
+
+  it('full-auto with webRequireConfirm=false allows directly', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      webEnabled: true,
+      webRequireConfirm: false,
+      onApprovalNeeded: async () => { throw new Error('不应弹审批'); },
+    });
+    const r = await gate.authorize({ tool: 'web_fetch', scope: 'example.com' });
+    assert.equal(r.allowed, true);
+  });
+
+  it('full-auto with webRequireConfirm=true still asks', async () => {
+    let asked = false;
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      webEnabled: true,
+      webRequireConfirm: true,
+      onApprovalNeeded: async (p) => {
+        asked = true;
+        gate.resolveApproval(p.approvalId, 'deny');
+      },
+    });
+    const r = await gate.authorize({ tool: 'web_fetch', scope: 'example.com' });
+    assert.equal(asked, true);
+    assert.equal(r.allowed, false);
+  });
+
+  it('allow_session is scoped per host: example.com does not unlock evil.com', async () => {
+    let asks = 0;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      webEnabled: true,
+      onApprovalNeeded: async (p) => {
+        asks += 1;
+        gate.resolveApproval(p.approvalId, 'allow_session');
+      },
+    });
+    const sessionKey = 'sess-net-1';
+    await gate.authorize({ tool: 'web_fetch', scope: 'example.com', sessionKey });
+    const again = await gate.authorize({ tool: 'web_fetch', scope: 'example.com', sessionKey });
+    assert.equal(again.allowed, true);
+    assert.equal(asks, 1);
+    await gate.authorize({ tool: 'web_fetch', scope: 'evil.com', sessionKey });
+    assert.equal(asks, 2);
+  });
+
+  it('plan mode does not block network', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      webEnabled: true,
+      agentMode: 'plan',
+      onApprovalNeeded: async (p) => gate.resolveApproval(p.approvalId, 'allow'),
+    });
+    const r = await gate.authorize({ tool: 'web_fetch', scope: 'example.com' });
+    assert.equal(r.allowed, true);
+  });
+
+  it('unscoped write allow_session keeps the bare risk key', async () => {
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      onApprovalNeeded: async (p) => gate.resolveApproval(p.approvalId, 'allow_session'),
+    });
+    const sessionKey = 'sess-w-1';
+    await gate.authorize({ tool: 'write_file', sessionKey });
+    assert.ok(getSessionAllows(sessionKey).has('write'));
+  });
+});

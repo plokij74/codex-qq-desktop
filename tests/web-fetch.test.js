@@ -193,6 +193,75 @@ describe('fetchUrl', () => {
     controller.abort();
     await assert.rejects(pending, (err) => err?.code === 'ABORTED');
   });
+
+  it('enforces one overall timeout across redirect hops', async () => {
+    let transportAborted = false;
+    const requestFn = async (url, { signal }) => {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 15);
+        signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          transportAborted = true;
+          reject(new Error('aborted'));
+        }, { once: true });
+      });
+      if (url.endsWith('/1')) {
+        return {
+          status: 302,
+          headers: { location: '/2', 'content-type': 'text/plain' },
+          body: Buffer.alloc(0),
+          truncated: false,
+        };
+      }
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+        body: Buffer.from('late'),
+        truncated: false,
+      };
+    };
+    const r = await fetchUrl('https://a.com/1', { requestFn, timeoutMs: 20 });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'TIMEOUT');
+    assert.equal(transportAborted, true);
+  });
+
+  it('rejects promptly when the caller aborts an uncooperative transport', async () => {
+    const controller = new AbortController();
+    const pending = fetchUrl('https://slow.example.com/', {
+      requestFn: () => new Promise(() => {}),
+      timeoutMs: 1000,
+      signal: controller.signal,
+    });
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 10);
+    await assert.rejects(pending, (err) => err?.code === 'ABORTED');
+    assert.ok(Date.now() - started < 200, 'caller abort should not wait for timeout');
+  });
+
+  it('returns a structured error for malformed compressed content', async () => {
+    const requestFn = fakeRequest({
+      'https://a.com/bad-gzip': {
+        headers: { 'content-type': 'text/plain', 'content-encoding': 'gzip' },
+        body: Buffer.from('not gzip'),
+      },
+    });
+    const r = await fetchUrl('https://a.com/bad-gzip', { requestFn });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'DECOMPRESSION');
+  });
+
+  it('rejects responses with no content type', async () => {
+    const requestFn = fakeRequest({
+      'https://a.com/no-type': {
+        headers: { 'content-type': '' },
+        body: Buffer.from([0, 1, 2]),
+      },
+    });
+    const r = await fetchUrl('https://a.com/no-type', { requestFn });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'CONTENT_TYPE');
+  });
 });
 
 describe('makeSafeLookup', () => {
@@ -209,6 +278,20 @@ describe('makeSafeLookup', () => {
       assert.equal(err, null);
       assert.equal(address, '93.184.216.34');
       assert.equal(family, 4);
+      done();
+    });
+  });
+
+  it('preserves the all:true callback shape', (t, done) => {
+    const lookup = makeSafeLookup(fakeDns({
+      'ok.com': [['93.184.216.34', 4], ['2001:db8::1', 6]],
+    }));
+    lookup('ok.com', { all: true }, (err, addresses) => {
+      assert.equal(err, null);
+      assert.deepEqual(addresses, [
+        { address: '93.184.216.34', family: 4 },
+        { address: '2001:db8::1', family: 6 },
+      ]);
       done();
     });
   });

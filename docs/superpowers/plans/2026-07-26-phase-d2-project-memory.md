@@ -1,5 +1,7 @@
 # Phase D.2 Project and User Long-Term Memory Implementation Plan
 
+> **Status:** Complete (2026-08-02). All nine implementation tasks and the D.2 completion-fix pass are implemented and verified. The original task checkboxes below are synchronized with the completed work; the latest focused regression is 168 pass / 1 host-dependent skip.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付跨会话长期记忆：项目级与用户级两层 JSONL 条目库，模型经 `remember` / `recall` / `forget` 读写并受既有权限三档约束，每轮按确定性打分选 top-N 注入 system。
@@ -65,7 +67,7 @@
 **Interfaces:**
 - Produces: `DEFAULT_SETTINGS.memoryEnabled === true`、`memoryMaxEntries === 200`、`memoryInjectTopN === 8`、`memoryInjectMaxTokens === 1200`；导出 `clampMemorySettings(s)`，load/save 与 main 三处共用同一份数值
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/settings.test.js` 末尾追加：
 
@@ -100,12 +102,12 @@ it('defaults and clamps Phase D.2 memory settings', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/settings.test.js`
 Expected: FAIL — `DEFAULT_SETTINGS.memoryEnabled` 为 `undefined`
 
-- [ ] **Step 3: 实现 settings.js**
+- [x] **Step 3: 实现 settings.js**
 
 在 `DEFAULT_SETTINGS` 的 `compactMaxApproxTokens` 之后追加：
 
@@ -141,7 +143,7 @@ function clampMemorySettings(s) {
 
 `module.exports` 增加 `clampMemorySettings`。
 
-- [ ] **Step 4: main.js 透传与 save clamp**
+- [x] **Step 4: main.js 透传与 save clamp**
 
 `toPublicSettings`（`src/main.js:101`）在 `compactMaxApproxTokens` 之后追加：
 
@@ -160,12 +162,12 @@ function clampMemorySettings(s) {
     ['memoryInjectMaxTokens', 200, 8000, 1200],
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `node --test tests/settings.test.js`
 Expected: PASS
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/ai/settings.js src/main.js tests/settings.test.js
@@ -191,7 +193,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory settings defaults and clamp"
   - `normalizeText(s) -> string`、常量 `TEXT_MAX = 1000`
   - `Entry = { id: string, text: string, tags: string[], createdAt: number, source: 'tool'|'slash', scope: 'project'|'user' }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/memory-store.test.js`：
 
@@ -345,12 +347,12 @@ describe('memory-store', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/memory-store.test.js`
 Expected: FAIL — `Cannot find module '../src/ai/memory-store'`
 
-- [ ] **Step 3: 实现 memory-store.js**
+- [x] **Step 3: 实现 memory-store.js**
 
 创建 `src/ai/memory-store.js`：
 
@@ -544,12 +546,12 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `node --test tests/memory-store.test.js`
 Expected: PASS（11 个用例）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/memory-store.js tests/memory-store.test.js
@@ -574,7 +576,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory store with dedupe prune and corr
   - `formatEntryLine(entry) -> string`
   - `formatInjection(entries) -> string`（空数组返回 `''`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/memory-recall.test.js`：
 
@@ -689,12 +691,12 @@ describe('memory-recall', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/memory-recall.test.js`
 Expected: FAIL — `Cannot find module '../src/ai/memory-recall'`
 
-- [ ] **Step 3: 实现 memory-recall.js**
+- [x] **Step 3: 实现 memory-recall.js**
 
 创建 `src/ai/memory-recall.js`：
 
@@ -827,12 +829,12 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `node --test tests/memory-recall.test.js`
 Expected: PASS（9 个用例）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/memory-recall.js tests/memory-recall.test.js
@@ -850,7 +852,7 @@ git commit -m "feat(codex-qq): Phase D.2 deterministic memory scoring and bounde
 **Interfaces:**
 - Produces: `riskForTool('recall') === 'read'`；`riskForTool('remember') === 'write'`；`riskForTool('forget') === 'write'`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/permission.test.js` 的 `describe('permission', ...)` 内追加：
 
@@ -879,12 +881,12 @@ git commit -m "feat(codex-qq): Phase D.2 deterministic memory scoring and bounde
   });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/permission.test.js`
 Expected: FAIL — `riskForTool('recall')` 返回 `'write'`（未知工具默认档）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/ai/permission.js:3` 的 `READ_TOOLS` 末尾加 `'recall'`：
 
@@ -902,12 +904,12 @@ const WRITE_TOOLS = new Set([
 ]);
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `node --test tests/permission.test.js`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/permission.js tests/permission.test.js
@@ -926,7 +928,7 @@ git commit -m "feat(codex-qq): Phase D.2 classify memory tools under existing ri
 - Consumes: Task 2 的 `readAll` / `appendEntry` / `deleteEntry`；Task 3 的 `selectForInjection` / `formatInjection` / `tokenizeQuery` / `matchScore` / `scoreEntry`；`clampInt`（`src/ai/settings.js:94` 已导出，勿重复实现）；`ctx.extensions.userDataPath`（`src/ai/agent.js:1223`）；`ctx.extensions.userPromptText`（`src/ai/agent.js:1193`）
 - Produces: `createMemoryProvider() -> Provider`，`Provider.id === 'memory'`；工具名 `remember` / `recall` / `forget`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/memory-provider.test.js`：
 
@@ -1059,12 +1061,12 @@ describe('memory provider', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/memory-provider.test.js`
 Expected: FAIL — `Cannot find module '../src/ai/providers/memory'`
 
-- [ ] **Step 3: 实现 providers/memory.js**
+- [x] **Step 3: 实现 providers/memory.js**
 
 创建 `src/ai/providers/memory.js`：
 
@@ -1236,12 +1238,12 @@ function createMemoryProvider() {
 module.exports = { createMemoryProvider };
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `node --test tests/memory-provider.test.js`
 Expected: PASS（11 个用例）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/providers/memory.js tests/memory-provider.test.js
@@ -1260,7 +1262,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory provider with remember recall fo
 - Consumes: Task 5 的 `createMemoryProvider`
 - Produces: `createDefaultRegistry(deps)` 收集到的工具在 depth 0 agent 模式下含 `remember` / `recall` / `forget`；`providers/index.js` 导出 `createMemoryProvider`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/memory-provider.test.js` 末尾（`describe` 之外）追加：
 
@@ -1307,12 +1309,12 @@ describe('memory provider registration', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/memory-provider.test.js`
 Expected: FAIL — `names.includes('remember')` 为 false（provider 未注册）
 
-- [ ] **Step 3: 实现注册**
+- [x] **Step 3: 实现注册**
 
 `src/ai/providers/index.js`：顶部 require 区加
 
@@ -1328,17 +1330,17 @@ const { createMemoryProvider } = require('./memory');
 
 同时更新该函数上方 JSDoc 首行为 `Default registry: builtin + skills + explore + implement + memory + mcp.`，并在 `module.exports` 加 `createMemoryProvider`。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `node --test tests/memory-provider.test.js tests/registry.test.js`
 Expected: PASS
 
-- [ ] **Step 5: 全量回归**
+- [x] **Step 5: 全量回归**
 
 Run: `npm test`
 Expected: PASS（确认注册没有打破 explore / implement / skills 的既有工具表断言）
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/ai/providers/index.js tests/memory-provider.test.js
@@ -1366,7 +1368,7 @@ git commit -m "feat(codex-qq): Phase D.2 register memory provider in default reg
 
 **为什么抽一层：** main.js 无法在 `node:test` 里加载（要 Electron），把 gating 与 scope 判定放进纯函数才能测；main 只留一行转发。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/memory-ipc.test.js`：
 
@@ -1488,12 +1490,12 @@ describe('memory-ipc', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `node --test tests/memory-ipc.test.js`
 Expected: FAIL — `Cannot find module '../src/ai/memory-ipc'`
 
-- [ ] **Step 3: 实现 memory-ipc.js**
+- [x] **Step 3: 实现 memory-ipc.js**
 
 创建 `src/ai/memory-ipc.js`：
 
@@ -1562,12 +1564,12 @@ function memoryDelete({ settings, userDataPath, payload = {} } = {}) {
 module.exports = { memoryList, memoryAdd, memoryDelete };
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `node --test tests/memory-ipc.test.js`
 Expected: PASS（9 个用例）
 
-- [ ] **Step 5: main.js 与 preload.js 接线**
+- [x] **Step 5: main.js 与 preload.js 接线**
 
 `src/main.js` 顶部 require 区加：
 
@@ -1599,12 +1601,12 @@ ipcMain.handle('memory:delete', async (_e, payload = {}) => memoryDelete({
   deleteMemory: (payload) => ipcRenderer.invoke('memory:delete', payload || {}),
 ```
 
-- [ ] **Step 6: 语法检查与全量测试**
+- [x] **Step 6: 语法检查与全量测试**
 
 Run: `node --check src/main.js && node --check src/preload.js && npm test`
 Expected: `node --check` 无输出；`npm test` PASS
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add src/ai/memory-ipc.js tests/memory-ipc.test.js src/main.js src/preload.js
@@ -1624,7 +1626,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory list add delete IPC with pure ha
 - Consumes: Task 7 的 `window.codex.listMemory / addMemory / deleteMemory`
 - Produces: `/remember` / `/memory` / `/forget` 三条命令；`renderMemoryList()`；设置项 id `set-memory-enabled` / `set-memory-max-entries` / `set-memory-inject-topn` / `set-memory-inject-max-tokens`；列表容器 id `memory-list`
 
-- [ ] **Step 1: index.html 增加设置项**
+- [x] **Step 1: index.html 增加设置项**
 
 在 `<label class="switch-row"><input type="checkbox" id="set-hooks-enabled" checked /> ...` 之前插入：
 
@@ -1650,7 +1652,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory list add delete IPC with pure ha
         </div>
 ```
 
-- [ ] **Step 2: app.js 增加三条斜杠命令**
+- [x] **Step 2: app.js 增加三条斜杠命令**
 
 在 `handleSlashCommand` 的 `/export` 分支之后、`/skill ` 分支之前插入：
 
@@ -1696,7 +1698,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory list add delete IPC with pure ha
   }
 ```
 
-- [ ] **Step 3: app.js 更新 /help**
+- [x] **Step 3: app.js 更新 /help**
 
 把 `/help` 分支的第一行文案改为：
 
@@ -1710,7 +1712,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory list add delete IPC with pure ha
 
 （最后一行 `'任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）'` 保持原样。）
 
-- [ ] **Step 4: app.js 增加列表渲染与设置读写**
+- [x] **Step 4: app.js 增加列表渲染与设置读写**
 
 在 `refreshHooksSummary` 函数之前插入：
 
@@ -1798,7 +1800,7 @@ async function renderMemoryList() {
     memoryInjectMaxTokens: Number(document.getElementById('set-memory-inject-max-tokens')?.value || 1200),
 ```
 
-- [ ] **Step 5: styles.css 增加样式**
+- [x] **Step 5: styles.css 增加样式**
 
 在文件末尾追加：
 
@@ -1836,12 +1838,12 @@ async function renderMemoryList() {
 }
 ```
 
-- [ ] **Step 6: 语法检查与全量测试**
+- [x] **Step 6: 语法检查与全量测试**
 
 Run: `node --check src/renderer/app.js && npm test`
 Expected: `node --check` 无输出；`npm test` PASS
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add src/renderer/app.js src/renderer/index.html src/renderer/styles.css
@@ -1859,7 +1861,7 @@ git commit -m "feat(codex-qq): Phase D.2 memory slash commands and settings list
 - Consumes: 前八个任务的全部行为
 - Produces: 无代码接口；文档章节结构与前几期一致
 
-- [ ] **Step 1: 追加 README 章节**
+- [x] **Step 1: 追加 README 章节**
 
 在 `README.md` 末尾追加：
 
@@ -1919,17 +1921,17 @@ git commit -m "feat(codex-qq): Phase D.2 memory slash commands and settings list
 - 记忆进入 `/export` 导出文件
 ```
 
-- [ ] **Step 2: 全量测试**
+- [x] **Step 2: 全量测试**
 
 Run: `npm test`
 Expected: PASS，全部测试文件绿
 
-- [ ] **Step 3: 确认无新依赖**
+- [x] **Step 3: 确认无新依赖**
 
 Run: `git diff HEAD~8 --stat -- package.json package-lock.json`
 Expected: 无输出（两个文件均未改动）
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add README.md
@@ -1940,12 +1942,12 @@ git commit -m "docs(codex-qq): Phase D.2 long-term memory usage in README"
 
 ## 验收清单（对照 spec §1.4）
 
-- [ ] `memoryEnabled: false` 时无记忆工具、system 无记忆片段、不触碰任何 `memory.jsonl`（Task 5 用例 1 + Task 7 用例 1）
-- [ ] 未绑定项目时 `remember` 回落 user scope（Task 5 用例 4）
-- [ ] read-only 拒绝写、confirm-writes 审批、full-auto 直写（Task 4 用例）
-- [ ] plan 只暴露 `recall`；depth≥1 全关（Task 5 用例 3、Task 6 用例 2/3）
-- [ ] 坏行降级并报告 `skipped`（Task 2 用例 6、Task 5 用例 11）
-- [ ] 超 `memoryMaxEntries` 按最旧淘汰（Task 2 用例 5）
-- [ ] 注入含边界标注且受 token 预算约束（Task 3 用例 7/8）
-- [ ] 三条斜杠命令 + `/help` + 设置四项与列表（Task 8）
-- [ ] `npm test` 全绿、无新依赖（Task 9 Step 2/3）
+- [x] `memoryEnabled: false` 时无记忆工具、system 无记忆片段、不触碰任何 `memory.jsonl`（Task 5 用例 1 + Task 7 用例 1）
+- [x] 未绑定项目时 `remember` 回落 user scope（Task 5 用例 4）
+- [x] read-only 拒绝写、confirm-writes 审批、full-auto 直写（Task 4 用例）
+- [x] plan 只暴露 `recall`；depth≥1 全关（Task 5 用例 3、Task 6 用例 2/3）
+- [x] 坏行降级并报告 `skipped`（Task 2 用例 6、Task 5 用例 11）
+- [x] 超 `memoryMaxEntries` 按最旧淘汰（Task 2 用例 5）
+- [x] 注入含边界标注且受 token 预算约束（Task 3 用例 7/8）
+- [x] 三条斜杠命令 + `/help` + 设置四项与列表（Task 8）
+- [x] `npm test` 全绿、无新依赖（Task 9 Step 2/3）
