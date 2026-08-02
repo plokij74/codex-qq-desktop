@@ -4,6 +4,7 @@ dist/
 *.tgz
 *.zip
 npm-install.*
+.worktrees/
 electron-meta.json
 fetch-meta.js
 run-npm-install.ps1
