@@ -126,6 +126,7 @@ function reject(code, reason) {
 function checkUrl(rawUrl, opts = {}) {
   const allow = Array.isArray(opts.allowDomains) ? opts.allowDomains : [];
   const deny = Array.isArray(opts.denyDomains) ? opts.denyDomains : [];
+  const allowPrivate = opts.allowPrivate === true;
 
   let url;
   try {
@@ -141,7 +142,7 @@ function checkUrl(rawUrl, opts = {}) {
     return reject('CREDENTIALS', 'URL 不允许携带用户名或密码');
   }
 
-  if (url.port) {
+  if (url.port && !allowPrivate) {
     const p = Number(url.port);
     if (BLOCKED_PORTS.has(p)) return reject('PORT', `端口 ${p} 属常见服务端口，已拒绝`);
     if (p < 1024 && p !== 80 && p !== 443) {
@@ -152,11 +153,13 @@ function checkUrl(rawUrl, opts = {}) {
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (!host) return reject('INVALID', 'URL 缺少主机名');
 
-  if (host === 'localhost' || BLOCKED_HOST_SUFFIXES.some((sfx) => host.endsWith(sfx))) {
-    return reject('PRIVATE_IP', `主机名 ${host} 指向本机或内网，已拒绝`);
-  }
-  if (isBlockedIp(host)) {
-    return reject('PRIVATE_IP', `目标地址是内网/保留地址：${host}`);
+  if (!allowPrivate) {
+    if (host === 'localhost' || BLOCKED_HOST_SUFFIXES.some((sfx) => host.endsWith(sfx))) {
+      return reject('PRIVATE_IP', `主机名 ${host} 指向本机或内网，已拒绝`);
+    }
+    if (isBlockedIp(host)) {
+      return reject('PRIVATE_IP', `目标地址是内网/保留地址：${host}`);
+    }
   }
 
   if (deny.some((d) => matchDomain(host, d))) {

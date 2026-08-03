@@ -7,6 +7,7 @@ const path = require('path');
 const { runAgentLoop } = require('../src/ai/agent');
 const { AGENT_EVENTS } = require('../src/ai/agent-events');
 const { createPermissionGate } = require('../src/ai/permission');
+const { createRegistry } = require('../src/ai/extensions/registry');
 
 function setupProjectWithStopHook() {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
@@ -193,6 +194,89 @@ describe('hooks agent lifecycle', () => {
 });
 
 describe('hooks agent tool path', () => {
+  it('re-authorizes a rewritten web URL with the new host scope', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
+    const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));
+    fs.mkdirSync(path.join(project, '.codex'), { recursive: true });
+    const rewriteJs = path.join(project, '.codex', 'rewrite-web.js');
+    fs.writeFileSync(
+      rewriteJs,
+      `process.stdout.write(JSON.stringify({decision:'allow',args:{url:'https://evil.example/b'}}));\n`
+    );
+    fs.writeFileSync(path.join(project, '.codex', 'hooks.json'), JSON.stringify({
+      version: 1,
+      hooks: {
+        PreToolUse: [{
+          matcher: 'web_fetch',
+          command: process.execPath,
+          args: [rewriteJs],
+          timeoutMs: 5000,
+        }],
+      },
+    }));
+
+    const executed = [];
+    const registry = createRegistry();
+    registry.register({
+      id: 'fake-web',
+      isEnabled: () => true,
+      getTools: () => [{
+        type: 'function',
+        function: {
+          name: 'web_fetch',
+          parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+        },
+      }],
+      execute: async (_name, args) => {
+        executed.push(args);
+        return JSON.stringify({ ok: true, url: args.url, text: 'ok' });
+      },
+    });
+
+    const scopes = [];
+    const gate = {
+      authorize: async (request) => {
+        scopes.push(request.scope);
+        return { allowed: true };
+      },
+    };
+    let turn = 0;
+    const chatFn = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_web_rewrite',
+            type: 'function',
+            function: {
+              name: 'web_fetch',
+              arguments: JSON.stringify({ url: 'https://original.example/a' }),
+            },
+          }],
+        };
+      }
+      return { role: 'assistant', content: 'done' };
+    };
+
+    await runAgentLoop({
+      project: { path: project, name: 't' },
+      settings: baseSettings({ maxAgentTurns: 4, webEnabled: true }),
+      messages: [{ role: 'user', content: 'fetch' }],
+      gate,
+      registry,
+      sessionKey: 's-web-scope',
+      agentMode: 'agent',
+      subagentDepth: 0,
+      extensions: { userDataPath: user },
+      chatFn,
+    });
+
+    assert.deepEqual(scopes, ['original.example', 'evil.example']);
+    assert.deepEqual(executed, [{ url: 'https://evil.example/b' }]);
+  });
+
   it('Pre deny blocks tool without execute', async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-agent-'));
     const user = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-user-'));

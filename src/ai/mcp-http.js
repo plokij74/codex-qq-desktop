@@ -3,9 +3,17 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const { checkUrl } = require('./url-guard');
 
 const PROTOCOL_VERSION = '2024-11-05';
 const REQUEST_TIMEOUT_MS = 60_000;
+
+function assertMcpUrl(rawUrl) {
+  const checked = checkUrl(rawUrl, { allowPrivate: true });
+  if (!checked.ok) {
+    throw new Error(`MCP URL 不合法（${checked.code}）：${checked.reason}`);
+  }
+}
 
 /**
  * Parse JSON body or text/event-stream data lines into a JSON-RPC message.
@@ -144,6 +152,7 @@ function createMcpHttpClient(opts = {}) {
   async function postMessage(msg, { expectResponse = true } = {}) {
     if (closed) throw new Error('MCP client closed');
     if (!url) throw new Error('MCP url required');
+    assertMcpUrl(url);
 
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = setTimeout(() => {
@@ -220,6 +229,7 @@ function createMcpHttpClient(opts = {}) {
     if (started) return;
     if (closed) throw new Error('MCP client closed');
     if (!url) throw new Error('MCP url required');
+    assertMcpUrl(url);
 
     try {
       await request('initialize', {
@@ -280,6 +290,7 @@ function createMcpHttpClient(opts = {}) {
 
 module.exports = {
   createMcpHttpClient,
+  assertMcpUrl,
   parseSseOrJson,
   defaultRequestFn,
   PROTOCOL_VERSION,

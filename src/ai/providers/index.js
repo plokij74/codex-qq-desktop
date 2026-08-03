@@ -7,9 +7,10 @@ const { createExploreProvider } = require('./explore');
 const { createImplementProvider } = require('./implement');
 const { createMemoryProvider } = require('./memory');
 const { createMcpProvider } = require('./mcp');
+const { createWebProvider } = require('./web');
 
 /**
- * Default registry: builtin + skills + explore + implement + memory + mcp.
+ * Default registry: builtin + skills + explore + implement + memory + mcp + web.
  *
  * @param {{
  *   getToolDefs: () => Array,
@@ -34,6 +35,7 @@ function createDefaultRegistry(deps) {
   reg.register(createImplementProvider({ runLoop }));
   reg.register(createMemoryProvider());
   reg.register(createMcpProvider());
+  reg.register(createWebProvider());
   return reg;
 }
 
@@ -52,4 +54,5 @@ module.exports = {
   createImplementProvider,
   createMemoryProvider,
   createMcpProvider,
+  createWebProvider,
 };

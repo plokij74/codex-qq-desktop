@@ -88,6 +88,16 @@ function makeRequestFn() {
 }
 
 describe('createMcpHttpClient', () => {
+  it('rejects an invalid URL before making a request', async () => {
+    let calls = 0;
+    const c = createMcpHttpClient({
+      url: 'file:///tmp/mcp',
+      requestFn: async () => { calls += 1; },
+    });
+    await assert.rejects(() => c.start(), /MCP URL.*PROTOCOL/);
+    assert.equal(calls, 0);
+  });
+
   it('initialize + listTools via mock requestFn', async () => {
     const { requestFn, calls } = makeRequestFn();
     const c = createMcpHttpClient({ url: 'https://example.com/mcp', requestFn });

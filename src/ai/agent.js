@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { URL } = require('url');
 const {
   listTree,
   readFile,
@@ -30,6 +31,7 @@ const { createDefaultRegistry: buildDefaultRegistry } = require('./providers');
 const { loadHooks } = require('./hooks-loader');
 const { createHooksRunner } = require('./hooks-runner');
 const { mergeSubagentFileChanges } = require('./subagent-runtime');
+const { checkUrl } = require('./url-guard');
 
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
@@ -496,6 +498,19 @@ function toolPath(name, args) {
   return args.path || args.file || undefined;
 }
 
+/** Domain-scoped permission key for outbound network tools. */
+function toolScope(name, args) {
+  if (name !== 'web_fetch') return undefined;
+  const checked = checkUrl(String(args?.url || '').trim());
+  return checked.ok ? checked.host : undefined;
+}
+
+function isWebCacheHit(name, args, extensions) {
+  if (name !== 'web_fetch' || !(extensions?.webCache instanceof Map)) return false;
+  const rawUrl = String(args?.url || '').trim();
+  return Boolean(rawUrl) && extensions.webCache.has(rawUrl);
+}
+
 function toolSummary(name, args) {
   const p = toolPath(name, args);
   switch (name) {
@@ -525,6 +540,13 @@ function toolSummary(name, args) {
       return `提交计划${args.title ? `: ${String(args.title).slice(0, 60)}` : ''}`;
     case 'spawn_explore':
       return `子 Agent 调研: ${String(args.goal || '').slice(0, 80)}`;
+    case 'web_fetch': {
+      try {
+        return `读取网页 ${new URL(String(args.url || '')).hostname}`;
+      } catch {
+        return `读取网页 ${String(args.url || '?').slice(0, 60)}`;
+      }
+    }
     case 'remember': {
       const preview = String(args.text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
       return `记住: ${preview}`;
@@ -538,6 +560,7 @@ function toolSummary(name, args) {
 
 function toolDetail(name, args) {
   if (name === 'run_terminal') return String(args.command || '');
+  if (name === 'web_fetch') return String(args.url || '');
   if (name === 'search_replace') {
     const oldS = String(args.old_string || '');
     const newS = String(args.new_string || '');
@@ -604,7 +627,13 @@ async function authorizeTool({
   signal,
   diff,
   agentMode,
+  scope,
 }) {
+  const effectiveRisk = risk || riskForTool(name);
+  if (effectiveRisk === 'network' && !scope) {
+    return { allowed: false, reason: '网页 URL 不合法、使用受限端口或指向内网，已拒绝' };
+  }
+
   if (gate && typeof gate.authorize === 'function') {
     return gate.authorize({
       tool: name,
@@ -616,10 +645,10 @@ async function authorizeTool({
       signal,
       diff,
       agentMode,
+      scope,
     });
   }
 
-  const effectiveRisk = risk || riskForTool(name);
   if (effectiveRisk === 'terminal') {
     if (!settings?.terminalEnabled) {
       return { allowed: false, reason: '终端未启用，不允许执行终端命令' };
@@ -1399,6 +1428,7 @@ async function runAgentLoop({
           const risk = riskForTool(name);
           const summary = toolSummary(name, args);
           const relPath = toolPath(name, args);
+          const scope = toolScope(name, args);
 
           onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: name, args });
 
@@ -1491,6 +1521,7 @@ async function runAgentLoop({
               authDetail,
               authPath,
               authDiff,
+              authScope,
             }) {
               try {
                 const auth = await authorizeTool({
@@ -1506,6 +1537,7 @@ async function runAgentLoop({
                   signal,
                   diff: authDiff,
                   agentMode: mode,
+                  scope: authScope,
                 });
                 return {
                   allowed: !!auth.allowed,
@@ -1526,12 +1558,15 @@ async function runAgentLoop({
 
             if (resultStr == null) {
               // Gate₁ — sole authorization before Pre; skip cannot bypass this.
-              const gate1 = await authorizeOnce({
-                authSummary: summary,
-                authDetail: detail,
-                authPath: relPath,
-                authDiff: diffPayload,
-              });
+              const gate1 = isWebCacheHit(name, args, extensions)
+                ? { allowed: true }
+                : await authorizeOnce({
+                  authSummary: summary,
+                  authDetail: detail,
+                  authPath: relPath,
+                  authDiff: diffPayload,
+                  authScope: scope,
+                });
               authAllowed = gate1.allowed;
               authReason = gate1.reason;
 
@@ -1597,12 +1632,15 @@ async function runAgentLoop({
                     }
                   }
 
-                  const gate2 = await authorizeOnce({
-                    authSummary: g2Summary,
-                    authDetail: g2Detail,
-                    authPath: effectiveRelPath,
-                    authDiff: g2DiffPayload,
-                  });
+                  const gate2 = isWebCacheHit(name, effectiveArgs, extensions)
+                    ? { allowed: true }
+                    : await authorizeOnce({
+                      authSummary: g2Summary,
+                      authDetail: g2Detail,
+                      authPath: effectiveRelPath,
+                      authDiff: g2DiffPayload,
+                      authScope: toolScope(name, effectiveArgs),
+                    });
                   if (!gate2.allowed) {
                     return {
                       allowed: false,

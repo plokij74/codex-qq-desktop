@@ -4,6 +4,7 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const {
+  assertMcpUrl,
   parseSseOrJson,
   defaultRequestFn,
   PROTOCOL_VERSION,
@@ -224,6 +225,7 @@ function createMcpSseClient(opts = {}) {
   async function postMessage(msg, { expectResponse = true } = {}) {
     if (closed) throw new Error('MCP client closed');
     if (!messageUrl) throw new Error('MCP url required');
+    assertMcpUrl(messageUrl);
 
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = setTimeout(() => {
@@ -299,6 +301,8 @@ function createMcpSseClient(opts = {}) {
     if (started) return;
     if (closed) throw new Error('MCP client closed');
     if (!url) throw new Error('MCP url required');
+    assertMcpUrl(url);
+    assertMcpUrl(sseUrl || url);
 
     try {
       const sseHeaders = {

@@ -109,6 +109,13 @@ describe('checkUrl', () => {
     assert.equal(r.code, 'DENIED');
   });
 
+  it('allowPrivate skips private-ip and port checks but keeps protocol/credentials', () => {
+    assert.equal(checkUrl('http://127.0.0.1:6379/mcp', { allowPrivate: true }).ok, true);
+    assert.equal(checkUrl('http://localhost:3001/sse', { allowPrivate: true }).ok, true);
+    assert.equal(checkUrl('file:///x', { allowPrivate: true }).code, 'PROTOCOL');
+    assert.equal(checkUrl('http://u:p@localhost/', { allowPrivate: true }).code, 'CREDENTIALS');
+  });
+
   it('every rejection carries a Chinese reason', () => {
     for (const u of ['file:///x', 'http://127.0.0.1/', 'http://example.com:22/']) {
       const r = checkUrl(u);

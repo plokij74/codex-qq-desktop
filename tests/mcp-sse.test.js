@@ -103,6 +103,19 @@ function makeOpenSseFn(bodyText, getUrl = 'https://example.com/sse') {
 }
 
 describe('createMcpSseClient', () => {
+  it('rejects an invalid URL before opening SSE or posting', async () => {
+    let opens = 0;
+    let posts = 0;
+    const c = createMcpSseClient({
+      url: 'file:///tmp/sse',
+      openSseFn: async () => { opens += 1; },
+      requestFn: async () => { posts += 1; },
+    });
+    await assert.rejects(() => c.start(), /MCP URL.*PROTOCOL/);
+    assert.equal(opens, 0);
+    assert.equal(posts, 0);
+  });
+
   it('start opens SSE, uses endpoint event for POST, initialize + listTools', async () => {
     const { requestFn, calls } = makeRequestFn();
     const { openSseFn, calls: sseCalls } = makeOpenSseFn(
