@@ -7,6 +7,9 @@ function buildChatPayload(model, messages, extra = {}) {
   if (extra.tools) body.tools = extra.tools;
   if (extra.tool_choice) body.tool_choice = extra.tool_choice;
   if (extra.stream) body.stream = true;
+  if (extra.stream && extra.includeUsage !== false) {
+    body.stream_options = { include_usage: true };
+  }
   return body;
 }
 
@@ -128,6 +131,7 @@ async function postChatCompletions({
   temperature,
   signal,
   stream,
+  includeUsage,
 }) {
   const fetchImpl = fetchFn || globalThis.fetch;
   if (!fetchImpl) throw new Error('当前环境没有 fetch，无法调用 API');
@@ -140,6 +144,7 @@ async function postChatCompletions({
     tool_choice,
     temperature,
     stream: !!stream,
+    includeUsage,
   });
 
   let res;
@@ -170,6 +175,7 @@ async function chatRequest({
   fetchFn,
   temperature,
   signal,
+  includeUsage,
 }) {
   const { res, url } = await postChatCompletions({
     baseUrl,
@@ -182,6 +188,7 @@ async function chatRequest({
     temperature,
     signal,
     stream: false,
+    includeUsage,
   });
 
   const { text, json } = await readResponseBody(res);
@@ -202,6 +209,7 @@ async function streamChatCompletionMessage(opts) {
     temperature,
     signal,
     onDelta,
+    includeUsage,
   } = opts;
 
   const { res, url } = await postChatCompletions({
@@ -215,6 +223,7 @@ async function streamChatCompletionMessage(opts) {
     temperature,
     signal,
     stream: true,
+    includeUsage,
   });
 
   if (!res.ok) {
@@ -227,11 +236,13 @@ async function streamChatCompletionMessage(opts) {
   }
 
   let content = '';
+  let usage;
   const toolMap = new Map();
 
   try {
     for await (const event of iterateSse(res)) {
       if (signal?.aborted) throw abortedError();
+      if (event?.usage && typeof event.usage === 'object') usage = event.usage;
       const delta = event?.choices?.[0]?.delta;
       if (!delta) continue;
       if (typeof delta.content === 'string' && delta.content) {
@@ -259,6 +270,7 @@ async function streamChatCompletionMessage(opts) {
     role: 'assistant',
     content,
     tool_calls: tool_calls?.length ? tool_calls : undefined,
+    usage,
   };
 }
 
@@ -277,6 +289,7 @@ async function chatCompletionMessage(opts) {
     role: 'assistant',
     content: typeof msg.content === 'string' ? msg.content : (msg.content ?? ''),
     tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : undefined,
+    usage: json?.usage && typeof json.usage === 'object' ? json.usage : undefined,
   };
 }
 

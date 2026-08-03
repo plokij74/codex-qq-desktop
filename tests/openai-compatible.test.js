@@ -41,6 +41,15 @@ describe('openai-compatible', () => {
     assert.equal(body.stream, true);
   });
 
+  it('D.3 buildChatPayload adds stream_options only for stream', () => {
+    const streamed = buildChatPayload('m', [], { stream: true });
+    assert.deepEqual(streamed.stream_options, { include_usage: true });
+    const disabled = buildChatPayload('m', [], { stream: true, includeUsage: false });
+    assert.equal(disabled.stream_options, undefined);
+    const nonStreamed = buildChatPayload('m', [], {});
+    assert.equal(nonStreamed.stream_options, undefined);
+  });
+
   it('normalizeBaseUrl strips chat/completions suffix', () => {
     assert.equal(normalizeBaseUrl('https://api.openai.com/v1/chat/completions'), 'https://api.openai.com/v1');
   });
@@ -61,6 +70,25 @@ describe('openai-compatible', () => {
       fetchFn,
     });
     assert.equal(text, 'hello from api');
+  });
+
+  it('D.3 non-stream response carries usage through', async () => {
+    const fetchFn = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'hi' } }],
+        usage: { prompt_tokens: 100, completion_tokens: 7 },
+      }),
+    });
+    const msg = await chatCompletionMessage({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'm',
+      messages: [{ role: 'user', content: 'q' }],
+      fetchFn,
+    });
+    assert.deepEqual(msg.usage, { prompt_tokens: 100, completion_tokens: 7 });
   });
 
   it('chatCompletion throws on error status', async () => {
@@ -123,6 +151,61 @@ describe('openai-compatible', () => {
     assert.equal(msg.role, 'assistant');
     assert.deepEqual(deltas, ['Hel', 'lo']);
     assert.equal(posted.stream, true);
+  });
+
+  it('D.3 stream captures usage from the final empty-choices chunk', async () => {
+    const fetchFn = mockSseFetch([
+      'data: {"choices":[{"delta":{"content":"你"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"好"}}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":2}}\n\n',
+      'data: [DONE]\n\n',
+    ]);
+    const msg = await chatCompletionMessage({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'm',
+      messages: [{ role: 'user', content: 'q' }],
+      fetchFn,
+      stream: true,
+    });
+    assert.equal(msg.content, '你好');
+    assert.deepEqual(msg.usage, { prompt_tokens: 42, completion_tokens: 2 });
+  });
+
+  it('D.3 stream without usage chunk leaves msg.usage undefined', async () => {
+    let posted;
+    const fetchFn = mockSseFetch([
+      'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ], { captureBody: (body) => { posted = JSON.parse(body); } });
+    const msg = await chatCompletionMessage({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'm',
+      messages: [{ role: 'user', content: 'q' }],
+      fetchFn,
+      stream: true,
+    });
+    assert.equal(msg.usage, undefined);
+    assert.deepEqual(posted.stream_options, { include_usage: true });
+  });
+
+  it('D.3 includeUsage false is forwarded to the streamed request body', async () => {
+    let posted;
+    const fetchFn = mockSseFetch([
+      'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ], { captureBody: (body) => { posted = JSON.parse(body); } });
+    await chatCompletionMessage({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'm',
+      messages: [{ role: 'user', content: 'q' }],
+      fetchFn,
+      stream: true,
+      includeUsage: false,
+    });
+    assert.equal(posted.stream_options, undefined);
   });
 
   it('chatCompletionMessage stream accumulates tool_calls deltas', async () => {
