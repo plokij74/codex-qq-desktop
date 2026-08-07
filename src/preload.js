@@ -35,4 +35,7 @@ contextBridge.exposeInMainWorld('codex', {
   listMemory: (payload) => ipcRenderer.invoke('memory:list', payload || {}),
   addMemory: (payload) => ipcRenderer.invoke('memory:add', payload || {}),
   deleteMemory: (payload) => ipcRenderer.invoke('memory:delete', payload || {}),
+  webFetch: (payload) => ipcRenderer.invoke('web:fetch', payload || {}),
+  usageSummary: (payload) => ipcRenderer.invoke('usage:summary', payload || {}),
+  usageClear: () => ipcRenderer.invoke('usage:clear'),
 });

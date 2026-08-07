@@ -123,10 +123,11 @@ function buildCompactSystemPrompt() {
  * Local mode never touches the network — it returns a deterministic placeholder
  * so the feature is still exercisable offline. `chatFn` is injectable for tests.
  *
- * @param {{transcript:string, settings:object, chatFn?:Function, signal?:AbortSignal}} args
+ * @param {{transcript:string, settings:object, chatFn?:Function, signal?:AbortSignal,
+ *   onUsage?:Function}} args
  * @returns {Promise<string>}
  */
-async function generateCompactSummary({ transcript, settings, chatFn, signal } = {}) {
+async function generateCompactSummary({ transcript, settings, chatFn, signal, onUsage } = {}) {
   const text = String(transcript || '');
   if (!text.trim()) throw new Error('待压缩内容为空');
   const s = settings || {};
@@ -134,21 +135,47 @@ async function generateCompactSummary({ transcript, settings, chatFn, signal } =
   if (mode === 'local') {
     return `（本地模式占位摘要）摘录约 ${text.length} 字符、约 ${approxTokensFromText(text)} token。切换到 API 模式可生成真实摘要。`;
   }
-  const fn = typeof chatFn === 'function'
-    ? chatFn
-    : (opts) => require('./openai-compatible').chatCompletion(opts);
-  const content = await fn({
-    baseUrl: s.baseUrl,
-    apiKey: s.apiKey,
-    model: s.model,
-    temperature: 0.2,
-    signal,
-    messages: [
-      { role: 'system', content: buildCompactSystemPrompt() },
-      { role: 'user', content: text.slice(0, TRANSCRIPT_MAX_DEFAULT) },
-    ],
-  });
+  const sentMessages = [
+    { role: 'system', content: buildCompactSystemPrompt() },
+    { role: 'user', content: text.slice(0, TRANSCRIPT_MAX_DEFAULT) },
+  ];
+  let content;
+  let rawUsage = null;
+  if (typeof chatFn === 'function') {
+    const response = await chatFn({
+      baseUrl: s.baseUrl,
+      apiKey: s.apiKey,
+      model: s.model,
+      temperature: 0.2,
+      signal,
+      messages: sentMessages,
+    });
+    if (response && typeof response === 'object') {
+      content = response.content || '';
+      rawUsage = response.usage ?? null;
+    } else {
+      content = response;
+    }
+  } else {
+    const msg = await require('./openai-compatible').chatCompletionMessage({
+      baseUrl: s.baseUrl,
+      apiKey: s.apiKey,
+      model: s.model,
+      temperature: 0.2,
+      signal,
+      messages: sentMessages,
+    });
+    content = msg?.content || '';
+    rawUsage = msg?.usage ?? null;
+  }
   const out = String(content || '').trim();
+  if (typeof onUsage === 'function') {
+    try {
+      await Promise.resolve(onUsage({ rawUsage, messages: sentMessages, content: out }));
+    } catch {
+      // Usage metering is best-effort and must not turn a valid summary into a failure.
+    }
+  }
   if (!out) throw new Error('摘要为空');
   return out;
 }

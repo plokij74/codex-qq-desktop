@@ -48,6 +48,8 @@ let projects = [];
 let activeSessionId = '';
 let currentView = 'chat';
 let sending = false;
+let currencySymbol = '$';
+let usageDisplayEnabled = true;
 /** Seeds agentMode for newly created sessions (from settings.defaultAgentMode). */
 let defaultAgentModeSeed = 'agent';
 
@@ -645,6 +647,8 @@ function renderMessages() {
   }
   scrollToBottom();
   bindInlineStop();
+  renderUsageBar();
+  renderContextMeter();
 }
 
 function toolArgsSummary(tool, args) {
@@ -1051,6 +1055,9 @@ function renderApprovalCard(ev) {
   card.dataset.approvalId = ev.approvalId || '';
   const title = '需要确认：' + (ev.tool || '操作') + (ev.risk ? '（' + ev.risk + '）' : '');
   const body = buildApprovalBodyHtml(ev);
+  const sessionAllowLabel = ev.risk === 'network' && ev.scope
+    ? '本会话始终允许 ' + String(ev.scope)
+    : '本会话始终允许此类';
   card.innerHTML =
     '<div class="appr-title">' + escapeHtml(title) + '</div>' +
     '<div class="appr-summary">' + escapeHtml(ev.summary || ev.path || '') + '</div>' +
@@ -1058,7 +1065,8 @@ function renderApprovalCard(ev) {
     '<div class="appr-actions">' +
       '<button type="button" class="appr-btn" data-decision="allow">允许</button>' +
       '<button type="button" class="appr-btn appr-deny" data-decision="deny">拒绝</button>' +
-      '<button type="button" class="appr-btn appr-session" data-decision="allow_session">本会话始终允许此类</button>' +
+      '<button type="button" class="appr-btn appr-session" data-decision="allow_session">'
+        + escapeHtml(sessionAllowLabel) + '</button>' +
     '</div>' +
     '<div class="appr-result"></div>';
   card.querySelectorAll('.appr-btn').forEach((btn) => {
@@ -1270,6 +1278,19 @@ function handleChatEvent(ev) {
     );
     return;
   }
+  if (type === 'usage') {
+    const session = sessions.find((item) => item.id === ev.sessionId)
+      || sessions.find((item) => item.id === chatRun?.sessionId);
+    if (session) {
+      applyUsageToSession(session, ev);
+      saveState();
+      if (session.id === activeSessionId) {
+        renderUsageBar();
+        renderContextMeter();
+      }
+    }
+    return;
+  }
   if (type === 'turn-end') {
     return;
   }
@@ -1411,6 +1432,9 @@ function renderLeftDynamic() {
 function deleteSession(id) {
   if (sessions.length <= 1) return toast('至少保留一个会话');
   const s = sessions.find((x) => x.id === id); if (!s) return;
+  if (chatRun && !chatRun.finalized && chatRun.sessionId === id) {
+    return toast('生成中无法删除该会话，请先停止');
+  }
   if (!confirm('确定删除「' + s.title + '」？')) return;
   sessions = sessions.filter((x) => x.id !== id);
   if (activeSessionId === id) activeSessionId = sessions[0].id;
@@ -1418,6 +1442,9 @@ function deleteSession(id) {
 }
 function deleteProject(id) {
   const p = getProject(id); if (!p) return;
+  const running = chatRun && !chatRun.finalized
+    && sessions.some((session) => session.id === chatRun.sessionId && session.projectId === id);
+  if (running) return toast('生成中无法删除该项目，请先停止');
   if (!confirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）')) return;
   projects = projects.filter((x) => x.id !== id);
   sessions = sessions.filter((s) => s.projectId !== id);
@@ -1499,10 +1526,99 @@ function updateHeader() {
 async function updateStatusBar() {
   try {
     const settings = await window.codex.getSettings();
+    currencySymbol = settings.usageCurrency || '$';
+    usageDisplayEnabled = settings.usageEnabled !== false;
     document.getElementById('status-left').textContent = '安全 · ' + (settings.mode === 'api' ? 'API 模式' : '本地模拟');
     const proj = sessionProject();
     document.getElementById('status-mid').textContent = proj?.path ? ('项目: ' + proj.name) : (settings.mode === 'api' ? (settings.model || '') : 'mock');
+    renderUsageBar();
+    renderContextMeter();
   } catch { document.getElementById('status-left').textContent = '安全'; }
+}
+
+function fmtTok(value) {
+  const number = Math.max(0, Number(value) || 0);
+  if (number >= 10000) return (number / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+  if (number >= 1000) return (number / 1000).toFixed(1) + 'k';
+  return String(Math.floor(number));
+}
+
+function applyUsageToSession(session, event) {
+  if (!session || !event) return;
+  if (!session.usage) {
+    session.usage = { in: 0, out: 0, cost: 0, est: false, byKind: {}, costByCurrency: {} };
+  }
+  const usage = session.usage;
+  if (!usage.byKind || typeof usage.byKind !== 'object') usage.byKind = {};
+  if (!usage.costByCurrency || typeof usage.costByCurrency !== 'object') {
+    usage.costByCurrency = {};
+    if (Number(usage.cost) > 0) {
+      usage.costByCurrency[String(usage.currency || currencySymbol)] = Number(usage.cost);
+    }
+  }
+  const inputTokens = Math.max(0, Number(event.inputTokens) || 0);
+  const outputTokens = Math.max(0, Number(event.outputTokens) || 0);
+  usage.in = Math.max(0, Number(usage.in) || 0) + inputTokens;
+  usage.out = Math.max(0, Number(usage.out) || 0) + outputTokens;
+  const eventCurrency = String(event.currency || currencySymbol);
+  if (typeof event.cost === 'number' && Number.isFinite(event.cost) && event.cost >= 0) {
+    usage.costByCurrency[eventCurrency] = Number(usage.costByCurrency[eventCurrency] || 0)
+      + event.cost;
+  }
+  usage.cost = Number(usage.costByCurrency[eventCurrency] || 0);
+  if (event.estimated) usage.est = true;
+  usage.currency = eventCurrency;
+  const kind = String(event.kind || 'main');
+  if (!usage.byKind[kind]) usage.byKind[kind] = { in: 0, out: 0 };
+  usage.byKind[kind].in += inputTokens;
+  usage.byKind[kind].out += outputTokens;
+  usage.lastContextTokens = Math.max(0, Number(event.contextTokens) || 0);
+  usage.contextLimit = Math.max(1, Number(event.contextLimit) || 24000);
+}
+
+function renderUsageBar() {
+  const el = document.getElementById('usage-bar');
+  if (!el) return;
+  const usage = activeSession()?.usage;
+  if (!usageDisplayEnabled || !usage || (!usage.in && !usage.out)) {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  const approximate = usage.est ? '≈' : '';
+  let text = `${approximate}↑${fmtTok(usage.in)} ↓${fmtTok(usage.out)}`;
+  const cost = Number(usage.costByCurrency?.[currencySymbol]
+    ?? (usage.currency === currencySymbol ? usage.cost : 0)) || 0;
+  if (cost > 0) {
+    text += ` ${currencySymbol}${cost.toFixed(cost < 0.1 ? 4 : 2)}`;
+  }
+  el.textContent = text;
+  el.classList.remove('hidden');
+}
+
+function renderContextMeter() {
+  const el = document.getElementById('context-meter');
+  if (!el) return;
+  const usage = activeSession()?.usage;
+  if (!usageDisplayEnabled || !usage || !usage.lastContextTokens) {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  const limit = usage.contextLimit || 24000;
+  const over = usage.lastContextTokens >= limit;
+  el.textContent = `上下文 ≈${fmtTok(usage.lastContextTokens)} / ${fmtTok(limit)}`
+    + (over ? ' · 建议 /compact' : '');
+  el.classList.toggle('is-over', over);
+  el.classList.remove('hidden');
+}
+
+function showUsageDetails() {
+  const byKind = activeSession()?.usage?.byKind || {};
+  const text = Object.entries(byKind)
+    .map(([kind, usage]) => `${kind} ↑${fmtTok(usage.in)} ↓${fmtTok(usage.out)}`)
+    .join(' / ');
+  if (text) toast(text);
 }
 function updateClock() {
   const el = document.getElementById('clock'); if (!el) return;
@@ -1862,6 +1978,7 @@ function handleSlashCommand(text) {
       content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name> /compact /export md|json /remember /memory /forget\n'
         + '/compact：把更早的消息压缩成一条摘要，保留最近若干条原文（生成中不可用）\n'
         + '/export md｜/export json：导出当前会话，路径在保存对话框里选\n'
+        + '/fetch <url>：抓取网页正文进会话（需先开启网页访问）；/usage：查看 token 用量\n'
         + '/remember <事实>：记入长期记忆（绑定项目时进项目级，否则用户级）\n'
         + '/memory：列出长期记忆；/forget <id>：删除一条\n'
         + '任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）',
@@ -1900,6 +2017,89 @@ function handleSlashCommand(text) {
     } else {
       toast('用法：/export md 或 /export json');
     }
+    return true;
+  }
+  if (lower.startsWith('/fetch ')) {
+    const url = cmd.slice(7).trim();
+    if (!url) { toast('用法：/fetch <url>'); return true; }
+    const targetSession = activeSession();
+    toast('抓取中…');
+    window.codex.webFetch({ url }).then((result) => {
+      if (!targetSession) return;
+      if (!result.ok) {
+        targetSession.messages.push({
+          role: 'assistant',
+          content: `网页抓取失败（${result.code || '?'}）：${result.error || ''}`,
+          error: true,
+        });
+      } else {
+        const head = `【网页】${result.title ? result.title + ' ' : ''}${result.url}`
+          + (result.truncated ? '（已截断）' : '');
+        targetSession.messages.push({ role: 'assistant', content: head + '\n\n' + result.text });
+      }
+      targetSession.updatedAt = Date.now();
+      saveState();
+      if (targetSession.id === activeSessionId) renderMessages();
+    }).catch((error) => toast(error.message || String(error)));
+    return true;
+  }
+  if (lower === '/usage') {
+    const targetSession = activeSession();
+    const now = Date.now();
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+    const week = new Date(today);
+    week.setDate(week.getDate() - ((week.getDay() + 6) % 7));
+    const query = (from, groupBy) => window.codex.usageSummary({
+      ...(from ? { from, to: now } : {}),
+      groupBy,
+    });
+    Promise.all([
+      query(today.getTime(), 'kind'),
+      query(today.getTime(), 'model'),
+      query(week.getTime(), 'kind'),
+      query(week.getTime(), 'model'),
+      query(0, 'kind'),
+      query(0, 'model'),
+    ]).then(([todayKind, todayModel, weekKind, weekModel, totalKind, totalModel]) => {
+      if (!targetSession) return;
+      if (!totalKind.ok) {
+        targetSession.messages.push({ role: 'assistant', content: totalKind.error, error: true });
+      } else {
+        const currency = totalKind.currency || '$';
+        const fmtCost = (cost) => cost > 0 ? ` ${currency}${cost.toFixed(4)}` : '';
+        const section = (label, byKind, byModel) => {
+          if (!byKind?.ok) return [`${label}：${byKind?.error || '读取失败'}`];
+          const lines = [
+            `${label}：↑${fmtTok(byKind.totals.in)} ↓${fmtTok(byKind.totals.out)}`
+              + fmtCost(byKind.totals.cost)
+              + (byKind.totals.estimatedShare > 0
+                ? `（约 ${(byKind.totals.estimatedShare * 100).toFixed(0)}% 为估算）`
+                : ''),
+            '  按来源：' + (byKind.groups.length
+              ? byKind.groups.map((group) => `${group.key} ↑${fmtTok(group.in)} ↓${fmtTok(group.out)}${fmtCost(group.cost)}`).join('；')
+              : '无'),
+            '  按模型：' + (byModel?.ok && byModel.groups.length
+              ? byModel.groups.map((group) => `${group.key} ↑${fmtTok(group.in)} ↓${fmtTok(group.out)}${fmtCost(group.cost)}`).join('；')
+              : '无'),
+          ];
+          return lines;
+        };
+        const lines = [
+          ...section('今日', todayKind, todayModel),
+          ...section('本周', weekKind, weekModel),
+          ...section('总计', totalKind, totalModel),
+        ];
+        if (totalKind.skipped) lines.push(`（${totalKind.skipped} 条损坏记录已跳过）`);
+        if (totalKind.mixedCurrencies?.length) {
+          lines.push(`（未合计其他币种：${totalKind.mixedCurrencies.join('、')}）`);
+        }
+        targetSession.messages.push({ role: 'assistant', content: lines.join('\n') });
+      }
+      targetSession.updatedAt = Date.now();
+      saveState();
+      if (targetSession.id === activeSessionId) renderMessages();
+    }).catch((error) => toast(error.message || String(error)));
     return true;
   }
   const memorySession = activeSession();
@@ -1949,6 +2149,7 @@ function cloneForIpc(value) {
  */
 function requestCompact(session, force) {
   return window.codex.compactSession({
+    sessionId: String(session?.id || ''),
     force: !!force,
     messages: cloneForIpc(session?.messages || []),
   });
@@ -1973,6 +2174,7 @@ async function runCompactOnSession(session, { force } = {}) {
       toast(force ? '无需压缩：没有可压缩的更早消息' : '未达压缩阈值');
       return false;
     }
+    if (res.usage) applyUsageToSession(session, res.usage);
     session.messages = res.messages;
     session.updatedAt = Date.now();
     saveState();
@@ -1992,6 +2194,7 @@ async function maybeAutoCompact(session) {
     if (st?.autoCompact !== true) return false;
     const res = await requestCompact(session, false);
     if (!res?.ok || !res.needed) return false;
+    if (res.usage) applyUsageToSession(session, res.usage);
     session.messages = res.messages;
     session.updatedAt = Date.now();
     saveState();
@@ -2292,9 +2495,36 @@ async function openSettings() {
   if (mmt) mmt.value = String(settings.memoryInjectMaxTokens ?? 1200);
   const he = document.getElementById('set-hooks-enabled');
   if (he) he.checked = settings.hooksEnabled !== false;
+  const webEnabled = document.getElementById('set-web-enabled');
+  if (webEnabled) webEnabled.checked = settings.webEnabled === true;
+  const webConfirm = document.getElementById('set-web-confirm');
+  if (webConfirm) webConfirm.checked = settings.webRequireConfirm !== false;
+  const webAllow = document.getElementById('set-web-allow');
+  if (webAllow) webAllow.value = (settings.webAllowDomains || []).join('\n');
+  const webDeny = document.getElementById('set-web-deny');
+  if (webDeny) webDeny.value = (settings.webDenyDomains || []).join('\n');
+  const webTimeout = document.getElementById('set-web-timeout');
+  if (webTimeout) webTimeout.value = String(settings.webTimeoutMs ?? 15000);
+  const webMaxBytes = document.getElementById('set-web-max-bytes');
+  if (webMaxBytes) webMaxBytes.value = String(settings.webMaxBytes ?? 524288);
+  const webMaxChars = document.getElementById('set-web-max-chars');
+  if (webMaxChars) webMaxChars.value = String(settings.webMaxChars ?? 15000);
+  const usageEnabled = document.getElementById('set-usage-enabled');
+  if (usageEnabled) usageEnabled.checked = settings.usageEnabled !== false;
+  const usageMaxRecords = document.getElementById('set-usage-max-records');
+  if (usageMaxRecords) usageMaxRecords.value = String(settings.usageMaxRecords ?? 5000);
+  const usagePricing = document.getElementById('set-usage-pricing');
+  if (usagePricing) {
+    usagePricing.value = (settings.usagePricing || [])
+      .map((row) => `${row.modelPrefix},${row.inputPerM},${row.outputPerM}`)
+      .join('\n');
+  }
+  const usageCurrency = document.getElementById('set-usage-currency');
+  if (usageCurrency) usageCurrency.value = settings.usageCurrency || '$';
   document.getElementById('settings-modal').classList.remove('hidden');
   await refreshHooksSummary();
   await renderMemoryList();
+  await refreshUsageSummaryBox();
 }
 function closeSettings() {
   document.getElementById('settings-modal').classList.add('hidden');
@@ -2372,6 +2602,23 @@ async function refreshHooksSummary() {
     el.textContent = 'Hooks 摘要加载失败';
   }
 }
+
+async function refreshUsageSummaryBox() {
+  const box = document.getElementById('usage-summary-box');
+  if (!box || !window.codex?.usageSummary) return;
+  try {
+    const result = await window.codex.usageSummary({ groupBy: 'model' });
+    box.textContent = result.ok
+      ? `历史总计：↑${fmtTok(result.totals.in)} ↓${fmtTok(result.totals.out)}`
+        + (result.totals.cost > 0 ? ` ${result.currency}${result.totals.cost.toFixed(4)}` : '')
+        + (result.mixedCurrencies?.length
+          ? ` · 未合计 ${result.mixedCurrencies.join('、')}`
+          : '')
+      : result.error;
+  } catch {
+    box.textContent = '用量加载失败';
+  }
+}
 async function saveSettingsFromForm() {
   const mcpServers = serializeMcpServerList();
   const partial = {
@@ -2400,11 +2647,34 @@ async function saveSettingsFromForm() {
     compactKeepMessages: Number(document.getElementById('set-compact-keep-messages')?.value || 24),
     compactMaxMessages: Number(document.getElementById('set-compact-max-messages')?.value || 40),
     compactMaxApproxTokens: Number(document.getElementById('set-compact-max-tokens')?.value || 24000),
+    webEnabled: Boolean(document.getElementById('set-web-enabled')?.checked),
+    webRequireConfirm: document.getElementById('set-web-confirm')?.checked !== false,
+    webAllowDomains: (document.getElementById('set-web-allow')?.value || '')
+      .split('\n').map((value) => value.trim()).filter(Boolean),
+    webDenyDomains: (document.getElementById('set-web-deny')?.value || '')
+      .split('\n').map((value) => value.trim()).filter(Boolean),
+    webTimeoutMs: Number(document.getElementById('set-web-timeout')?.value || 15000),
+    webMaxBytes: Number(document.getElementById('set-web-max-bytes')?.value || 524288),
+    webMaxChars: Number(document.getElementById('set-web-max-chars')?.value || 15000),
+    usageEnabled: document.getElementById('set-usage-enabled')?.checked !== false,
+    usageMaxRecords: Number(document.getElementById('set-usage-max-records')?.value || 5000),
+    usagePricing: (document.getElementById('set-usage-pricing')?.value || '')
+      .split('\n').map((line) => {
+        const [modelPrefix, inputPerM, outputPerM] = line.split(',').map((value) => value.trim());
+        return { modelPrefix, inputPerM: Number(inputPerM), outputPerM: Number(outputPerM) };
+      }).filter((row) => row.modelPrefix),
+    usageCurrency: (document.getElementById('set-usage-currency')?.value || '$').slice(0, 4),
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
   await window.codex.saveSettings(partial);
+  usageDisplayEnabled = partial.usageEnabled !== false;
+  currencySymbol = partial.usageCurrency || '$';
   defaultAgentModeSeed = partial.defaultAgentMode === 'plan' ? 'plan' : 'agent';
-  closeSettings(); await updateStatusBar(); toast('设置已保存');
+  closeSettings();
+  renderUsageBar();
+  renderContextMeter();
+  await updateStatusBar();
+  toast('设置已保存');
   // Refresh terminal input enablement hint via status only; gate still enforces at run time.
 }
 async function sendMessage() {
@@ -2531,6 +2801,21 @@ function bindEvents() {
   document.getElementById('btn-settings').addEventListener('click', () => openSettings().catch((e) => alert(e.message)));
   document.getElementById('btn-settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('btn-settings-save').addEventListener('click', () => saveSettingsFromForm().catch((e) => alert(e.message)));
+  document.getElementById('usage-bar')?.addEventListener('click', showUsageDetails);
+  document.getElementById('btn-usage-clear')?.addEventListener('click', async () => {
+    if (!confirm('确定清空全部用量记录？此操作不可撤销。')) return;
+    const result = await window.codex.usageClear();
+    if (!result?.ok) {
+      toast(result?.error || '清空失败');
+      return;
+    }
+    for (const session of sessions) delete session.usage;
+    saveState();
+    renderUsageBar();
+    renderContextMeter();
+    await refreshUsageSummaryBox();
+    toast('已清空');
+  });
   document.getElementById('btn-hooks-refresh')?.addEventListener('click', () => refreshHooksSummary().catch(() => {}));
   document.getElementById('btn-mcp-add')?.addEventListener('click', () => addMcpServerDraft());
   document.getElementById('btn-mcp-import')?.addEventListener('click', () => {

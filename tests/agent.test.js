@@ -11,6 +11,7 @@ const {
   TOOL_DEFS,
   toolsForSettings,
   createDefaultRegistry,
+  buildUsageEvent,
 } = require('../src/ai/agent');
 const { createMemoryOnlyRegistry } = require('../src/ai/providers');
 const { memoryFilePath, readEntries } = require('../src/ai/memory-store');
@@ -24,6 +25,120 @@ try {
 } catch {
   gitAvailable = false;
 }
+
+describe('D.3 usage event', () => {
+  const baseSettings = {
+    mode: 'api',
+    model: 'gpt-4o-mini',
+    maxAgentTurns: 1,
+    usageEnabled: true,
+    usageCurrency: '$',
+    usagePricing: [
+      { modelPrefix: 'gpt-4o-mini', inputPerM: 0.15, outputPerM: 0.6 },
+    ],
+    verifyBeforeDone: false,
+    hooksEnabled: false,
+    compactMaxApproxTokens: 24000,
+  };
+
+  it('buildUsageEvent uses and prices real usage', () => {
+    const event = buildUsageEvent({
+      settings: baseSettings,
+      messages: [{ role: 'user', content: 'q' }],
+      msg: { content: 'a', usage: { prompt_tokens: 1000000, completion_tokens: 0 } },
+    });
+    assert.equal(event.type, AGENT_EVENTS.USAGE);
+    assert.equal(event.kind, 'main');
+    assert.equal(event.estimated, false);
+    assert.ok(Math.abs(event.cost - 0.15) < 1e-9);
+    assert.equal(event.contextTokens, 1000000);
+    assert.equal(event.contextLimit, 24000);
+  });
+
+  it('falls back to an unpriced estimate', () => {
+    const event = buildUsageEvent({
+      settings: { ...baseSettings, usagePricing: [] },
+      messages: [{ role: 'user', content: 'x'.repeat(400) }],
+      msg: { content: 'y'.repeat(40) },
+    });
+    assert.equal(event.estimated, true);
+    assert.equal(event.cost, null);
+    assert.ok(event.inputTokens >= 100);
+  });
+
+  it('returns null when usage metering is disabled', () => {
+    assert.equal(buildUsageEvent({
+      settings: { ...baseSettings, usageEnabled: false },
+      messages: [],
+      msg: { content: 'a' },
+    }), null);
+  });
+
+  it('emits one usage event per successful model call', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-usage-event-'));
+    const events = [];
+    await runAgentLoop({
+      project: { path: dir },
+      settings: baseSettings,
+      messages: [{ role: 'user', content: 'hello' }],
+      chatFn: async () => ({
+        role: 'assistant',
+        content: 'answer',
+        usage: { prompt_tokens: 10, completion_tokens: 2 },
+      }),
+      onEvent: (event) => events.push(event),
+    });
+    const usageEvents = events.filter((event) => event.type === AGENT_EVENTS.USAGE);
+    assert.equal(usageEvents.length, 1);
+    assert.equal(usageEvents[0].inputTokens, 10);
+  });
+
+  it('retries stream_options once without duplicating usage', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-usage-options-'));
+    const calls = [];
+    const events = [];
+    await runAgentLoop({
+      project: { path: dir },
+      settings: baseSettings,
+      messages: [{ role: 'user', content: 'hello' }],
+      chatFn: async (opts) => {
+        calls.push({ stream: opts.stream, includeUsage: opts.includeUsage });
+        if (opts.includeUsage !== false) throw new Error('stream_options unsupported');
+        return { role: 'assistant', content: 'answer' };
+      },
+      onEvent: (event) => events.push(event),
+    });
+    assert.deepEqual(calls, [
+      { stream: true, includeUsage: true },
+      { stream: true, includeUsage: false },
+    ]);
+    assert.equal(events.filter((event) => event.type === AGENT_EVENTS.USAGE).length, 1);
+  });
+
+  it('preserves the stream_options fallback when tools are also unsupported', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-usage-options-tools-'));
+    const calls = [];
+    const events = [];
+    await runAgentLoop({
+      project: { path: dir },
+      settings: baseSettings,
+      messages: [{ role: 'user', content: 'hello' }],
+      chatFn: async (opts) => {
+        calls.push({ includeUsage: opts.includeUsage, tools: Array.isArray(opts.tools) });
+        if (opts.includeUsage !== false) throw new Error('stream_options unsupported');
+        if (Array.isArray(opts.tools)) throw new Error('tools unsupported');
+        return { role: 'assistant', content: 'answer' };
+      },
+      onEvent: (event) => events.push(event),
+    });
+    assert.deepEqual(calls, [
+      { includeUsage: true, tools: true },
+      { includeUsage: false, tools: true },
+      { includeUsage: false, tools: false },
+    ]);
+    assert.equal(events.filter((event) => event.type === AGENT_EVENTS.USAGE).length, 1);
+  });
+});
 
 function initTempRepo() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-git-'));

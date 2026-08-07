@@ -1,7 +1,9 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('zlib');
-const { fetchUrl, makeSafeLookup } = require('../src/ai/web-fetch');
+const http = require('http');
+const { EventEmitter } = require('events');
+const { fetchUrl, makeSafeLookup, defaultRequestFn } = require('../src/ai/web-fetch');
 
 function fakeRequest(routes) {
   const calls = [];
@@ -24,6 +26,79 @@ function fakeRequest(routes) {
   fn.options = options;
   return fn;
 }
+
+describe('defaultRequestFn cleanup', () => {
+  it('clears its timer and abort listener after a successful response', async () => {
+    const originalRequest = http.request;
+    const originalSetTimeout = global.setTimeout;
+    const originalClearTimeout = global.clearTimeout;
+    const timer = { id: 'request-timeout' };
+    const cleared = [];
+    let addedAbort;
+    let removedAbort;
+    http.request = (_options, onResponse) => {
+      const req = new EventEmitter();
+      req.destroy = () => {};
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.headers = { 'content-type': 'text/plain' };
+        onResponse(res);
+        res.emit('data', Buffer.from('ok'));
+        res.emit('end');
+      };
+      return req;
+    };
+    global.setTimeout = () => timer;
+    global.clearTimeout = (value) => cleared.push(value);
+    const signal = {
+      aborted: false,
+      addEventListener: (_name, listener) => { addedAbort = listener; },
+      removeEventListener: (_name, listener) => { removedAbort = listener; },
+    };
+    try {
+      const result = await defaultRequestFn('http://example.com/', {
+        headers: {}, timeoutMs: 1000, maxBytes: 100, signal,
+        lookup: (_host, _opts, callback) => callback(null, [{ address: '93.184.216.34', family: 4 }]),
+      });
+      assert.equal(result.body.toString('utf8'), 'ok');
+      assert.deepEqual(cleared, [timer]);
+      assert.equal(removedAbort, addedAbort);
+    } finally {
+      http.request = originalRequest;
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
+    }
+  });
+
+  it('actively destroys the default transport after maxBytes', async () => {
+    const originalRequest = http.request;
+    let destroyed = false;
+    http.request = (_options, onResponse) => {
+      const req = new EventEmitter();
+      req.destroy = () => { destroyed = true; };
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.headers = { 'content-type': 'text/plain' };
+        onResponse(res);
+        res.emit('data', Buffer.from('0123456789'));
+      };
+      return req;
+    };
+    try {
+      const result = await defaultRequestFn('http://example.com/', {
+        headers: {}, timeoutMs: 1000, maxBytes: 4,
+        lookup: (_host, _opts, callback) => callback(null, [{ address: '93.184.216.34', family: 4 }]),
+      });
+      assert.equal(result.truncated, true);
+      assert.equal(result.body.toString('utf8'), '0123');
+      assert.equal(destroyed, true);
+    } finally {
+      http.request = originalRequest;
+    }
+  });
+});
 
 describe('fetchUrl', () => {
   it('fetches html, extracts markdown, and sends only public request headers', async () => {
@@ -196,16 +271,11 @@ describe('fetchUrl', () => {
 
   it('enforces one overall timeout across redirect hops', async () => {
     let transportAborted = false;
-    const requestFn = async (url, { signal }) => {
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, 15);
-        signal.addEventListener('abort', () => {
-          clearTimeout(timer);
-          transportAborted = true;
-          reject(new Error('aborted'));
-        }, { once: true });
-      });
+    const requestTimeouts = [];
+    const requestFn = async (url, { signal, timeoutMs }) => {
+      requestTimeouts.push(timeoutMs);
       if (url.endsWith('/1')) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
         return {
           status: 302,
           headers: { location: '/2', 'content-type': 'text/plain' },
@@ -213,16 +283,18 @@ describe('fetchUrl', () => {
           truncated: false,
         };
       }
-      return {
-        status: 200,
-        headers: { 'content-type': 'text/plain' },
-        body: Buffer.from('late'),
-        truncated: false,
-      };
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          transportAborted = true;
+          reject(new Error('aborted'));
+        }, { once: true });
+      });
     };
-    const r = await fetchUrl('https://a.com/1', { requestFn, timeoutMs: 20 });
+    const r = await fetchUrl('https://a.com/1', { requestFn, timeoutMs: 250 });
     assert.equal(r.ok, false);
     assert.equal(r.code, 'TIMEOUT');
+    assert.equal(requestTimeouts.length, 2);
+    assert.ok(requestTimeouts[1] < requestTimeouts[0]);
     assert.equal(transportAborted, true);
   });
 

@@ -65,6 +65,7 @@
             <div>
               <h1 id="session-heading">优化 KV 读写成本</h1>
               <div class="session-sub" id="session-sub">与 Codex 小蓝 对话</div>
+              <div class="usage-bar hidden" id="usage-bar" title="点击展开按来源明细"></div>
             </div>
             <div class="session-actions">
               <button type="button" class="ghost-btn hidden" id="btn-bind-project">绑定目录</button>
@@ -89,6 +90,7 @@
             </div>
             <div id="emoji-panel" class="emoji-panel hidden"></div>
             <div id="attach-preview" class="attach-preview hidden"></div>
+            <div class="context-meter hidden" id="context-meter"></div>
             <textarea id="chat-input" rows="3" placeholder="输入消息，Enter 发送..."></textarea>
             <div class="composer-footer">
               <span class="hint">Enter 发送 · Shift+Enter 换行 · /help 查看命令</span>
@@ -278,6 +280,27 @@
         <label class="switch-row"><input type="checkbox" id="set-hooks-enabled" checked /> <span>启用 Hooks（项目 .codex/hooks.json + 用户 hooks.json）</span></label>
         <div class="hooks-summary" id="hooks-summary">Hooks 摘要：未加载</div>
         <button type="button" id="btn-hooks-refresh" class="btn-small">刷新 Hooks</button>
+
+        <div class="settings-section-title">网页访问（D.3）</div>
+        <label class="switch-row"><input type="checkbox" id="set-web-enabled" /> <span>允许 Agent 抓取公网网页（默认关）</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-web-confirm" /> <span>每个新域名需审批（full-auto 下也生效）</span></label>
+        <label class="field-row"><span>允许域名（每行一个，留空 = 不限制公网）</span>
+          <textarea id="set-web-allow" rows="2" placeholder="example.com"></textarea></label>
+        <label class="field-row"><span>拒绝域名（每行一个）</span>
+          <textarea id="set-web-deny" rows="2"></textarea></label>
+        <label class="field-row"><span>超时 (ms)</span><input id="set-web-timeout" type="number" min="3000" max="60000" step="1000" value="15000" /></label>
+        <label class="field-row"><span>响应上限 (bytes)</span><input id="set-web-max-bytes" type="number" min="32768" max="4194304" step="65536" value="524288" /></label>
+        <label class="field-row"><span>正文上限 (chars)</span><input id="set-web-max-chars" type="number" min="1000" max="50000" step="1000" value="15000" /></label>
+
+        <div class="settings-section-title">用量统计（D.3）</div>
+        <label class="switch-row"><input type="checkbox" id="set-usage-enabled" /> <span>统计 token 用量（默认开）</span></label>
+        <label class="field-row"><span>记录上限</span><input id="set-usage-max-records" type="number" min="500" max="50000" step="500" value="5000" /></label>
+        <label class="field-row"><span>价格表（每行：模型前缀,输入单价,输出单价 / 每百万 token；留空只显示 token）</span>
+          <textarea id="set-usage-pricing" rows="2" placeholder="gpt-4o-mini,0.15,0.6"></textarea></label>
+        <label class="field-row"><span>币种符号</span><input id="set-usage-currency" type="text" maxlength="4" value="$" /></label>
+        <div class="usage-summary" id="usage-summary-box" aria-live="polite">加载中…</div>
+        <button type="button" class="ghost-btn" id="btn-usage-clear">清空用量记录</button>
+
         <small class="field-hint">Agent 仅在「API 模式 + 已绑定项目」时生效。终端命令在项目目录内用 PowerShell 执行。计划模式只读 + submit_plan。MCP 仅 agent 模式、非子 Agent 时连接。</small>
       </div>
       <div class="modal-actions">

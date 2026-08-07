@@ -76,24 +76,44 @@ function defaultRequestFn(urlString, {
     }
 
     const lib = parsed.protocol === 'https:' ? https : http;
-    const req = lib.request({
-      protocol: parsed.protocol,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: 'GET',
-      headers,
-      lookup: lookup || makeSafeLookup(),
-    }, (res) => {
+    let settled = false;
+    let timeout = null;
+    let timedOut = false;
+    let aborted = false;
+    let req;
+    const onAbort = () => {
+      aborted = true;
+      req?.destroy(makeAbortError());
+    };
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
+    const settleResolve = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const settleReject = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    try {
+      req = lib.request({
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: 'GET',
+        headers,
+        lookup: lookup || makeSafeLookup(),
+      }, (res) => {
       const chunks = [];
       let received = 0;
-      let settled = false;
-
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
 
       res.on('data', (chunk) => {
         if (settled) return;
@@ -102,7 +122,7 @@ function defaultRequestFn(urlString, {
         if (received > maxBytes) {
           const keep = body.length - (received - maxBytes);
           if (keep > 0) chunks.push(body.slice(0, keep));
-          finish({
+          settleResolve({
             status: res.statusCode || 0,
             headers: res.headers || {},
             body: Buffer.concat(chunks),
@@ -113,26 +133,24 @@ function defaultRequestFn(urlString, {
         }
         chunks.push(body);
       });
-      res.on('end', () => finish({
+      res.on('end', () => settleResolve({
         status: res.statusCode || 0,
         headers: res.headers || {},
         body: Buffer.concat(chunks),
         truncated: false,
       }));
-      res.on('error', reject);
-    });
+        res.on('error', settleReject);
+      });
+    } catch (error) {
+      settleReject(error);
+      return;
+    }
 
-    let timedOut = false;
-    let aborted = false;
-    const timeout = setTimeout(() => {
+    timeout = setTimeout(() => {
       timedOut = true;
       req.destroy(makeTimeoutError());
     }, timeoutMs);
 
-    const onAbort = () => {
-      aborted = true;
-      req.destroy(makeAbortError());
-    };
     if (signal) {
       if (signal.aborted) {
         onAbort();
@@ -142,11 +160,9 @@ function defaultRequestFn(urlString, {
     }
 
     req.on('error', (error) => {
-      clearTimeout(timeout);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (timedOut) reject(makeTimeoutError());
-      else if (aborted) reject(makeAbortError());
-      else reject(error);
+      if (timedOut) settleReject(makeTimeoutError());
+      else if (aborted) settleReject(makeAbortError());
+      else settleReject(error);
     });
     req.end();
   });

@@ -10,8 +10,12 @@ const {
   sanitizePricing,
 } = require('./ai/settings');
 const { generateLocalReply } = require('./ai/local-mock');
-const { chatCompletion } = require('./ai/openai-compatible');
-const { runAgentLoop, applyWriteFencesWithGate } = require('./ai/agent');
+const { chatCompletionMessage } = require('./ai/openai-compatible');
+const {
+  runAgentLoop,
+  applyWriteFencesWithGate,
+  buildUsageEvent,
+} = require('./ai/agent');
 const { createMemoryOnlyRegistry } = require('./ai/providers');
 const { AGENT_EVENTS } = require('./ai/agent-events');
 const { createPermissionGate } = require('./ai/permission');
@@ -49,6 +53,15 @@ const {
   defaultExportFilename,
 } = require('./ai/session-export');
 const { memoryList, memoryAdd, memoryDelete } = require('./ai/memory-ipc');
+const { fetchUrl } = require('./ai/web-fetch');
+const { aggregate } = require('./ai/usage');
+const {
+  usageFilePath,
+  appendRecord,
+  readRecords,
+  pruneRecords,
+  clearRecords,
+} = require('./ai/usage-store');
 
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
@@ -102,6 +115,32 @@ let manualTerm = null;
 
 function userDataPath() {
   return app.getPath('userData');
+}
+
+function persistUsageEvent(settings, sessionId, event) {
+  if (!event || settings?.usageEnabled === false) return false;
+  try {
+    const file = usageFilePath(userDataPath());
+    appendRecord(file, {
+      ts: Date.now(),
+      session: String(sessionId || ''),
+      model: String(event.model || ''),
+      kind: String(event.kind || 'main'),
+      in: Number(event.inputTokens) || 0,
+      out: Number(event.outputTokens) || 0,
+      cached: Number(event.cachedInputTokens) || 0,
+      est: event.estimated === true,
+      cost: typeof event.cost === 'number' && Number.isFinite(event.cost)
+        ? event.cost
+        : null,
+      cur: String(event.currency || '$'),
+    });
+    pruneRecords(file, settings.usageMaxRecords);
+    return true;
+  } catch {
+    // Usage metering is best-effort and must never interrupt a chat or compact.
+    return false;
+  }
 }
 
 function bundledSkillsDir() {
@@ -224,12 +263,23 @@ function createWindow() {
   return win;
 }
 
-app.whenReady().then(() => {
-  createWindow();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.focus();
   });
-});
+  app.whenReady().then(() => {
+    createWindow();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
@@ -379,7 +429,26 @@ ipcMain.handle('session:compact', async (_e, payload = {}) => {
       return { ok: true, needed: false, approxTokens: plan.approxTokens };
     }
     const transcript = serializeOlderTranscript(plan.older);
-    const summary = await generateCompactSummary({ transcript, settings });
+    let compactUsage = null;
+    const summary = await generateCompactSummary({
+      transcript,
+      settings,
+      chatFn: chatCompletionMessage,
+      onUsage: ({ rawUsage, messages: sentMessages, content }) => {
+        const usageEvent = buildUsageEvent({
+          settings,
+          messages: sentMessages,
+          msg: { content, usage: rawUsage },
+        });
+        if (usageEvent) {
+          compactUsage = {
+            ...usageEvent,
+            kind: 'compact',
+          };
+          persistUsageEvent(settings, payload.sessionId, compactUsage);
+        }
+      },
+    });
     return {
       ok: true,
       needed: true,
@@ -387,6 +456,7 @@ ipcMain.handle('session:compact', async (_e, payload = {}) => {
       compactedCount: plan.older.length,
       approxTokens: plan.approxTokens,
       olderApproxTokens: plan.olderApproxTokens,
+      usage: compactUsage,
     };
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
@@ -719,6 +789,8 @@ async function startChatRun(event, payload = {}, opts = {}) {
       : 'confirm-writes',
     terminalEnabled: Boolean(settings.terminalEnabled),
     terminalRequireConfirm: settings.terminalRequireConfirm !== false,
+    webEnabled: settings.webEnabled === true,
+    webRequireConfirm: settings.webRequireConfirm !== false,
     agentMode,
     onApprovalNeeded: async (approvalPayload) => {
       safeSend(sender, 'chat:event', {
@@ -740,6 +812,9 @@ async function startChatRun(event, payload = {}, opts = {}) {
         steps: e.steps,
         sessionId,
       });
+    }
+    if (e && e.type === AGENT_EVENTS.USAGE) {
+      persistUsageEvent(settings, sessionId, e);
     }
     safeSend(sender, 'chat:event', { runId, sessionId, ...e });
   };
@@ -911,16 +986,21 @@ async function startChatRun(event, payload = {}, opts = {}) {
       if (!settings.apiKey) {
         throw new Error('未配置 API Key，请先在设置中填写，或切换到本地模拟模式');
       }
-      content = await chatCompletion({
+      const sentMessages = [
+        { role: 'system', content: systemParts.join('\n\n') },
+        ...modelMessages,
+      ];
+      const msg = await chatCompletionMessage({
         baseUrl: settings.baseUrl,
         apiKey: settings.apiKey,
         model: settings.model,
-        messages: [
-          { role: 'system', content: systemParts.join('\n\n') },
-          ...modelMessages,
-        ],
+        messages: sentMessages,
         signal,
       });
+      content = String(msg?.content || '');
+      const usageEvent = buildUsageEvent({ settings, messages: sentMessages, msg });
+      if (usageEvent) emit(usageEvent);
+      if (!content) throw new Error('API 返回空内容');
     } else {
       content = generateLocalReply(userText, { project });
     }
@@ -1068,4 +1148,63 @@ ipcMain.handle('chat:rejectPlan', async (event, payload = {}) => {
     });
   }
   return { ok: true };
+});
+
+ipcMain.handle('web:fetch', async (_event, payload = {}) => {
+  const settings = loadSettings(userDataPath());
+  if (settings.webEnabled !== true) {
+    return { ok: false, error: '网页访问未启用' };
+  }
+  try {
+    return await fetchUrl(String(payload.url || ''), {
+      allowDomains: settings.webAllowDomains,
+      denyDomains: settings.webDenyDomains,
+      maxBytes: settings.webMaxBytes,
+      timeoutMs: settings.webTimeoutMs,
+      maxChars: settings.webMaxChars,
+    });
+  } catch (err) {
+    return { ok: false, code: 'NETWORK', error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle('usage:summary', async (_event, payload = {}) => {
+  const settings = loadSettings(userDataPath());
+  if (settings.usageEnabled === false) {
+    return { ok: false, error: '用量统计未启用' };
+  }
+  try {
+    const { records, skipped } = readRecords(usageFilePath(userDataPath()));
+    const from = Number(payload.from) || 0;
+    const to = Number(payload.to) || Infinity;
+    const currency = String(settings.usageCurrency || '$');
+    const recordsInRange = records.filter((record) => record.ts >= from && record.ts <= to);
+    const filtered = recordsInRange
+      .map((record) => record.cur === currency ? record : { ...record, cost: null });
+    const currencies = [...new Set(recordsInRange.map((record) => record.cur).filter(Boolean))];
+    const { totals, groups } = aggregate(filtered, { groupBy: payload.groupBy });
+    return {
+      ok: true,
+      totals,
+      groups,
+      skipped,
+      currency,
+      mixedCurrencies: currencies.filter((value) => value !== currency),
+    };
+  } catch {
+    return { ok: false, error: '读取用量记录失败' };
+  }
+});
+
+ipcMain.handle('usage:clear', async () => {
+  const settings = loadSettings(userDataPath());
+  if (settings.usageEnabled === false) {
+    return { ok: false, error: '用量统计未启用' };
+  }
+  try {
+    clearRecords(usageFilePath(userDataPath()));
+    return { ok: true };
+  } catch {
+    return { ok: false, error: '清空用量记录失败' };
+  }
 });

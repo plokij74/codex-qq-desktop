@@ -247,13 +247,58 @@ describe('generateCompactSummary', () => {
   });
 
   it('rejects an empty model reply', async () => {
+    let usageCalled = false;
     await assert.rejects(
       () => generateCompactSummary({
         transcript: 'abc',
         settings: { mode: 'api', model: 'm' },
         chatFn: async () => '   ',
+        onUsage: () => { usageCalled = true; },
       }),
       /摘要为空/
     );
+    assert.equal(usageCalled, true);
+  });
+
+  it('reports usage inputs after an injected API call', async () => {
+    let seen;
+    await generateCompactSummary({
+      transcript: 'some earlier messages',
+      settings: { mode: 'api', baseUrl: 'https://x/v1', apiKey: 'k', model: 'm' },
+      chatFn: async () => ({
+        content: 'summary',
+        usage: { prompt_tokens: 12, completion_tokens: 3 },
+      }),
+      onUsage: (usage) => { seen = usage; },
+    });
+    assert.deepEqual(seen.rawUsage, { prompt_tokens: 12, completion_tokens: 3 });
+    assert.equal(seen.content, 'summary');
+    assert.ok(Array.isArray(seen.messages));
+  });
+
+  it('does not report usage in local mode', async () => {
+    let called = false;
+    await generateCompactSummary({
+      transcript: 'x',
+      settings: { mode: 'local' },
+      onUsage: () => { called = true; },
+    });
+    assert.equal(called, false);
+  });
+
+  it('does not fail a valid summary when usage reporting throws or rejects', async () => {
+    const base = {
+      transcript: 'x',
+      settings: { mode: 'api', model: 'm' },
+      chatFn: async () => 'summary',
+    };
+    assert.equal(await generateCompactSummary({
+      ...base,
+      onUsage: () => { throw new Error('sync usage failure'); },
+    }), 'summary');
+    assert.equal(await generateCompactSummary({
+      ...base,
+      onUsage: async () => { throw new Error('async usage failure'); },
+    }), 'summary');
   });
 });

@@ -7,6 +7,31 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+describe('D.3 usage forwarding', () => {
+  it('overrides kind on forwarded usage events', async () => {
+    const events = [];
+    const runtime = createSubagentRuntime({
+      runLoop: async ({ onEvent }) => {
+        onEvent({ type: 'usage', kind: 'main', inputTokens: 5, outputTokens: 1 });
+        return { content: 'done', turns: 1, agentLog: [] };
+      },
+    });
+    await runtime.runExplore({
+      project: { path: '/tmp' },
+      settings: {},
+      gate: null,
+      onEvent: (event) => events.push(event),
+      extensions: {},
+      sessionKey: 's',
+      subagentDepth: 0,
+    }, { goal: 'inspect usage forwarding' });
+    const usage = events.find((event) => event.type === 'usage');
+    assert.equal(usage.kind, 'explore');
+    assert.equal(usage.subagent, true);
+    assert.equal(typeof usage.subagentId, 'string');
+  });
+});
+
 function makeCtx(overrides = {}) {
   const events = [];
   return {

@@ -22,6 +22,7 @@ const AGENT_EVENTS = {
   MCP_STATUS: 'mcp-status',
   HOOK_START: 'hook-start',
   HOOK_END: 'hook-end',
+  USAGE: 'usage',
 };
 
 module.exports = { AGENT_EVENTS };

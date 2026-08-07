@@ -32,6 +32,12 @@ const { loadHooks } = require('./hooks-loader');
 const { createHooksRunner } = require('./hooks-runner');
 const { mergeSubagentFileChanges } = require('./subagent-runtime');
 const { checkUrl } = require('./url-guard');
+const {
+  normalizeUsage,
+  estimateUsage,
+  resolvePricing,
+  computeCost,
+} = require('./usage');
 
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
@@ -1157,6 +1163,25 @@ async function applyWriteFencesWithGate(projectRoot, content, {
   };
 }
 
+function buildUsageEvent({ settings, messages, msg } = {}) {
+  if (settings?.usageEnabled === false) return null;
+  const usage = normalizeUsage(msg?.usage) || estimateUsage(messages, msg?.content);
+  const pricing = resolvePricing(settings?.model, settings?.usagePricing);
+  return {
+    type: AGENT_EVENTS.USAGE,
+    kind: 'main',
+    model: String(settings?.model || ''),
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cachedInputTokens: usage.cachedInputTokens,
+    estimated: usage.estimated,
+    cost: computeCost(usage, pricing),
+    currency: String(settings?.usageCurrency || '$'),
+    contextTokens: usage.inputTokens,
+    contextLimit: Number(settings?.compactMaxApproxTokens) || 24000,
+  };
+}
+
 async function callModelTurn({
   chatFn,
   settings,
@@ -1167,6 +1192,7 @@ async function callModelTurn({
   signal,
   onEvent,
   streamFailedOnce,
+  streamOptionsFailedOnce,
 }) {
   const baseOpts = {
     baseUrl: settings.baseUrl,
@@ -1180,12 +1206,18 @@ async function callModelTurn({
   };
 
   const useStream = !streamFailedOnce;
+  const includeUsage = !streamOptionsFailedOnce;
+  const emitUsage = (msg) => {
+    const event = buildUsageEvent({ settings, messages: working, msg });
+    if (event) onEvent?.(event);
+  };
   /** True if any text-delta was already pushed for this turn (avoid full re-emit on fallback). */
   let emittedStreamText = false;
   try {
     const msg = await chatFn({
       ...baseOpts,
       stream: useStream,
+      includeUsage,
       onDelta: useStream
         ? (d) => {
           if (d?.text) {
@@ -1195,25 +1227,48 @@ async function callModelTurn({
         }
         : undefined,
     });
-    return { msg, streamFailedOnce };
+    emitUsage(msg);
+    return { msg, streamFailedOnce, streamOptionsFailedOnce };
   } catch (err) {
     if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
       const e = new Error('已停止');
       e.code = 'ABORTED';
       throw e;
     }
+    // Some compatible gateways support streaming but reject stream_options.
+    if (useStream && includeUsage && /stream_options/i.test(String(err.message || err))) {
+      try {
+        return await callModelTurn({
+          chatFn,
+          settings,
+          working,
+          tools,
+          toolsSupported,
+          fetchFn,
+          signal,
+          onEvent,
+          streamFailedOnce,
+          streamOptionsFailedOnce: true,
+        });
+      } catch (retryError) {
+        retryError.streamOptionsFailedOnce = true;
+        throw retryError;
+      }
+    }
     // Stream/SSE parse failure → one non-stream fallback
     if (useStream && /stream|SSE|parse/i.test(String(err.message || err))) {
       const msg = await chatFn({
         ...baseOpts,
         stream: false,
+        includeUsage,
       });
       // If partial stream text was already emitted, do not re-emit full content
       // (content still returned on msg for loop state / final answer).
       if (msg?.content && !emittedStreamText) {
         onEvent?.({ type: AGENT_EVENTS.TEXT_DELTA, text: msg.content });
       }
-      return { msg, streamFailedOnce: true };
+      emitUsage(msg);
+      return { msg, streamFailedOnce: true, streamOptionsFailedOnce };
     }
     throw err;
   }
@@ -1346,6 +1401,7 @@ async function runAgentLoop({
 
       let toolsSupported = true;
       let streamFailedOnce = false;
+      let streamOptionsFailedOnce = false;
 
       for (let turn = 1; unlimited || turn <= maxTurns; turn++) {
       assertNotAborted(signal);
@@ -1361,9 +1417,11 @@ async function runAgentLoop({
           signal,
           onEvent,
           streamFailedOnce,
+          streamOptionsFailedOnce,
         });
         msg = called.msg;
         streamFailedOnce = called.streamFailedOnce;
+        streamOptionsFailedOnce = called.streamOptionsFailedOnce;
       } catch (err) {
         if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
           const e = new Error('已停止');
@@ -1372,6 +1430,7 @@ async function runAgentLoop({
         }
         // Some gateways reject tools — retry once without tools
         if (toolsSupported && /tools|tool_choice|unsupported|400/i.test(String(err.message))) {
+          if (err.streamOptionsFailedOnce === true) streamOptionsFailedOnce = true;
           toolsSupported = false;
           const called = await callModelTurn({
             chatFn: chat,
@@ -1394,9 +1453,11 @@ async function runAgentLoop({
             signal,
             onEvent,
             streamFailedOnce,
+            streamOptionsFailedOnce,
           });
           msg = called.msg;
           streamFailedOnce = called.streamFailedOnce;
+          streamOptionsFailedOnce = called.streamOptionsFailedOnce;
         } else {
           throw err;
         }
@@ -2007,4 +2068,5 @@ module.exports = {
   riskForTool,
   authorizeTool,
   applyWriteFencesWithGate,
+  buildUsageEvent,
 };

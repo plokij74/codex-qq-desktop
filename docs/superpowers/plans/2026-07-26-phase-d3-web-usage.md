@@ -37,7 +37,7 @@
   - `clampUsageSettings(s) → s`（原地修改并返回）
   - `sanitizePricing(list) → { modelPrefix: string, inputPerM: number, outputPerM: number }[]`（导出，Task 8 的 `resolvePricing` 消费同一形状）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/settings.test.js` 的 `describe('settings', ...)` 内：
 
@@ -248,7 +248,7 @@ function clampUsageSettings(s) {
 Run: `node --test tests/settings.test.js`
 Expected: PASS，全部 `it` 绿
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/settings.js src/main.js tests/settings.test.js && git commit -m "feat(codex-qq): D.3 web and usage settings with clamp"
@@ -269,7 +269,7 @@ git add src/ai/settings.js src/main.js tests/settings.test.js && git commit -m "
   - `matchDomain(host: string, pattern: string) → boolean`
   - `checkUrl(rawUrl, { allowDomains?, denyDomains? }) → { ok: true, url: URL, host: string } | { ok: false, code, reason }`；`code` ∈ `INVALID | PROTOCOL | CREDENTIALS | PORT | PRIVATE_IP | DENIED | NOT_ALLOWED`（Task 4 / 6 / 9 消费）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/url-guard.test.js`：
 
@@ -394,12 +394,12 @@ describe('checkUrl', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/url-guard.test.js`
 Expected: FAIL with `Cannot find module '../src/ai/url-guard'`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 创建 `src/ai/url-guard.js`：
 
@@ -594,12 +594,12 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/url-guard.test.js`
 Expected: PASS，`# fail 0`
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/url-guard.js tests/url-guard.test.js && git commit -m "feat(codex-qq): D.3 url-guard SSRF checks"
@@ -617,7 +617,7 @@ git add src/ai/url-guard.js tests/url-guard.test.js && git commit -m "feat(codex
 - Consumes: 无
 - Produces: `extractFromHtml(html, { baseUrl?, maxChars? }) → { title: string, text: string, truncated: boolean }`（Task 4 消费）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/html-extract.test.js`：
 
@@ -701,12 +701,12 @@ describe('extractFromHtml', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/html-extract.test.js`
 Expected: FAIL with `Cannot find module '../src/ai/html-extract'`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 创建 `src/ai/html-extract.js`：
 
@@ -781,7 +781,7 @@ function extractFromHtml(rawHtml, opts = {}) {
   s = s.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_, inner) => {
     const code = decodeEntities(inner.replace(/<\/?code\b[^>]*>/gi, '').replace(/<[^>]+>/g, ''));
     codeBlocks.push(code.replace(/^\n+|\n+$/g, ''));
-    return `\n CODE${codeBlocks.length - 1} \n`;
+    return `\n\0CODE${codeBlocks.length - 1}\0\n`;
   });
   s = s.replace(/<code\b[^>]*>([\s\S]*?)<\/code\s*>/gi,
     (_, inner) => `\`${decodeEntities(inner.replace(/<[^>]+>/g, '')).trim()}\``);
@@ -815,7 +815,7 @@ function extractFromHtml(rawHtml, opts = {}) {
   s = s.replace(/<[^>]+>/g, ' ');
 
   s = decodeEntities(s);
-  s = s.replace(/ CODE(\d+) /g, (_, i) => `\n\`\`\`\n${codeBlocks[Number(i)]}\n\`\`\`\n`);
+  s = s.replace(/\0CODE(\d+)\0/g, (_, i) => `\n\`\`\`\n${codeBlocks[Number(i)]}\n\`\`\`\n`);
 
   s = s.replace(/\r\n?/g, '\n')
     .split('\n')
@@ -831,12 +831,12 @@ function extractFromHtml(rawHtml, opts = {}) {
 module.exports = { extractFromHtml };
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/html-extract.test.js`
 Expected: PASS，`# fail 0`。若某条正则断言未过，先用 `node -e "console.log(require('./src/ai/html-extract').extractFromHtml('<main>…</main>').text)"` 打印实际输出再调正则，**不要改测试期望**。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/html-extract.js tests/html-extract.test.js && git commit -m "feat(codex-qq): D.3 html to lightweight markdown extraction"
@@ -1578,7 +1578,7 @@ git add src/ai/permission.js tests/permission.test.js && git commit -m "feat(cod
   - `checkUrl(raw, { allowPrivate: true })`：跳过 `PRIVATE_IP` 与 `PORT` 检查（协议 / 凭据 / 解析仍查）——**仅供 MCP 用户自配 URL**（本地 MCP 服务器天然在 localhost，套用公网规则会把 C.5 打死；用户在设置里亲手填的 URL 信任级别不同于模型自选的 URL）
   - `agent.js` 新增 `function toolScope(name, args)`：`web_fetch` 返回 `checkUrl(args.url)` 的 host（解析失败返回 undefined），其余工具返回 undefined
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/url-guard.test.js` 的 `describe('checkUrl', ...)` 内：
 
@@ -1692,12 +1692,12 @@ describe('web provider', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/web-provider.test.js tests/url-guard.test.js`
 Expected: web-provider FAIL with `Cannot find module`；url-guard 新用例 FAIL（`allowPrivate` 未实现）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 (a) `src/ai/url-guard.js` 的 `checkUrl`：解构加 `allowPrivate`，端口块与主机名/IP 块各包一层：
 
@@ -1855,12 +1855,12 @@ function toolScope(name, args) {
 
 `src/ai/mcp-sse.js:226` 的 `if (!messageUrl) throw new Error('MCP url required');` 后加同款（变量名用 `messageUrl`）。
 
-- [ ] **Step 4: 跑测试确认通过 + 回归**
+- [x] **Step 4: 跑测试确认通过 + 回归**
 
 Run: `node --test tests/web-provider.test.js tests/url-guard.test.js tests/registry.test.js tests/mcp-http.test.js tests/mcp-sse.test.js tests/agent.test.js`
 Expected: 全 PASS。若 mcp 测试因假 URL 被新校验拦下而失败，把测试里的假 URL 改成合法形状（如 `http://localhost:3001/mcp`）——**校验行为本身不放松**。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/providers/web.js src/ai/providers/index.js src/ai/url-guard.js src/ai/agent.js src/ai/mcp-http.js src/ai/mcp-sse.js tests/web-provider.test.js tests/url-guard.test.js && git commit -m "feat(codex-qq): D.3 web_fetch provider, approval scope threading, MCP url checks"
@@ -1881,7 +1881,7 @@ git add src/ai/providers/web.js src/ai/providers/index.js src/ai/url-guard.js sr
   - `buildChatPayload(model, messages, extra)`：`extra.stream` 为真且 `extra.includeUsage !== false` 时，body 加 `stream_options: { include_usage: true }`
   - `chatCompletionMessage(opts)` 接受 `opts.includeUsage`（默认 true），供 Task 9 在网关报 `stream_options` 400 后重试时关掉
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/openai-compatible.test.js` 的 `describe('openai-compatible', ...)` 内：
 
@@ -1939,12 +1939,12 @@ git add src/ai/providers/web.js src/ai/providers/index.js src/ai/url-guard.js sr
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/openai-compatible.test.js`
 Expected: 4 条新用例 FAIL，既有用例 PASS
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 (a) `buildChatPayload`——`if (extra.stream) body.stream = true;` 后加：
 
@@ -1972,12 +1972,12 @@ Expected: 4 条新用例 FAIL，既有用例 PASS
 
 （必须在 `if (!delta) continue;` 之前——usage chunk 的 `choices` 是空数组，没有 delta。）最终 return 对象加 `usage,`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/openai-compatible.test.js`
 Expected: 全 PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/openai-compatible.js tests/openai-compatible.test.js && git commit -m "feat(codex-qq): D.3 surface token usage from chat completions"
@@ -2003,7 +2003,7 @@ git add src/ai/openai-compatible.js tests/openai-compatible.test.js && git commi
   - `usageFilePath(userDataPath) → string`；`appendRecord(file, record)`；`readRecords(file) → { records, skipped }`；`pruneRecords(file, maxRecords)`；`clearRecords(file)`
   - 落盘记录形状（Task 9 写、Task 10 读）：`{ ts, session, model, kind, in, out, cached, est, cost, cur }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/usage.test.js`：
 
@@ -2176,12 +2176,12 @@ describe('usage-store', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/usage.test.js tests/usage-store.test.js`
 Expected: 两个文件都 `Cannot find module`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 创建 `src/ai/usage.js`：
 
@@ -2359,12 +2359,12 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `node --test tests/usage.test.js tests/usage-store.test.js`
 Expected: 全 PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/usage.js src/ai/usage-store.js tests/usage.test.js tests/usage-store.test.js && git commit -m "feat(codex-qq): D.3 usage pricing pure functions and jsonl store"
@@ -2391,7 +2391,7 @@ git add src/ai/usage.js src/ai/usage-store.js tests/usage.test.js tests/usage-st
   - `generateCompactSummary({ ..., onUsage? })`：`onUsage({ rawUsage, messages, content })`，`rawUsage` 是网关原始 usage 或 null
   - IPC：`web:fetch`、`usage:summary`、`usage:clear`；preload：`webFetch` / `usageSummary` / `usageClear`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/agent.test.js`（顶部 require 补 `buildUsageEvent`，从 `../src/ai/agent` 解构；文件已有的 `runAgentLoop` 测试基建照用）：
 
@@ -2513,12 +2513,12 @@ describe('D.3 compact onUsage', () => {
 
 （该文件顶部 require 处补 `generateCompactSummary`，若已有则不动。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `node --test tests/agent.test.js tests/subagent-runtime.test.js tests/session-compact.test.js`
 Expected: 新用例 FAIL（`buildUsageEvent` 不存在 / `onUsage` 未被调用），既有用例 PASS
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 (a) `src/ai/agent-events.js`：`HOOK_END` 行后加 `USAGE: 'usage',`。
 
@@ -2728,12 +2728,12 @@ ipcMain.handle('usage:clear', async () => {
   usageClear: () => ipcRenderer.invoke('usage:clear'),
 ```
 
-- [ ] **Step 4: 跑全量测试**
+- [x] **Step 4: 跑全量测试**
 
 Run: `npm test`
 Expected: 全 PASS。`main.js` 无单测（Electron 依赖），其改动由 lint-by-run 覆盖：`node -e "new Function(require('fs').readFileSync('src/main.js','utf8'))"` 至少验证语法。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/ai/agent-events.js src/ai/agent.js src/ai/session-compact.js src/main.js src/preload.js tests/agent.test.js tests/subagent-runtime.test.js tests/session-compact.test.js && git commit -m "feat(codex-qq): D.3 usage events, compact metering, main-process ledger and IPC"
@@ -2755,7 +2755,7 @@ git add src/ai/agent-events.js src/ai/agent.js src/ai/session-compact.js src/mai
 
 renderer 无 DOM 测试基建（与 C.x/D.x 各期一致），本任务以「`npm test` 全绿 + 手动冒烟」收口。
 
-- [ ] **Step 1: index.html 三处**
+- [x] **Step 1: index.html 三处**
 
 (a) session-head（`index.html:66` 的 `session-sub` 行后）加：
 
@@ -2793,7 +2793,7 @@ renderer 无 DOM 测试基建（与 C.x/D.x 各期一致），本任务以「`np
         <button type="button" class="ghost-btn" id="btn-usage-clear">清空用量记录</button>
 ```
 
-- [ ] **Step 2: app.js —— 事件与渲染**
+- [x] **Step 2: app.js —— 事件与渲染**
 
 (a) 会话对象累计。`handleChatEvent`（`app.js:1151`）在 `if (type === 'turn-end')` 之前加：
 
@@ -2898,7 +2898,7 @@ function renderContextMeter() {
 
 `/help` 文案追加一行：`'/fetch <url>：抓取网页正文进会话（需在设置开启网页访问）；/usage：查看 token 用量\n'`。
 
-- [ ] **Step 3: app.js —— 设置读写**
+- [x] **Step 3: app.js —— 设置读写**
 
 `openSettings` 在 `set-hooks-enabled` 行后加（照 `ac`/`ckm` 范式）：
 
@@ -2975,7 +2975,7 @@ async function refreshUsageSummaryBox() {
 
 审批卡片：审批渲染处（`approval-needed` 分支的卡片文案）对 `ev.risk === 'network'` 显示 `ev.scope`——按钮「本会话始终允许此类」文案在 network 时改为「本会话始终允许 <scope>」。找到既有渲染函数后加一个三元即可。
 
-- [ ] **Step 4: styles.css**
+- [x] **Step 4: styles.css**
 
 ```css
 .usage-bar { font-size: 11px; color: #6b7a8d; cursor: default; margin-top: 2px; }
@@ -2984,7 +2984,7 @@ async function refreshUsageSummaryBox() {
 .usage-summary { font-size: 12px; color: #445; padding: 4px 0; }
 ```
 
-- [ ] **Step 5: README + 全量回归**
+- [x] **Step 5: README + 全量回归**
 
 README 在 Phase D.2 段落（若有）后加「Phase D.3 网页读取与用量计量」：`web_fetch` 工具与 `network` 审批（默认关、按域名记住、私网硬拦不可配置放行）、`/fetch` `/usage` 命令、设置两分区说明、**警告：不要让 Agent 抓取含敏感 query 参数的 URL；价格表自填、金额仅供参考**。
 
@@ -2993,7 +2993,7 @@ Expected: 全 PASS
 
 手动冒烟（Windows 环境可选）：`npm start` → 设置开「网页访问」→ 项目会话说「用 web_fetch 读 https://example.com 并总结」→ 应弹出 `读取网页 example.com` 审批卡；会话头出现 `↑ ↓` 用量；`/usage` 有 main 分组。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/renderer/app.js src/renderer/index.html src/renderer/styles.css README.md && git commit -m "feat(codex-qq): D.3 renderer usage bar, context meter, fetch and usage commands"

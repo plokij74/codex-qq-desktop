@@ -1403,3 +1403,121 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Phase D.3 web access and usage metering */
+.session-head > div:first-child {
+  min-width: 0;
+}
+.usage-bar {
+  max-width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
+  color: #60758a;
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.usage-bar.hidden,
+.context-meter.hidden {
+  display: none;
+}
+.context-meter {
+  max-width: 100%;
+  padding: 2px 6px;
+  overflow-wrap: anywhere;
+  color: #60758a;
+  font-size: 11px;
+  line-height: 16px;
+}
+.context-meter.is-over {
+  color: #b33226;
+  font-weight: 700;
+}
+
+#settings-modal {
+  padding: 12px;
+}
+#settings-modal .modal-card {
+  width: min(520px, 100%);
+  max-width: 100%;
+  max-height: calc(100vh - 24px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+#settings-modal .modal-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  margin: 8px -2px -2px;
+  padding: 10px 2px 2px;
+  border-top: 1px solid #b8cfe2;
+  background: #edf5fb;
+}
+.settings-section-title {
+  margin: 12px 0 8px;
+  padding-top: 10px;
+  border-top: 1px solid #b8cfe2;
+  color: #1f4f80;
+  font-size: 12px;
+  font-weight: 700;
+}
+.field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 44%);
+  gap: 6px 10px;
+  align-items: center;
+  margin-bottom: 8px;
+  color: #345;
+  font-size: 12px;
+}
+.field-row > span,
+.switch-row > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.field-row input,
+.field-row textarea {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid #7e9db9;
+  border-radius: 3px;
+  background: #fff;
+  color: #1a1a1a;
+  font-family: inherit;
+  font-size: 12px;
+}
+.field-row input {
+  height: 28px;
+  padding: 0 8px;
+}
+.field-row textarea {
+  grid-column: 1 / -1;
+  padding: 6px 8px;
+  resize: vertical;
+}
+.usage-summary {
+  padding: 4px 0;
+  overflow-wrap: anywhere;
+  color: #445;
+  font-size: 12px;
+  line-height: 1.4;
+}
+#btn-usage-clear {
+  max-width: 100%;
+  margin-bottom: 4px;
+  white-space: normal;
+}
+
+@media (max-width: 480px) {
+  .field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .field-row input,
+  .field-row textarea {
+    grid-column: 1;
+  }
+}
