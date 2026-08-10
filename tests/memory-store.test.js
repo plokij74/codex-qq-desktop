@@ -10,6 +10,7 @@ const {
   readAll,
   appendEntry,
   deleteEntry,
+  updateEntry,
   writeAllAtomic,
   normalizeText,
   TEXT_MAX,
@@ -279,5 +280,127 @@ describe('memory-store', () => {
   it('normalizeText folds whitespace and case', () => {
     assert.equal(normalizeText('  A   B  '), 'a b');
     assert.equal(normalizeText(null), '');
+  });
+
+  it('round-trips compact source and optional updatedAt without migrating old rows', () => {
+    const { projectPath } = tmpDirs();
+    const added = appendEntry({
+      scope: 'project', projectPath, text: '构建只用 npm test',
+      tags: ['build'], source: 'compact', maxEntries: 200, now: 1000,
+    });
+    const file = memoryFilePath({ scope: 'project', projectPath });
+    let entries = readEntries(file, 'project').entries;
+    assert.equal(entries[0].source, 'compact');
+    assert.equal(entries[0].updatedAt, null);
+
+    fs.appendFileSync(file, JSON.stringify({
+      id: 'm_legacy', text: '旧行', tags: [], createdAt: 900,
+      source: 'unknown-source', updatedAt: 'bad',
+    }) + '\n', 'utf8');
+    entries = readEntries(file, 'project').entries;
+    assert.equal(entries.find((entry) => entry.id === 'm_legacy').source, 'tool');
+    assert.equal(entries.find((entry) => entry.id === 'm_legacy').updatedAt, null);
+
+    writeAllAtomic(file, [{ ...entries.find((entry) => entry.id === added.id), updatedAt: 1500 }]);
+    entries = readEntries(file, 'project').entries;
+    assert.equal(entries[0].id, added.id);
+    assert.equal(entries[0].source, 'compact');
+    assert.equal(entries[0].updatedAt, 1500);
+  });
+
+  it('updates text and tags while preserving identity, source, scope and createdAt', () => {
+    const { projectPath } = tmpDirs();
+    const added = appendEntry({
+      scope: 'project', projectPath, text: '旧约定', tags: ['old'],
+      source: 'compact', maxEntries: 200, now: 1000,
+    });
+    const before = readEntries(
+      memoryFilePath({ scope: 'project', projectPath }), 'project'
+    ).entries[0];
+    const result = updateEntry({
+      id: added.id, scope: 'project', projectPath,
+      expected: { text: before.text, tags: before.tags, updatedAt: before.updatedAt },
+      text: '  新约定  ', tags: [' Build ', 'build'], now: 2000,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.updated, true);
+    assert.deepEqual(result.entry, {
+      id: added.id, text: '新约定', tags: ['build'], createdAt: 1000,
+      updatedAt: 2000, source: 'compact', scope: 'project',
+    });
+    const after = readEntries(
+      memoryFilePath({ scope: 'project', projectPath }), 'project'
+    ).entries[0];
+    assert.deepEqual(after, result.entry);
+  });
+
+  it('rejects stale text, tags, updatedAt and a missing id as conflicts', () => {
+    const variants = [
+      { text: '别的文本', tags: ['old'], updatedAt: null },
+      { text: '旧约定', tags: ['other'], updatedAt: null },
+      { text: '旧约定', tags: ['old'], updatedAt: 999 },
+    ];
+    for (const expected of variants) {
+      const { userDataPath } = tmpDirs();
+      const added = appendEntry({
+        scope: 'user', userDataPath, text: '旧约定', tags: ['old'], now: 100,
+      });
+      const result = updateEntry({
+        id: added.id, scope: 'user', userDataPath, expected,
+        text: '不应写入', tags: [], now: 200,
+      });
+      assert.deepEqual(result, {
+        ok: false, code: 'CONFLICT', error: '记忆已被修改或删除，请刷新后重试',
+      });
+      assert.equal(readEntries(
+        memoryFilePath({ scope: 'user', userDataPath }), 'user'
+      ).entries[0].text, '旧约定');
+    }
+
+    const { userDataPath } = tmpDirs();
+    assert.equal(updateEntry({
+      id: 'm_missing', scope: 'user', userDataPath,
+      expected: { text: 'x', tags: [], updatedAt: null }, text: 'y', tags: [],
+    }).code, 'CONFLICT');
+  });
+
+  it('rejects an exact duplicate without changing either row', () => {
+    const { userDataPath } = tmpDirs();
+    const first = appendEntry({ scope: 'user', userDataPath, text: '保留内容', now: 100 });
+    const second = appendEntry({ scope: 'user', userDataPath, text: '待修改内容', now: 200 });
+    const file = memoryFilePath({ scope: 'user', userDataPath });
+    const before = fs.readFileSync(file, 'utf8');
+    const current = readEntries(file, 'user').entries.find((e) => e.id === second.id);
+    const result = updateEntry({
+      id: second.id, scope: 'user', userDataPath,
+      expected: { text: current.text, tags: current.tags, updatedAt: current.updatedAt },
+      text: '  保留内容  ', tags: [], now: 300,
+    });
+    assert.deepEqual(result, { ok: false, code: 'DUPLICATE', error: '已有相同记忆' });
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+    assert.equal(readEntries(file, 'user').entries.find((e) => e.id === first.id).text, '保留内容');
+  });
+
+  it('keeps the original file readable and removes tmp files when update rewrite fails', () => {
+    const { userDataPath } = tmpDirs();
+    const added = appendEntry({ scope: 'user', userDataPath, text: '原内容', now: 100 });
+    const file = memoryFilePath({ scope: 'user', userDataPath });
+    const current = readEntries(file, 'user').entries[0];
+    const realWrite = fs.writeFileSync;
+    fs.writeFileSync = () => { throw new Error('EACCES: permission denied'); };
+    let result;
+    try {
+      result = updateEntry({
+        id: added.id, scope: 'user', userDataPath,
+        expected: { text: current.text, tags: current.tags, updatedAt: null },
+        text: '新内容', tags: [], now: 200,
+      });
+    } finally {
+      fs.writeFileSync = realWrite;
+    }
+    assert.equal(result.ok, false);
+    assert.match(result.error, /更新记忆失败/);
+    assert.equal(readEntries(file, 'user').entries[0].text, '原内容');
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((name) => /\.tmp/.test(name)), []);
   });
 });

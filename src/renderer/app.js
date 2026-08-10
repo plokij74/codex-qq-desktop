@@ -506,6 +506,23 @@ let searchQuery = '';
 let pendingAttaches = [];
 let pluginState = Object.fromEntries(PLUGINS.map((p) => [p.id, p.enabled]));
 let ctxMenuEl = null;
+let memoryCandidateSessionId = null;
+let memoryCandidateSelected = new Set();
+let memoryCandidateErrors = new Map();
+let memoryCandidateInvalidIds = new Set();
+let memoryCandidateBusy = false;
+let memoryCandidateMemoryEnabled = true;
+let memoryCandidateNotice = '';
+
+function ensureSessionCandidateState(session) {
+  if (!session || !window.MemoryCandidateState) return [];
+  session.pendingMemoryCandidates = window.MemoryCandidateState.normalizePendingCandidates(
+    session.pendingMemoryCandidates,
+    { max: window.MemoryCandidateState.PENDING_MAX, allowDrafts: true }
+  );
+  return session.pendingMemoryCandidates;
+}
+
 function uid(prefix = 's') {
   return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
 }
@@ -528,22 +545,35 @@ function defaultSessions() {
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('codex-qq-sessions-v1');
-    if (!raw) { sessions = defaultSessions(); projects = defaultProjects(); activeSessionId = sessions[0].id; return; }
+    if (!raw) {
+      sessions = defaultSessions();
+      sessions.forEach(ensureSessionCandidateState);
+      projects = defaultProjects();
+      activeSessionId = sessions[0].id;
+      return;
+    }
     const data = JSON.parse(raw);
     sessions = Array.isArray(data.sessions) && data.sessions.length
       ? data.sessions.map((s) => {
         const mode = normalizeSessionAgentMode(s.agentMode);
-        return { pinned: false, projectId: null, ...s, agentMode: mode };
+        const session = { pinned: false, projectId: null, ...s, agentMode: mode };
+        ensureSessionCandidateState(session);
+        return session;
       })
       : defaultSessions();
+    sessions.forEach(ensureSessionCandidateState);
     projects = Array.isArray(data.projects) && data.projects.length ? data.projects : defaultProjects();
     activeSessionId = data.activeSessionId && sessions.some((s) => s.id === data.activeSessionId) ? data.activeSessionId : sessions[0].id;
     if (data.pluginState) pluginState = { ...pluginState, ...data.pluginState };
   } catch {
-    sessions = defaultSessions(); projects = defaultProjects(); activeSessionId = sessions[0].id;
+    sessions = defaultSessions();
+    sessions.forEach(ensureSessionCandidateState);
+    projects = defaultProjects();
+    activeSessionId = sessions[0].id;
   }
 }
 function saveState() {
+  sessions.forEach(ensureSessionCandidateState);
   localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions, projects, activeSessionId, pluginState }));
 }
 function activeSession() { return sessions.find((s) => s.id === activeSessionId) || sessions[0]; }
@@ -553,6 +583,300 @@ function sessionProject(session = activeSession()) {
   if (session.projectId) return getProject(session.projectId);
   return null;
 }
+
+function candidateSession() {
+  return sessions.find((session) => session.id === memoryCandidateSessionId) || null;
+}
+
+function currentProjectRef(session = activeSession()) {
+  const project = sessionProject(session);
+  return window.MemoryCandidateState?.normalizeProjectRef({ id: project?.id, path: project?.path });
+}
+
+function updateMemoryCandidateCount() {
+  const count = ensureSessionCandidateState(activeSession()).length;
+  const badge = document.getElementById('memory-candidate-count');
+  const button = document.getElementById('btn-memory-candidates');
+  if (badge) badge.textContent = String(count);
+  if (button) {
+    button.classList.toggle('has-candidates', count > 0);
+    button.setAttribute('aria-label', `记忆候选，${count} 条待审核`);
+  }
+}
+
+function updateCandidateDraft(id, patch) {
+  const session = candidateSession();
+  const item = ensureSessionCandidateState(session).find((candidate) => candidate.id === id);
+  if (!item || memoryCandidateBusy) return;
+  const changesText = Object.hasOwn(patch, 'text');
+  Object.assign(item, { ...patch, edited: true });
+  if (changesText && !String(item.text || '').trim()) {
+    memoryCandidateInvalidIds.add(id);
+    memoryCandidateErrors.set(id, '记忆内容不能为空');
+  } else if (changesText) {
+    memoryCandidateInvalidIds.delete(id);
+    memoryCandidateErrors.delete(id);
+  } else if (!memoryCandidateInvalidIds.has(id)) {
+    memoryCandidateErrors.delete(id);
+  }
+  session.pendingMemoryCandidates = window.MemoryCandidateState.normalizePendingCandidates(
+    session.pendingMemoryCandidates,
+    { max: window.MemoryCandidateState.PENDING_MAX, allowDrafts: true }
+  );
+  saveState();
+  updateMemoryCandidateCount();
+  const row = document.querySelector(`.memory-candidate-row[data-candidate-id="${CSS.escape(String(id))}"]`);
+  const error = row?.querySelector('.memory-candidate-error');
+  if (error) error.textContent = memoryCandidateErrors.get(id) || '';
+}
+
+function updateMemoryCandidateActions() {
+  const session = candidateSession();
+  const validIds = new Set(ensureSessionCandidateState(session).map((item) => item.id));
+  const selectedCount = [...memoryCandidateSelected].filter((id) => validIds.has(id)).length;
+  const accept = document.getElementById('btn-memory-candidate-accept');
+  const reject = document.getElementById('btn-memory-candidate-reject');
+  const later = document.getElementById('btn-memory-candidate-later');
+  const close = document.getElementById('btn-memory-candidate-close');
+  if (accept) {
+    accept.disabled = memoryCandidateBusy || selectedCount === 0 || !memoryCandidateMemoryEnabled;
+    accept.title = !memoryCandidateMemoryEnabled ? '请先启用长期记忆' : '';
+  }
+  if (reject) reject.disabled = memoryCandidateBusy || selectedCount === 0;
+  if (later) later.disabled = memoryCandidateBusy;
+  if (close) close.disabled = memoryCandidateBusy;
+}
+
+function renderMemoryCandidateReview() {
+  const root = document.getElementById('memory-candidate-list');
+  const session = candidateSession();
+  if (!root || !session) return;
+  const items = ensureSessionCandidateState(session);
+  root.innerHTML = '';
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'memory-candidate-empty';
+    empty.textContent = '当前会话没有待审核候选。';
+    root.appendChild(empty);
+  }
+  const projectRef = currentProjectRef(session);
+  for (const candidate of items) {
+    const row = document.createElement('div');
+    row.className = 'memory-candidate-row';
+    row.dataset.candidateId = candidate.id;
+
+    const select = document.createElement('input');
+    select.type = 'checkbox';
+    select.className = 'memory-candidate-select';
+    select.checked = memoryCandidateSelected.has(candidate.id);
+    select.disabled = memoryCandidateBusy;
+    select.setAttribute('aria-label', '选择候选');
+    select.addEventListener('change', () => {
+      if (select.checked) memoryCandidateSelected.add(candidate.id);
+      else memoryCandidateSelected.delete(candidate.id);
+      updateMemoryCandidateActions();
+    });
+
+    const fields = document.createElement('div');
+    fields.className = 'memory-candidate-fields';
+    const text = document.createElement('textarea');
+    text.className = 'memory-candidate-text';
+    text.rows = 2;
+    text.maxLength = 1000;
+    text.value = candidate.text;
+    text.disabled = memoryCandidateBusy;
+    text.addEventListener('input', () => updateCandidateDraft(candidate.id, { text: text.value }));
+
+    const tags = document.createElement('input');
+    tags.type = 'text';
+    tags.className = 'memory-candidate-tags';
+    tags.placeholder = '标签，用逗号分隔';
+    tags.value = candidate.tags.join(', ');
+    tags.disabled = memoryCandidateBusy;
+    tags.addEventListener('input', () => updateCandidateDraft(candidate.id, {
+      tags: tags.value.split(',').map((tag) => tag.trim()).filter(Boolean),
+    }));
+
+    const scope = document.createElement('div');
+    scope.className = 'memory-candidate-scope';
+    scope.setAttribute('role', 'group');
+    scope.setAttribute('aria-label', '记忆作用域');
+    for (const value of ['project', 'user']) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'scope-option' + (candidate.scope === value ? ' is-active' : '');
+      button.textContent = value === 'project' ? '项目' : '用户';
+      button.disabled = memoryCandidateBusy || (value === 'project' && !projectRef);
+      button.addEventListener('click', () => {
+        if (candidate.scope === value) return;
+        updateCandidateDraft(candidate.id, {
+          scope: value,
+          projectRef: value === 'project' ? projectRef : null,
+        });
+        renderMemoryCandidateReview();
+      });
+      scope.appendChild(button);
+    }
+
+    const evidence = document.createElement('details');
+    evidence.className = 'memory-candidate-evidence';
+    const summary = document.createElement('summary');
+    summary.textContent = '查看证据';
+    const quote = document.createElement('div');
+    quote.className = 'memory-candidate-evidence-text';
+    quote.textContent = candidate.evidence;
+    evidence.append(summary, quote);
+
+    const error = document.createElement('div');
+    error.className = 'memory-candidate-error';
+    error.textContent = memoryCandidateErrors.get(candidate.id) || '';
+    fields.append(text, tags, scope, evidence, error);
+    row.append(select, fields);
+    root.appendChild(row);
+  }
+  updateMemoryCandidateActions();
+}
+
+async function openMemoryCandidateReview(session = activeSession(), { notice = '' } = {}) {
+  if (!session) return;
+  ensureSessionCandidateState(session);
+  memoryCandidateSessionId = session.id;
+  memoryCandidateSelected = new Set();
+  memoryCandidateErrors = new Map();
+  memoryCandidateInvalidIds = new Set();
+  memoryCandidateBusy = false;
+  memoryCandidateMemoryEnabled = false;
+  memoryCandidateNotice = String(notice || '');
+  const summary = document.getElementById('memory-candidate-summary');
+  summary.textContent = '正在读取记忆状态…';
+  document.getElementById('memory-candidate-modal').classList.remove('hidden');
+  renderMemoryCandidateReview();
+
+  try {
+    const settings = await window.codex.getSettings();
+    memoryCandidateMemoryEnabled = settings?.memoryEnabled !== false;
+  } catch {
+    memoryCandidateMemoryEnabled = false;
+  }
+
+  if (memoryCandidateMemoryEnabled) {
+    try {
+      const projectPath = sessionProject(session)?.path || null;
+      const result = await window.codex.listMemory({ projectPath });
+      if (result?.ok) {
+        session.pendingMemoryCandidates = window.MemoryCandidateState.filterStoredDuplicates(
+          session.pendingMemoryCandidates,
+          result.entries,
+          currentProjectRef(session)
+        );
+        saveState();
+        updateMemoryCandidateCount();
+      }
+    } catch {
+      // 列表去重只是 best effort；appendEntry 仍会做最终去重。
+    }
+  }
+
+  summary.textContent = memoryCandidateNotice || (memoryCandidateMemoryEnabled
+    ? ''
+    : '长期记忆已关闭；仍可编辑或拒绝候选，启用后才能接受。');
+  renderMemoryCandidateReview();
+}
+
+const openCandidateReview = (...args) => openMemoryCandidateReview(...args);
+
+async function acceptSelectedMemoryCandidates() {
+  const session = candidateSession();
+  if (!session || memoryCandidateBusy || !memoryCandidateMemoryEnabled) return;
+  const selected = ensureSessionCandidateState(session).filter(
+    (candidate) => memoryCandidateSelected.has(candidate.id)
+  );
+  if (!selected.length) return;
+
+  memoryCandidateBusy = true;
+  memoryCandidateErrors = new Map();
+  for (const candidate of selected) {
+    if (memoryCandidateInvalidIds.has(candidate.id)) {
+      memoryCandidateErrors.set(candidate.id, '记忆内容不能为空');
+    }
+  }
+  renderMemoryCandidateReview();
+  const acceptedIds = [];
+  let failed = 0;
+  for (const candidate of selected) {
+    if (memoryCandidateInvalidIds.has(candidate.id)) {
+      failed++;
+      continue;
+    }
+    const built = window.MemoryCandidateState.buildAcceptPayload(candidate, currentProjectRef(session));
+    if (!built.ok) {
+      memoryCandidateErrors.set(candidate.id, built.error);
+      failed++;
+      continue;
+    }
+    try {
+      const result = await window.codex.acceptMemory(built.payload);
+      if (result?.ok) {
+        acceptedIds.push(candidate.id);
+      } else {
+        memoryCandidateErrors.set(candidate.id, result?.error || '写入记忆失败');
+        failed++;
+      }
+    } catch (error) {
+      memoryCandidateErrors.set(candidate.id, error?.message || String(error));
+      failed++;
+    }
+  }
+
+  session.pendingMemoryCandidates = window.MemoryCandidateState.removePendingCandidates(
+    session.pendingMemoryCandidates,
+    acceptedIds
+  );
+  for (const id of acceptedIds) memoryCandidateSelected.delete(id);
+  for (const id of acceptedIds) memoryCandidateInvalidIds.delete(id);
+  saveState();
+  updateMemoryCandidateCount();
+  memoryCandidateBusy = false;
+  document.getElementById('memory-candidate-summary').textContent =
+    `已接受 ${acceptedIds.length} 条，失败 ${failed} 条`;
+  renderMemoryCandidateReview();
+  if (acceptedIds.length && !document.getElementById('settings-modal').classList.contains('hidden')) {
+    renderMemoryList().catch(() => {});
+  }
+}
+
+function rejectSelectedMemoryCandidates() {
+  const session = candidateSession();
+  if (!session || memoryCandidateBusy) return;
+  const ids = ensureSessionCandidateState(session)
+    .filter((candidate) => memoryCandidateSelected.has(candidate.id))
+    .map((candidate) => candidate.id);
+  if (!ids.length || !confirm('确定拒绝所选记忆候选？')) return;
+  session.pendingMemoryCandidates = window.MemoryCandidateState.removePendingCandidates(
+    session.pendingMemoryCandidates,
+    ids
+  );
+  memoryCandidateSelected = new Set();
+  for (const id of ids) {
+    memoryCandidateErrors.delete(id);
+    memoryCandidateInvalidIds.delete(id);
+  }
+  saveState();
+  updateMemoryCandidateCount();
+  document.getElementById('memory-candidate-summary').textContent = `已拒绝 ${ids.length} 条`;
+  renderMemoryCandidateReview();
+}
+
+function closeMemoryCandidateReview() {
+  if (memoryCandidateBusy) return;
+  document.getElementById('memory-candidate-modal').classList.add('hidden');
+  memoryCandidateSessionId = null;
+  memoryCandidateSelected = new Set();
+  memoryCandidateErrors = new Map();
+  memoryCandidateInvalidIds = new Set();
+  memoryCandidateNotice = '';
+}
+
 function toast(msg, ms = 2400) {
   const el = document.getElementById('toast');
   el.textContent = msg; el.classList.remove('hidden');
@@ -1522,6 +1846,7 @@ function updateHeader() {
   document.title = 'Codex 2007 - ' + title;
   const bindBtn = document.getElementById('btn-bind-project');
   if (bindBtn) { bindBtn.classList.toggle('hidden', !(s?.kind === 'project')); bindBtn.textContent = proj?.path ? '换目录' : '绑定目录'; }
+  updateMemoryCandidateCount();
 }
 async function updateStatusBar() {
   try {
@@ -2147,12 +2472,41 @@ function cloneForIpc(value) {
  * One IPC round trip: main plans, summarizes and applies, then hands back the
  * new messages array. The sandboxed preload cannot require the pure helpers.
  */
-function requestCompact(session, force) {
-  return window.codex.compactSession({
-    sessionId: String(session?.id || ''),
+async function requestCompact(session, force) {
+  const originProjectRef = currentProjectRef(session);
+  const res = await window.codex.compactSession({
     force: !!force,
+    sessionId: String(session?.id || ''),
     messages: cloneForIpc(session?.messages || []),
+    candidateLimit: window.MemoryCandidateState.candidateLimit(
+      ensureSessionCandidateState(session),
+      { perBatch: window.MemoryCandidateState.PER_BATCH_MAX, max: window.MemoryCandidateState.PENDING_MAX }
+    ),
   });
+  if (res.usage) applyUsageToSession(session, res.usage);
+  return { response: res, originProjectRef };
+}
+
+function applyCompactResult(session, response, originProjectRef) {
+  if (!Array.isArray(response.messages)) throw new Error('压缩结果缺少消息');
+  session.messages = response.messages;
+  session.updatedAt = Date.now();
+  saveState();
+  if (session.id === activeSessionId) renderMessages();
+
+  const merged = window.MemoryCandidateState.mergePendingCandidates(
+    ensureSessionCandidateState(session),
+    response.candidates,
+    {
+      max: window.MemoryCandidateState.PENDING_MAX,
+      defaultScope: originProjectRef ? 'project' : 'user',
+      projectRef: originProjectRef,
+    }
+  );
+  session.pendingMemoryCandidates = merged.items;
+  saveState();
+  updateMemoryCandidateCount();
+  return merged;
 }
 
 /** Manual `/compact` and the 压缩 button. Refuses while a run is live. */
@@ -2165,21 +2519,31 @@ async function runCompactOnSession(session, { force } = {}) {
   const btn = document.getElementById('btn-compact');
   if (btn) btn.disabled = true;
   try {
-    const res = await requestCompact(session, force);
+    const { response: res, originProjectRef } = await requestCompact(session, force);
     if (!res || res.ok === false) {
       toast('压缩失败：' + (res?.error || '未知错误'));
       return false;
     }
     if (!res.needed) {
       toast(force ? '无需压缩：没有可压缩的更早消息' : '未达压缩阈值');
+      if (force && activeSessionId === session.id && ensureSessionCandidateState(session).length > 0) {
+        openMemoryCandidateReview(session).catch((error) => toast(error?.message || String(error)));
+      }
       return false;
     }
-    if (res.usage) applyUsageToSession(session, res.usage);
-    session.messages = res.messages;
-    session.updatedAt = Date.now();
-    saveState();
-    renderMessages();
-    toast('已压缩更早 ' + res.compactedCount + ' 条消息');
+    const merged = applyCompactResult(session, res, originProjectRef);
+    if (res.candidateWarning) {
+      toast('已完成压缩；候选提炼失败');
+    } else if (merged.added > 0) {
+      toast(`已压缩更早 ${res.compactedCount} 条，提炼 ${merged.added} 条候选`);
+    } else {
+      toast('已压缩更早 ' + res.compactedCount + ' 条消息');
+    }
+    if (activeSessionId === session.id && ensureSessionCandidateState(session).length > 0) {
+      openMemoryCandidateReview(session, {
+        notice: merged.dropped > 0 ? '候选箱已满，部分新候选未保存' : '',
+      }).catch((error) => toast(error?.message || String(error)));
+    }
     return true;
   } finally {
     if (btn) btn.disabled = false;
@@ -2192,13 +2556,11 @@ async function maybeAutoCompact(session) {
   try {
     const st = await window.codex.getSettings();
     if (st?.autoCompact !== true) return false;
-    const res = await requestCompact(session, false);
+    const { response: res, originProjectRef } = await requestCompact(session, false);
     if (!res?.ok || !res.needed) return false;
-    if (res.usage) applyUsageToSession(session, res.usage);
-    session.messages = res.messages;
-    session.updatedAt = Date.now();
-    saveState();
-    toast('发送前已自动压缩 ' + res.compactedCount + ' 条');
+    const merged = applyCompactResult(session, res, originProjectRef);
+    const suffix = merged.added > 0 ? `；已新增 ${merged.added} 条记忆候选` : '';
+    toast('发送前已自动压缩 ' + res.compactedCount + ' 条' + suffix);
     return true;
   } catch {
     return false;
@@ -2487,6 +2849,8 @@ async function openSettings() {
   if (cmt) cmt.value = String(settings.compactMaxApproxTokens ?? 24000);
   const me = document.getElementById('set-memory-enabled');
   if (me) me.checked = settings.memoryEnabled !== false;
+  const mce = document.getElementById('set-memory-candidate-enabled');
+  if (mce) mce.checked = settings.memoryCandidateEnabled !== false;
   const mme = document.getElementById('set-memory-max-entries');
   if (mme) mme.value = String(settings.memoryMaxEntries ?? 200);
   const mtn = document.getElementById('set-memory-inject-topn');
@@ -2532,6 +2896,121 @@ function closeSettings() {
 }
 /* ---- Phase D.2: memory list in settings ------------------------------- */
 
+function memoryScopeBadge(scope) {
+  const badge = document.createElement('span');
+  badge.className = 'memory-scope-badge' + (scope === 'user' ? ' is-user' : '');
+  badge.textContent = scope === 'user' ? '用户' : '项目';
+  return badge;
+}
+
+function memoryIconButton(symbol, title, className = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'memory-icon-btn' + (className ? ' ' + className : '');
+  button.textContent = symbol;
+  button.title = title;
+  button.setAttribute('aria-label', title);
+  return button;
+}
+
+function renderMemoryEntryRow(entry, projectPath) {
+  const row = document.createElement('div');
+  row.className = 'memory-item';
+
+  function renderDisplay() {
+    row.className = 'memory-item';
+    row.innerHTML = '';
+    const badge = memoryScopeBadge(entry.scope);
+    const text = document.createElement('span');
+    text.className = 'memory-text';
+    text.textContent = entry.text.length > 80 ? entry.text.slice(0, 80) + '…' : entry.text;
+    text.title = entry.text;
+    const edit = memoryIconButton('✎', '编辑记忆');
+    edit.addEventListener('click', renderEdit);
+    const del = memoryIconButton('×', '删除记忆', 'is-danger');
+    del.addEventListener('click', async () => {
+      try {
+        const result = await window.codex.deleteMemory({
+          projectPath, id: entry.id, scope: entry.scope,
+        });
+        toast(window.CodexMemoryCommands.deleteResultMessage(result));
+        if (result?.ok !== false && result?.removed) await renderMemoryList();
+      } catch (error) {
+        toast('删除失败：' + (error?.message || String(error)));
+      }
+    });
+    row.append(badge, text, edit, del);
+  }
+
+  function renderEdit() {
+    row.className = 'memory-item is-editing';
+    row.innerHTML = '';
+    const badge = memoryScopeBadge(entry.scope);
+    badge.title = '编辑时不能迁移作用域；需要迁移请删除后重建';
+    const fields = document.createElement('div');
+    fields.className = 'memory-edit-fields';
+    const text = document.createElement('textarea');
+    text.className = 'memory-edit-text';
+    text.rows = 2;
+    text.maxLength = 1000;
+    text.value = entry.text;
+    const tags = document.createElement('input');
+    tags.type = 'text';
+    tags.className = 'memory-edit-tags';
+    tags.placeholder = '标签，用逗号分隔';
+    tags.value = Array.isArray(entry.tags) ? entry.tags.join(', ') : '';
+    const error = document.createElement('div');
+    error.className = 'memory-edit-error';
+
+    const actions = document.createElement('div');
+    actions.className = 'memory-edit-actions';
+    const save = memoryIconButton('✓', '保存记忆');
+    const cancel = memoryIconButton('×', '取消编辑');
+    cancel.addEventListener('click', renderDisplay);
+    save.addEventListener('click', async () => {
+      save.disabled = true;
+      cancel.disabled = true;
+      error.textContent = '';
+      try {
+        const result = await window.codex.updateMemory({
+          projectPath,
+          id: entry.id,
+          scope: entry.scope,
+          expected: {
+            text: entry.text,
+            tags: Array.isArray(entry.tags) ? entry.tags : [],
+            updatedAt: entry.updatedAt ?? null,
+          },
+          text: text.value,
+          tags: tags.value.split(',').map((tag) => tag.trim()).filter(Boolean),
+        });
+        if (!result?.ok) {
+          error.textContent = result?.code === 'CONFLICT'
+            ? '记忆已被修改或删除，请刷新后重试'
+            : (result?.error || '保存失败');
+          return;
+        }
+        Object.assign(entry, result.entry);
+        toast('记忆已更新');
+        renderDisplay();
+      } catch (updateError) {
+        error.textContent = updateError?.message || String(updateError);
+      } finally {
+        save.disabled = false;
+        cancel.disabled = false;
+      }
+    });
+    actions.append(save, cancel);
+    fields.append(text, tags, error, actions);
+    row.append(badge, fields);
+    text.focus();
+    text.setSelectionRange(text.value.length, text.value.length);
+  }
+
+  renderDisplay();
+  return row;
+}
+
 async function renderMemoryList() {
   const root = document.getElementById('memory-list');
   if (!root || !window.codex?.listMemory) return;
@@ -2552,32 +3031,7 @@ async function renderMemoryList() {
   if (!entries.length) {
     root.textContent = '暂无记忆。对话里用 /remember <事实> 添加。';
   }
-  for (const e of entries) {
-    const row = document.createElement('div');
-    row.className = 'memory-item';
-    const badge = document.createElement('span');
-    badge.className = 'memory-scope-badge' + (e.scope === 'user' ? ' is-user' : '');
-    badge.textContent = e.scope === 'user' ? '用户' : '项目';
-    const text = document.createElement('span');
-    text.className = 'memory-text';
-    text.textContent = e.text.length > 80 ? (e.text.slice(0, 80) + '…') : e.text;
-    text.title = e.text;
-    const del = document.createElement('button');
-    del.type = 'button';
-    del.className = 'btn-small';
-    del.textContent = '删除';
-    del.addEventListener('click', async () => {
-      try {
-        const r = await window.codex.deleteMemory({ projectPath, id: e.id, scope: e.scope });
-        toast(window.CodexMemoryCommands.deleteResultMessage(r));
-        if (r?.ok !== false && r?.removed) renderMemoryList();
-      } catch (err) {
-        toast('删除失败：' + (err.message || String(err)));
-      }
-    });
-    row.append(badge, text, del);
-    root.appendChild(row);
-  }
+  for (const entry of entries) root.appendChild(renderMemoryEntryRow(entry, projectPath));
   if (res.skipped) {
     const warn = document.createElement('div');
     warn.className = 'field-hint';
@@ -2640,6 +3094,7 @@ async function saveSettingsFromForm() {
     mcpServers,
     hooksEnabled: document.getElementById('set-hooks-enabled')?.checked !== false,
     memoryEnabled: document.getElementById('set-memory-enabled')?.checked !== false,
+    memoryCandidateEnabled: document.getElementById('set-memory-candidate-enabled')?.checked !== false,
     memoryMaxEntries: Number(document.getElementById('set-memory-max-entries')?.value || 200),
     memoryInjectTopN: Number(document.getElementById('set-memory-inject-topn')?.value ?? 8),
     memoryInjectMaxTokens: Number(document.getElementById('set-memory-inject-max-tokens')?.value || 1200),
@@ -2845,6 +3300,22 @@ function bindEvents() {
   document.getElementById('btn-compact')?.addEventListener('click', () => {
     runCompactOnSession(activeSession(), { force: true }).catch((e) => toast(e.message || String(e)));
   });
+  document.getElementById('btn-memory-candidates')?.addEventListener('click', () => {
+    openCandidateReview(activeSession()).catch((error) => {
+      toast(error?.message || String(error));
+    });
+  });
+  document.getElementById('btn-memory-candidate-close')?.addEventListener('click', closeMemoryCandidateReview);
+  document.getElementById('btn-memory-candidate-later')?.addEventListener('click', closeMemoryCandidateReview);
+  document.getElementById('btn-memory-candidate-accept')?.addEventListener('click', () => {
+    acceptSelectedMemoryCandidates().catch((error) => toast(error?.message || String(error)));
+  });
+  document.getElementById('btn-memory-candidate-reject')?.addEventListener(
+    'click', rejectSelectedMemoryCandidates
+  );
+  document.getElementById('memory-candidate-modal')?.addEventListener('click', (event) => {
+    if (event.target.id === 'memory-candidate-modal') closeMemoryCandidateReview();
+  });
   document.getElementById('btn-export')?.addEventListener('click', () => {
     runExportOnSession(activeSession(), 'md').catch((e) => toast(e.message || String(e)));
   });
@@ -2864,6 +3335,11 @@ function bindEvents() {
   });
   document.addEventListener('click', (e) => { if (!e.target.closest('#ctx-menu')) hideContextMenu(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideContextMenu(); });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    const modal = document.getElementById('memory-candidate-modal');
+    if (modal && !modal.classList.contains('hidden')) closeMemoryCandidateReview();
+  });
 }
 function boot() {
   loadState();

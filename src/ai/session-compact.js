@@ -1,5 +1,7 @@
 'use strict';
 
+const { generateMemoryCandidates } = require('./memory-candidates');
+
 /**
  * Phase D.1 — structured session compaction.
  *
@@ -180,6 +182,40 @@ async function generateCompactSummary({ transcript, settings, chatFn, signal, on
   return out;
 }
 
+function bestEffortUsageReporter(onUsage) {
+  if (typeof onUsage !== 'function') return undefined;
+  return (event) => {
+    try {
+      const result = onUsage(event);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch {
+      // Usage 失败不能改变 compact 的消息结果。
+    }
+  };
+}
+
+async function generateCompactArtifacts({
+  transcript, settings, candidateLimit, chatFn, signal, onUsage,
+} = {}) {
+  const reportUsage = bestEffortUsageReporter(onUsage);
+  const summary = await generateCompactSummary({
+    transcript, settings, chatFn, signal, onUsage: reportUsage,
+  });
+  try {
+    const candidates = await generateMemoryCandidates({
+      transcript, settings, limit: candidateLimit,
+      chatFn, signal, onUsage: reportUsage,
+    });
+    return { summary, candidates, candidateWarning: null };
+  } catch {
+    return {
+      summary,
+      candidates: [],
+      candidateWarning: '候选提炼失败，已仅完成会话压缩',
+    };
+  }
+}
+
 module.exports = {
   approxTokensFromText,
   approxTokensFromMessages,
@@ -188,6 +224,7 @@ module.exports = {
   applyCompact,
   buildCompactSystemPrompt,
   generateCompactSummary,
+  generateCompactArtifacts,
   TRANSCRIPT_MAX_DEFAULT,
   TOOL_SUMMARY_MAX,
 };

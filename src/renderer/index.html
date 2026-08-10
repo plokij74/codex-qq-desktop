@@ -69,6 +69,9 @@
             </div>
             <div class="session-actions">
               <button type="button" class="ghost-btn hidden" id="btn-bind-project">绑定目录</button>
+              <button type="button" class="ghost-btn memory-candidate-entry" id="btn-memory-candidates" title="审核当前会话的记忆候选">
+                记忆候选 <span id="memory-candidate-count" class="memory-candidate-count">0</span>
+              </button>
               <button type="button" class="ghost-btn" id="btn-compact" title="把更早的消息压缩成一条摘要">压缩</button>
               <button type="button" class="ghost-btn" id="btn-export" title="导出为 Markdown">导出</button>
               <button type="button" class="ghost-btn" id="btn-export-json" title="导出为 JSON">导出 JSON</button>
@@ -259,6 +262,10 @@
           <small class="field-hint">约 token 按字符数/4 估算，不依赖 tokenizer。</small>
         </label>
         <label class="switch-row"><input type="checkbox" id="set-memory-enabled" checked /> <span>启用长期记忆（项目 .codex/memory.jsonl + 用户 memory.jsonl）</span></label>
+        <label class="switch-row">
+          <input type="checkbox" id="set-memory-candidate-enabled" checked />
+          <span>压缩时提炼记忆候选（每次压缩可能增加一次模型调用；候选需审核后才写入）</span>
+        </label>
         <label class="field">
           <span>记忆条数上限</span>
           <input id="set-memory-max-entries" type="number" min="20" max="2000" step="10" value="200" />
@@ -310,7 +317,22 @@
     </div>
   </div>
 
-  
+  <div id="memory-candidate-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="memory-candidate-title">
+    <div class="modal-card memory-candidate-modal-card">
+      <div class="memory-candidate-modal-head">
+        <div class="modal-title" id="memory-candidate-title">记忆候选</div>
+        <button type="button" id="btn-memory-candidate-close" class="icon-btn" title="稍后处理" aria-label="稍后处理">×</button>
+      </div>
+      <div id="memory-candidate-list" class="memory-candidate-review-list"></div>
+      <div id="memory-candidate-summary" class="memory-candidate-summary" aria-live="polite"></div>
+      <div class="modal-actions memory-candidate-actions">
+        <button type="button" id="btn-memory-candidate-reject" class="btn-secondary" disabled>拒绝所选</button>
+        <button type="button" id="btn-memory-candidate-later" class="btn-secondary">稍后处理</button>
+        <button type="button" id="btn-memory-candidate-accept" class="btn-primary" disabled>接受所选</button>
+      </div>
+    </div>
+  </div>
+
   <div id="project-modal" class="modal hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-title">添加项目</div>
@@ -335,6 +357,7 @@
   <div id="ctx-menu" class="ctx-menu hidden"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="memory-commands.js"></script>
+  <script src="memory-candidate-state.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

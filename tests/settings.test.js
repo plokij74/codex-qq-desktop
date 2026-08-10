@@ -261,4 +261,22 @@ describe('settings', () => {
     ]);
     assert.equal(s.usageCurrency, '\uFFE5\uFFE5\uFFE5\uFFE5');
   });
+
+  it('D.4 defaults memory candidate extraction on and preserves explicit false', () => {
+    assert.equal(DEFAULT_SETTINGS.memoryCandidateEnabled, true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d4-settings-'));
+    assert.equal(loadSettings(dir).memoryCandidateEnabled, true);
+    saveSettings(dir, { memoryCandidateEnabled: false });
+    assert.equal(loadSettings(dir).memoryCandidateEnabled, false);
+  });
+
+  it('D.4 normalizes hand-edited candidate setting to a boolean', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d4-settings-'));
+    fs.writeFileSync(
+      getSettingsPath(dir),
+      JSON.stringify({ memoryCandidateEnabled: 'false' }),
+      'utf8'
+    );
+    assert.equal(loadSettings(dir).memoryCandidateEnabled, true);
+  });
 });

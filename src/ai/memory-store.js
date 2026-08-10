@@ -41,6 +41,29 @@ function normalizeTags(raw) {
   return out;
 }
 
+function normalizeSource(value) {
+  return value === 'slash' || value === 'compact' ? value : 'tool';
+}
+
+function normalizeUpdatedAt(value) {
+  if (value == null) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function storedEntry(entry) {
+  const out = {
+    id: String(entry?.id || ''),
+    text: normalizeEntryText(entry?.text),
+    tags: normalizeTags(entry?.tags),
+    createdAt: Number(entry?.createdAt) || 0,
+    source: normalizeSource(entry?.source),
+  };
+  const updatedAt = normalizeUpdatedAt(entry?.updatedAt);
+  if (updatedAt != null) out.updatedAt = updatedAt;
+  return out;
+}
+
 /**
  * Project memory lives beside hooks.json / skills under .codex; user memory
  * sits next to settings.json. resolveSafe keeps the project path in-sandbox.
@@ -82,11 +105,8 @@ function readEntries(file, scope) {
         continue;
       }
       entries.push({
-        id: String(o.id || ''),
-        text: normalizeEntryText(o.text),
-        tags: normalizeTags(o.tags),
-        createdAt: Number(o.createdAt) || 0,
-        source: o.source === 'slash' ? 'slash' : 'tool',
+        ...storedEntry(o),
+        updatedAt: normalizeUpdatedAt(o.updatedAt),
         scope,
       });
     } catch {
@@ -128,11 +148,7 @@ function readAll({ projectPath, userDataPath } = {}) {
  * @param {any[]} entries
  */
 function writeAllAtomic(file, entries) {
-  const body = entries
-    .map((e) => JSON.stringify({
-      id: e.id, text: e.text, tags: e.tags, createdAt: e.createdAt, source: e.source,
-    }))
-    .join('\n');
+  const body = entries.map((entry) => JSON.stringify(storedEntry(entry))).join('\n');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = file + '.tmp-' + process.pid + '-' + Date.now().toString(36);
   try {
@@ -186,7 +202,7 @@ function appendEntry({
     text: clean,
     tags: normalizeTags(tags),
     createdAt: Number.isFinite(Number(now)) ? Number(now) : Date.now(),
-    source: source === 'slash' ? 'slash' : 'tool',
+    source: normalizeSource(source),
   };
 
   let pruned = 0;
@@ -247,14 +263,89 @@ function deleteEntry({ id, scope, projectPath, userDataPath } = {}) {
   return { ok: true, removed: false };
 }
 
+const CONFLICT = Object.freeze({
+  ok: false,
+  code: 'CONFLICT',
+  error: '记忆已被修改或删除，请刷新后重试',
+});
+
+function sameTags(left, right) {
+  const a = normalizeTags(left);
+  const b = normalizeTags(right);
+  return a.length === b.length && a.every((tag, index) => tag === b[index]);
+}
+
+/**
+ * Optimistically update one existing row. The file is re-read immediately
+ * before comparing expected state so stale renderer edits cannot overwrite a
+ * newer row. Scope is required and only locates the existing layer.
+ */
+function updateEntry({
+  id, scope, projectPath, userDataPath, expected, text, tags, now,
+} = {}) {
+  const wanted = String(id || '').trim();
+  if (!wanted || (scope !== 'project' && scope !== 'user')) return { ...CONFLICT };
+
+  let file;
+  try {
+    file = memoryFilePath({ scope, projectPath, userDataPath });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  let entries;
+  try {
+    ({ entries } = readEntries(file, scope));
+  } catch (err) {
+    return { ok: false, error: '更新记忆失败：' + err.message };
+  }
+
+  const index = entries.findIndex((entry) => entry.id === wanted);
+  const current = index >= 0 ? entries[index] : null;
+  const expectedUpdatedAt = normalizeUpdatedAt(expected?.updatedAt);
+  if (
+    !current
+    || String(expected?.text ?? '') !== current.text
+    || !sameTags(expected?.tags, current.tags)
+    || expectedUpdatedAt !== current.updatedAt
+  ) return { ...CONFLICT };
+
+  const cleanText = normalizeEntryText(text);
+  if (!cleanText) return { ok: false, error: '记忆内容为空' };
+  const duplicate = entries.some((entry, entryIndex) => (
+    entryIndex !== index && normalizeText(entry.text) === normalizeText(cleanText)
+  ));
+  if (duplicate) return { ok: false, code: 'DUPLICATE', error: '已有相同记忆' };
+
+  const requestedNow = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const updatedAt = Math.max(requestedNow, (current.updatedAt || 0) + 1);
+  const entry = {
+    ...current,
+    text: cleanText,
+    tags: normalizeTags(tags),
+    updatedAt,
+  };
+  const next = entries.slice();
+  next[index] = entry;
+  try {
+    writeAllAtomic(file, next);
+  } catch (err) {
+    return { ok: false, error: '更新记忆失败：' + err.message };
+  }
+  return { ok: true, updated: true, entry };
+}
+
 module.exports = {
   memoryFilePath,
   readEntries,
   readAll,
   appendEntry,
   deleteEntry,
+  updateEntry,
   writeAllAtomic,
   normalizeText,
+  normalizeTags,
+  normalizeSource,
   TEXT_MAX,
   TAG_MAX,
   TAGS_MAX,

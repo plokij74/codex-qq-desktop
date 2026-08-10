@@ -174,4 +174,12 @@ describe('memory-recall', () => {
     assert.ok(text.startsWith('【长期记忆】'));
     assert.ok(approxTokensFromText(text) <= 200);
   });
+
+  it('does not treat updatedAt as recency', () => {
+    const selected = selectForInjection([
+      { id: 'old', text: 'old', tags: [], scope: 'user', createdAt: 1, updatedAt: 999999 },
+      { id: 'new', text: 'new', tags: [], scope: 'user', createdAt: 2, updatedAt: null },
+    ], { queryText: '', topN: 2, maxApproxTokens: 1000, now: 1000000 });
+    assert.deepEqual(selected.map((entry) => entry.id), ['new', 'old']);
+  });
 });

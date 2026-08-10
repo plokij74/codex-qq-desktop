@@ -103,4 +103,26 @@ describe('session-export', () => {
     const name = defaultExportFilename({ title: '///***' }, 'md');
     assert.match(name, /^session-\d{4}-\d{2}-\d{2}\.md$/);
   });
+
+  it('never exports pending memory candidates or evidence', () => {
+    const session = sampleSession();
+    session.pendingMemoryCandidates = [{
+      id: 'mc_private',
+      text: 'PRIVATE_CANDIDATE_TEXT',
+      tags: ['private'],
+      evidence: 'PRIVATE_EVIDENCE_EXCERPT',
+      scope: 'user',
+      projectRef: null,
+      createdAt: 1700000002000,
+    }];
+    const markdown = exportSessionMarkdown(session);
+    const json = exportSessionJson(session);
+    for (const secret of ['mc_private', 'PRIVATE_CANDIDATE_TEXT', 'PRIVATE_EVIDENCE_EXCERPT']) {
+      assert.equal(markdown.includes(secret), false);
+      assert.equal(json.includes(secret), false);
+    }
+    const parsed = JSON.parse(json);
+    assert.equal(parsed.version, 1);
+    assert.equal('pendingMemoryCandidates' in parsed.session, false);
+  });
 });

@@ -45,14 +45,20 @@ const {
   planCompact,
   serializeOlderTranscript,
   applyCompact,
-  generateCompactSummary,
+  generateCompactArtifacts,
 } = require('./ai/session-compact');
 const {
   exportSessionMarkdown,
   exportSessionJson,
   defaultExportFilename,
 } = require('./ai/session-export');
-const { memoryList, memoryAdd, memoryDelete } = require('./ai/memory-ipc');
+const {
+  memoryList,
+  memoryAdd,
+  memoryDelete,
+  memoryAccept,
+  memoryUpdate,
+} = require('./ai/memory-ipc');
 const { fetchUrl } = require('./ai/web-fetch');
 const { aggregate } = require('./ai/usage');
 const {
@@ -181,6 +187,7 @@ function toPublicSettings(s) {
     memoryMaxEntries: clampInt(s.memoryMaxEntries, 20, 2000, 200),
     memoryInjectTopN: clampInt(s.memoryInjectTopN, 0, 30, 8),
     memoryInjectMaxTokens: clampInt(s.memoryInjectMaxTokens, 200, 8000, 1200),
+    memoryCandidateEnabled: s.memoryCandidateEnabled !== false,
     webEnabled: s.webEnabled === true,
     webRequireConfirm: s.webRequireConfirm !== false,
     webAllowDomains: normalizeDomainList(s.webAllowDomains),
@@ -301,6 +308,7 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     'hooksEnabled',
     'autoCompact',
     'memoryEnabled',
+    'memoryCandidateEnabled',
     'webEnabled',
     'usageEnabled',
   ]) {
@@ -426,37 +434,42 @@ ipcMain.handle('session:compact', async (_e, payload = {}) => {
       force: payload.force === true,
     });
     if (!plan.needed) {
-      return { ok: true, needed: false, approxTokens: plan.approxTokens };
+      return { ok: true, needed: false, approxTokens: plan.approxTokens, candidates: [] };
     }
     const transcript = serializeOlderTranscript(plan.older);
     let compactUsage = null;
-    const summary = await generateCompactSummary({
+    const onUsage = ({ rawUsage, messages: sentMessages, content }) => {
+      const usageEvent = buildUsageEvent({
+        settings,
+        messages: sentMessages,
+        msg: { content, usage: rawUsage },
+      });
+      if (usageEvent) {
+        compactUsage = {
+          ...usageEvent,
+          kind: 'compact',
+        };
+        persistUsageEvent(settings, payload.sessionId, compactUsage);
+      }
+    };
+    const candidateLimit = clampInt(payload.candidateLimit, 0, 5, 0);
+    const artifacts = await generateCompactArtifacts({
       transcript,
       settings,
       chatFn: chatCompletionMessage,
-      onUsage: ({ rawUsage, messages: sentMessages, content }) => {
-        const usageEvent = buildUsageEvent({
-          settings,
-          messages: sentMessages,
-          msg: { content, usage: rawUsage },
-        });
-        if (usageEvent) {
-          compactUsage = {
-            ...usageEvent,
-            kind: 'compact',
-          };
-          persistUsageEvent(settings, payload.sessionId, compactUsage);
-        }
-      },
+      candidateLimit,
+      onUsage,
     });
     return {
       ok: true,
       needed: true,
-      messages: applyCompact(messages, plan, summary),
+      messages: applyCompact(messages, plan, artifacts.summary),
       compactedCount: plan.older.length,
       approxTokens: plan.approxTokens,
       olderApproxTokens: plan.olderApproxTokens,
       usage: compactUsage,
+      candidates: artifacts.candidates,
+      candidateWarning: artifacts.candidateWarning,
     };
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
@@ -498,6 +511,14 @@ ipcMain.handle('memory:add', async (_e, payload = {}) => memoryAdd({
 }));
 
 ipcMain.handle('memory:delete', async (_e, payload = {}) => memoryDelete({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+
+ipcMain.handle('memory:accept', async (_e, payload = {}) => memoryAccept({
+  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+}));
+
+ipcMain.handle('memory:update', async (_e, payload = {}) => memoryUpdate({
   settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
 }));
 

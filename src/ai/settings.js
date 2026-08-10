@@ -40,6 +40,8 @@ const DEFAULT_SETTINGS = {
   memoryMaxEntries: 200, // clamp 20..2000
   memoryInjectTopN: 8, // clamp 0..30; 0 = 不注入，只保留 recall 工具
   memoryInjectMaxTokens: 1200, // clamp 200..8000; 复用 char/4 估算
+  // Phase D.4 reviewed memory candidates
+  memoryCandidateEnabled: true,
   // Phase D.3 web fetch
   webEnabled: false,
   webRequireConfirm: true,
@@ -86,6 +88,7 @@ function clampMemorySettings(s) {
   s.memoryMaxEntries = clampInt(s.memoryMaxEntries, 20, 2000, 200);
   s.memoryInjectTopN = clampInt(s.memoryInjectTopN, 0, 30, 8);
   s.memoryInjectMaxTokens = clampInt(s.memoryInjectMaxTokens, 200, 8000, 1200);
+  s.memoryCandidateEnabled = s.memoryCandidateEnabled !== false;
   return s;
 }
 

@@ -8,6 +8,8 @@ const {
   serializeOlderTranscript,
   applyCompact,
   buildCompactSystemPrompt,
+  generateCompactSummary,
+  generateCompactArtifacts,
   TOOL_SUMMARY_MAX,
 } = require('../src/ai/session-compact');
 
@@ -300,5 +302,101 @@ describe('generateCompactSummary', () => {
       ...base,
       onUsage: async () => { throw new Error('async usage failure'); },
     }), 'summary');
+  });
+});
+
+describe('D.4 compact artifacts', () => {
+  const settings = {
+    mode: 'api', baseUrl: 'https://x/v1', apiKey: 'k', model: 'm',
+    memoryEnabled: true, memoryCandidateEnabled: true,
+  };
+  const transcript = '[user]\n项目构建统一使用 npm test。';
+
+  it('runs summary first, then candidates, with usage for both calls', async () => {
+    const calls = [];
+    const usage = [];
+    const result = await generateCompactArtifacts({
+      transcript, settings, candidateLimit: 5,
+      chatFn: async ({ messages }) => {
+        calls.push(messages[0].content);
+        return calls.length === 1
+          ? '关键约定：构建使用 npm test。'
+          : JSON.stringify({ candidates: [{
+            text: '项目构建统一使用 npm test', tags: ['build'],
+            evidence: '项目构建统一使用 npm test。',
+          }] });
+      },
+      onUsage: (event) => usage.push(event),
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(usage.length, 2);
+    assert.equal(result.summary, '关键约定：构建使用 npm test。');
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidateWarning, null);
+  });
+
+  it('keeps summary when candidate parsing fails', async () => {
+    let calls = 0;
+    const result = await generateCompactArtifacts({
+      transcript, settings, candidateLimit: 5,
+      chatFn: async () => (++calls === 1 ? '摘要成功' : 'invalid json'),
+    });
+    assert.equal(result.summary, '摘要成功');
+    assert.deepEqual(result.candidates, []);
+    assert.equal(result.candidateWarning, '候选提炼失败，已仅完成会话压缩');
+  });
+
+  it('keeps summary and hides candidate network error details', async () => {
+    let calls = 0;
+    const result = await generateCompactArtifacts({
+      transcript, settings, candidateLimit: 5,
+      chatFn: async () => {
+        calls++;
+        if (calls === 1) return '摘要成功';
+        throw new Error('timeout with sk-should-never-reach-renderer');
+      },
+    });
+    assert.equal(result.summary, '摘要成功');
+    assert.deepEqual(result.candidates, []);
+    assert.equal(result.candidateWarning, '候选提炼失败，已仅完成会话压缩');
+    assert.equal(result.candidateWarning.includes('sk-'), false);
+  });
+
+  it('does not let a usage callback failure change compact results', async () => {
+    let calls = 0;
+    const result = await generateCompactArtifacts({
+      transcript, settings, candidateLimit: 5,
+      chatFn: async () => (++calls === 1 ? '摘要成功' : JSON.stringify({ candidates: [] })),
+      onUsage: async () => { throw new Error('usage store unavailable'); },
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.summary, '摘要成功');
+    assert.deepEqual(result.candidates, []);
+    assert.equal(result.candidateWarning, null);
+  });
+
+  it('does not start candidates when summary fails', async () => {
+    let calls = 0;
+    await assert.rejects(
+      () => generateCompactArtifacts({
+        transcript, settings, candidateLimit: 5,
+        chatFn: async () => { calls++; throw new Error('summary failed'); },
+      }),
+      /summary failed/
+    );
+    assert.equal(calls, 1);
+  });
+
+  it('local mode uses the placeholder summary and makes no model call', async () => {
+    let calls = 0;
+    const result = await generateCompactArtifacts({
+      transcript,
+      settings: { ...settings, mode: 'local' },
+      candidateLimit: 5,
+      chatFn: async () => { calls++; return 'unexpected'; },
+    });
+    assert.match(result.summary, /本地模式占位摘要/);
+    assert.deepEqual(result.candidates, []);
+    assert.equal(calls, 0);
   });
 });

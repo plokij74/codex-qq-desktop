@@ -8,6 +8,7 @@
  */
 
 const store = require('./memory-store');
+const { containsSensitiveValue } = require('./memory-candidates');
 // clampInt 已由 settings.js 导出，不要再抄一份。
 const { clampInt } = require('./settings');
 
@@ -22,6 +23,20 @@ function pathsFrom(payload, userDataPath) {
     projectPath: payload?.projectPath ? String(payload.projectPath) : null,
     userDataPath: userDataPath || null,
   };
+}
+
+function requestedScope(payload) {
+  return payload?.scope === 'project' || payload?.scope === 'user'
+    ? payload.scope
+    : null;
+}
+
+function validateExplicitScope(scope, paths) {
+  if (!scope) return { ok: false, error: '记忆作用域无效' };
+  if (scope === 'project' && !paths.projectPath) {
+    return { ok: false, error: 'project 记忆缺少 projectPath' };
+  }
+  return null;
 }
 
 /**
@@ -82,4 +97,60 @@ function memoryDelete({ settings, userDataPath, payload = {} } = {}) {
   }
 }
 
-module.exports = { memoryList, memoryAdd, memoryDelete };
+function memoryAccept({ settings, userDataPath, payload = {} } = {}) {
+  if (!isEnabled(settings)) return { ...DISABLED };
+  const paths = pathsFrom(payload, userDataPath);
+  const scope = requestedScope(payload);
+  const invalid = validateExplicitScope(scope, paths);
+  if (invalid) return invalid;
+  const rawTags = Array.isArray(payload?.tags) ? payload.tags : [];
+  const rawMemoryText = [
+    String(payload?.text ?? ''),
+    ...rawTags.map((tag) => String(tag ?? '')),
+  ].join('\n');
+  if (containsSensitiveValue(rawMemoryText)) {
+    return { ok: false, error: '候选疑似包含敏感信息，未写入记忆' };
+  }
+  try {
+    return store.appendEntry({
+      ...paths,
+      scope,
+      text: payload?.text,
+      tags: rawTags,
+      source: 'compact',
+      maxEntries: clampInt(settings?.memoryMaxEntries, 20, 2000, 200),
+    });
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+function memoryUpdate({ settings, userDataPath, payload = {} } = {}) {
+  if (!isEnabled(settings)) return { ...DISABLED };
+  const paths = pathsFrom(payload, userDataPath);
+  const scope = requestedScope(payload);
+  const invalid = validateExplicitScope(scope, paths);
+  if (invalid) return invalid;
+  try {
+    return store.updateEntry({
+      ...paths,
+      id: String(payload?.id || ''),
+      scope,
+      expected: payload?.expected && typeof payload.expected === 'object'
+        ? payload.expected
+        : {},
+      text: payload?.text,
+      tags: Array.isArray(payload?.tags) ? payload.tags : [],
+    });
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+module.exports = {
+  memoryList,
+  memoryAdd,
+  memoryDelete,
+  memoryAccept,
+  memoryUpdate,
+};

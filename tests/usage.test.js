@@ -127,3 +127,20 @@ describe('aggregate', () => {
     assert.deepEqual(totals, { in: 0, out: 0, cost: 0, estimatedShare: 0 });
   });
 });
+
+describe('D.4 compact usage wiring', () => {
+  it('routes both compact artifact calls through one compact-kind write callback', () => {
+    const mainSource = require('node:fs').readFileSync(
+      require('node:path').join(__dirname, '..', 'src', 'main.js'),
+      'utf8'
+    );
+    const start = mainSource.indexOf("ipcMain.handle('session:compact'");
+    const end = mainSource.indexOf("ipcMain.handle('session:export'", start);
+    const handler = mainSource.slice(start, end);
+    assert.ok(start >= 0 && end > start);
+    assert.match(handler, /const onUsage =/);
+    assert.match(handler, /kind:\s*'compact'/);
+    assert.match(handler, /clampInt\(payload\.candidateLimit,\s*0,\s*5,\s*0\)/);
+    assert.match(handler, /generateCompactArtifacts\(\{[\s\S]*?onUsage,/);
+  });
+});

@@ -4,8 +4,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { memoryList, memoryAdd, memoryDelete } = require('../src/ai/memory-ipc');
-const { readAll } = require('../src/ai/memory-store');
+const {
+  memoryList,
+  memoryAdd,
+  memoryDelete,
+  memoryAccept,
+  memoryUpdate,
+} = require('../src/ai/memory-ipc');
+const memoryStore = require('../src/ai/memory-store');
+const { readAll } = memoryStore;
 
 const SETTINGS = {
   memoryEnabled: true,
@@ -27,7 +34,7 @@ describe('memory-ipc', () => {
   it('all three refuse when memoryEnabled is false', () => {
     const { projectPath, userDataPath } = dirs();
     const settings = { ...SETTINGS, memoryEnabled: false };
-    for (const fn of [memoryList, memoryAdd, memoryDelete]) {
+    for (const fn of [memoryList, memoryAdd, memoryDelete, memoryAccept, memoryUpdate]) {
       const r = fn({ settings, userDataPath, payload: { projectPath, text: 'x', id: 'm_1' } });
       assert.equal(r.ok, false);
       assert.match(r.error, /长期记忆未启用/);
@@ -111,5 +118,145 @@ describe('memory-ipc', () => {
     });
     // 合法但不存在的目录允许创建；关键是永远返回结构化结果、不抛异常
     assert.equal(typeof r.ok, 'boolean');
+  });
+
+  it('memoryAccept requires an explicit scope and never falls project back to user', () => {
+    const { userDataPath } = dirs();
+    const missingScope = memoryAccept({
+      settings: SETTINGS, userDataPath, payload: { text: 'x' },
+    });
+    assert.equal(missingScope.ok, false);
+    assert.match(missingScope.error, /作用域/);
+
+    const missingProject = memoryAccept({
+      settings: SETTINGS, userDataPath,
+      payload: { scope: 'project', text: '项目事实' },
+    });
+    assert.equal(missingProject.ok, false);
+    assert.match(missingProject.error, /projectPath/);
+    assert.equal(readAll({ userDataPath }).counts.user, 0);
+  });
+
+  it('memoryAccept fixes new source to compact and keeps deduped old source unchanged', () => {
+    const { projectPath, userDataPath } = dirs();
+    const accepted = memoryAccept({
+      settings: SETTINGS, userDataPath,
+      payload: {
+        projectPath, scope: 'project', text: '项目构建只用 npm test',
+        tags: ['build'], source: 'slash',
+      },
+    });
+    assert.equal(accepted.ok, true);
+    let all = readAll({ projectPath, userDataPath });
+    assert.equal(all.entries[0].source, 'compact');
+
+    memoryAdd({
+      settings: SETTINGS, userDataPath,
+      payload: { scope: 'user', text: '回答使用中文' },
+    });
+    const duplicate = memoryAccept({
+      settings: SETTINGS, userDataPath,
+      payload: { projectPath, scope: 'user', text: ' 回答使用中文 ' },
+    });
+    assert.equal(duplicate.ok, true);
+    assert.equal(duplicate.deduped, true);
+    all = readAll({ projectPath, userDataPath });
+    assert.equal(all.entries.find((entry) => entry.id === duplicate.id).source, 'slash');
+  });
+
+  it('memoryAccept rejects sensitive values in edited text or tags before writing', () => {
+    const { userDataPath } = dirs();
+    for (const payload of [
+      { scope: 'user', text: 'api_key = abcdefghijklmnop', tags: [] },
+      { scope: 'user', text: '部署约定', tags: ['password = abcdefghijklmnop'] },
+    ]) {
+      const result = memoryAccept({ settings: SETTINGS, userDataPath, payload });
+      assert.equal(result.ok, false);
+      assert.match(result.error, /敏感信息/);
+    }
+    assert.equal(readAll({ userDataPath }).counts.user, 0);
+  });
+
+  it('memoryAccept honors explicit user scope even when a project is bound', () => {
+    const { projectPath, userDataPath } = dirs();
+    const result = memoryAccept({
+      settings: SETTINGS, userDataPath,
+      payload: { projectPath, scope: 'user', text: '跨项目偏好' },
+    });
+    assert.equal(result.scope, 'user');
+    assert.deepEqual(readAll({ projectPath, userDataPath }).counts, { project: 0, user: 1 });
+  });
+
+  it('memoryAccept applies memoryMaxEntries to accepted candidates', () => {
+    const { userDataPath } = dirs();
+    const settings = { ...SETTINGS, memoryMaxEntries: 20 };
+    for (let index = 0; index < 25; index++) {
+      const result = memoryAccept({
+        settings, userDataPath,
+        payload: { scope: 'user', text: 'accepted-' + index },
+      });
+      assert.equal(result.ok, true);
+    }
+    assert.equal(readAll({ userDataPath }).counts.user, 20);
+  });
+
+  it('memoryUpdate passes expected state through and returns a stable conflict', () => {
+    const { projectPath, userDataPath } = dirs();
+    const added = memoryAccept({
+      settings: SETTINGS, userDataPath,
+      payload: { projectPath, scope: 'project', text: '旧文本', tags: ['old'] },
+    });
+    const current = readAll({ projectPath, userDataPath }).entries[0];
+    const updated = memoryUpdate({
+      settings: SETTINGS, userDataPath,
+      payload: {
+        projectPath, id: added.id, scope: 'project',
+        expected: { text: current.text, tags: current.tags, updatedAt: current.updatedAt },
+        text: '新文本', tags: ['new'],
+      },
+    });
+    assert.equal(updated.ok, true);
+    assert.equal(updated.entry.scope, 'project');
+    assert.equal(updated.entry.source, 'compact');
+
+    const stale = memoryUpdate({
+      settings: SETTINGS, userDataPath,
+      payload: {
+        projectPath, id: added.id, scope: 'project',
+        expected: { text: current.text, tags: current.tags, updatedAt: current.updatedAt },
+        text: '覆盖新文本', tags: [],
+      },
+    });
+    assert.deepEqual(stale, {
+      ok: false, code: 'CONFLICT', error: '记忆已被修改或删除，请刷新后重试',
+    });
+  });
+
+  it('memoryUpdate rejects invalid scope and a project update without projectPath', () => {
+    const { userDataPath } = dirs();
+    for (const payload of [
+      { id: 'm_1', scope: 'other', text: 'x' },
+      { id: 'm_1', scope: 'project', text: 'x' },
+    ]) {
+      const result = memoryUpdate({ settings: SETTINGS, userDataPath, payload });
+      assert.equal(result.ok, false);
+    }
+  });
+
+  it('memoryUpdate catches an unexpected store exception', () => {
+    const { userDataPath } = dirs();
+    const realUpdate = memoryStore.updateEntry;
+    memoryStore.updateEntry = () => { throw new Error('unexpected I/O'); };
+    let result;
+    try {
+      result = memoryUpdate({
+        settings: SETTINGS, userDataPath,
+        payload: { id: 'm_1', scope: 'user', expected: {}, text: 'x', tags: [] },
+      });
+    } finally {
+      memoryStore.updateEntry = realUpdate;
+    }
+    assert.equal(result.ok, false);
+    assert.match(result.error, /unexpected I\/O/);
   });
 });
