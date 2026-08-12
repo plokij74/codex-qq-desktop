@@ -286,7 +286,7 @@ npm run dist
 
 ## Phase C.4：子 Agent 增强（implement + 并行 explore + transcript）
 
-在 C.2 的 `spawn_explore` 之上，增加可写 implement、有限并行 explore（含批量工具），以及主轨迹内可展开 transcript。**不实现 git worktree 隔离**；无新 npm 依赖。
+在 C.2 的 `spawn_explore` 之上，增加可写 implement、有限并行 explore（含批量工具），以及主轨迹内可展开 transcript。C.4 的历史基线不包含 worktree 隔离；D.5 已为 `spawn_implement` 增加独立生命周期。无新 npm 依赖。
 
 ### 开关与设置
 
@@ -319,10 +319,10 @@ npm run dist
 | implement | 上表只读 + **`write_file` / `search_replace`** | `run_terminal` / `delete_path` / `git_commit` / spawn / skills / mcp |
 
 - **depth ≤ 1**：子 Agent **不可再 spawn**
-- implement 与父 **共用** PermissionGate 与 session「始终允许」；写入仍走 `confirm-writes` 审批
+- C.4 原实现共用父 PermissionGate；D.5 改为 spawn 入口走父 write Gate，隔离树内部使用只允许安全 read/write 的独立 Gate
 - 子 run **不跑** Hooks（C.3：`subagentDepth >= 1`）
-- **无 worktree** 隔离（本阶段不实现）
-- implement 的 `fileChanges` **合并**进父轨迹；verify 软门闩 **不** 因子 implement 记成功（验证仍由主 Agent 负责）
+- C.4 当时无 worktree 隔离；现由 Phase D.5 收敛为仅 `spawn_implement` 使用 worktree
+- C.4 原实现会把 implement `fileChanges` 合并进父轨迹；D.5 的 pending 结果不合并，必须先由用户整批应用（验证仍由主 Agent 负责）
 
 ### 轨迹 UI
 
@@ -332,7 +332,7 @@ npm run dist
 
 ### 本阶段明确不做
 
-git worktree 隔离、implement 并行、子内再 spawn、独立侧栏多 Agent 面板、子会话持久化/恢复。
+implement 并行、子内再 spawn、独立侧栏多 Agent 面板。worktree 生命周期、结果恢复与用户应用见 Phase D.5。
 
 ## Phase C.5：MCP 增强 + Skills 可执行 / 路由 + 列表 UI
 
@@ -652,3 +652,24 @@ D.4 把会话压缩与长期记忆连成一个人工审核闭环。成功 compac
 - 接受前会再次检查候选 text 与 tags 的常见敏感值形态；命中时不写入且保留候选。
 - candidate id 与 evidence 不写入项目/用户 `memory.jsonl`，也不进入 Markdown 或 JSON 会话导出。
 - 候选 evidence 是会话原文的短副本，与原会话一起存放在 renderer localStorage；接受、拒绝或删除整个会话后移除。
+
+## Phase D.5：`spawn_implement` Worktree 隔离
+
+D.5 把可写子 Agent 与主项目目录解耦。每次 `spawn_implement` 都从当前 Git `HEAD` 创建一个 detached、locked 的临时 worktree，子 Agent 只在该 checkout 的绑定项目目录内读写；主项目只有用户在聊天中的“应用全部”按钮明确确认后才会改变。
+
+### 使用方式
+
+- 绑定目录必须是可解析 `HEAD` 的 Git 工作树，且整个仓库在创建前 clean。普通 ignored 文件允许，但不会被快照或应用。
+- `spawn_implement` 仍需通过主 Agent 的 write Gate。`confirm-writes` 只审批入口一次，隔离树内的 `write_file` / `search_replace` 自动允许；`full-auto` 也不会自动应用主树结果。
+- 子 Agent 不能使用终端、删除、commit、MCP、Skills 或网络；完成后聊天时间线出现“隔离改动待审”卡片。
+- 卡片显示目标、基线短 SHA、文件列表和增删统计；“查看 diff”按需读取 bounded preview。“应用全部”是整批动作，会留下主树未暂存改动，不自动测试、stage 或 commit；“丢弃”不会修改主树。
+
+### 安全边界与状态
+
+- 主仓库在创建和应用前都必须 clean 且 `HEAD` 与基线一致；期间主树有任何变化，应用严格返回冲突并保留隔离结果。
+- patch 完整保存在项目 `.codex/worktrees/<resultId>/result.patch`，上限 16 MiB；renderer/localStorage、usage、memory 和会话导出只保存 opaque id 与 bounded 摘要，不保存 patch 或 checkout 绝对路径。
+- 结果最多同时保留 3 个未处理项。应用、丢弃或清理失败会进入可重试状态；`apply_uncertain` 不会自动重放或回滚。
+- 创建、收集、应用、打开和清理都会重新校验 canonical 路径、Git worktree registration 和 marker；未知目录、损坏 marker 或链接路径只报告 warning，不自动删除。
+- D.5 不回退到主目录直写，也不支持 dirty base 快照、逐文件选择、自动 commit/merge、PR 或 worktree 并行。
+
+临时资料可能包含源码或秘密。应用/丢弃并完成清理后目录会移除；合法 pending 结果不会因应用重启被静默删除。若主机上的其它进程同时修改 Git 元数据或文件，系统会保留现场并要求人工检查。

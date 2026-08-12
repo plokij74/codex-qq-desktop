@@ -1,6 +1,7 @@
 'use strict';
 
 const { AGENT_EVENTS } = require('./agent-events');
+const { assertSafeChildPath } = require('./worktree');
 
 const SUMMARY_MAX = 8 * 1024;
 const GOALS_MAX = 6;
@@ -40,6 +41,7 @@ function mergeSubagentFileChanges(parentArr, toolName, resultStr) {
     return parentArr;
   }
   if (!parsed || parsed.ok === false) return parentArr;
+  if (parsed.isolation === 'worktree') return parentArr;
   // Prefer spawn_implement; also accept explicit kind === 'implement'
   if (parsed.kind != null && parsed.kind !== 'implement') return parentArr;
   if (!Array.isArray(parsed.fileChanges)) return parentArr;
@@ -56,7 +58,7 @@ function mergeSubagentFileChanges(parentArr, toolName, resultStr) {
   return parentArr;
 }
 
-function createSubagentRuntime({ runLoop } = {}) {
+function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
   if (typeof runLoop !== 'function') {
     throw new Error('createSubagentRuntime requires runLoop');
   }
@@ -218,6 +220,7 @@ function createSubagentRuntime({ runLoop } = {}) {
       subagentEnabled: false,
       verifyBeforeDone: false,
       hooksEnabled: false,
+      webEnabled: false,
     };
   }
 
@@ -225,10 +228,56 @@ function createSubagentRuntime({ runLoop } = {}) {
     const childExt = { ...(parentExt || {}) };
     delete childExt.mcpHub;
     delete childExt.subagentRuntime;
+    delete childExt.worktreeManager;
     return childExt;
   }
 
-  async function runChild(ctx, { kind, goal, maxTurns, batchId }) {
+  function isolatedGate(childProjectPath) {
+    const readTools = new Set(['list_dir', 'read_file', 'grep', 'glob', 'git_status', 'git_diff']);
+    const writeTools = new Set(['write_file', 'search_replace']);
+    return {
+      async validatePath({ tool, risk, path: relPath, allowMissing } = {}) {
+        const name = String(tool || '');
+        const value = String(relPath || '').replace(/\\/g, '/');
+        if (risk !== 'read' && risk !== 'write') return { allowed: false, reason: '隔离路径校验只允许读写工具' };
+        if ((risk === 'read' && !readTools.has(name)) || (risk === 'write' && !writeTools.has(name))) {
+          return { allowed: false, reason: '隔离子 Agent 工具不在允许列表' };
+        }
+        try {
+          await assertSafeChildPath(childProjectPath, value, { allowMissing: allowMissing === true });
+          return { allowed: true };
+        } catch (err) {
+          return { allowed: false, reason: err.message || '隔离路径不安全' };
+        }
+      },
+      async authorize({ tool, risk, path: relPath, signal } = {}) {
+        if (signal?.aborted) throw makeAbortedError();
+        const name = String(tool || '');
+        const value = String(relPath || '').replace(/\\/g, '/');
+        if (value === '.git' || value.startsWith('.git/')) {
+          return { allowed: false, reason: '隔离 worktree 的 Git 管理路径不可访问' };
+        }
+        if (risk === 'read' && readTools.has(name)) {
+          if (value && name !== 'glob' && name !== 'git_status') {
+            const checked = await this.validatePath({ tool: name, risk, path: value });
+            if (!checked.allowed) return checked;
+          }
+          return { allowed: true };
+        }
+        if (risk === 'write' && writeTools.has(name)) {
+          return this.validatePath({ tool: name, risk, path: value, allowMissing: true });
+        }
+        return { allowed: false, reason: '隔离子 Agent 只允许项目内安全读写工具' };
+      },
+      resolveApproval() { return false; },
+      rememberSession() {},
+      riskForTool(tool) {
+        return readTools.has(String(tool || '')) ? 'read' : writeTools.has(String(tool || '')) ? 'write' : 'write';
+      },
+    };
+  }
+
+  async function runChild(ctx, { kind, goal, maxTurns, batchId, childProject, childGate, worktreeHandle, subagentId: requestedId }) {
     if (Number(ctx.subagentDepth) >= 1) {
       return { ok: false, kind, error: '子 Agent 内禁止再次 spawn' };
     }
@@ -237,7 +286,7 @@ function createSubagentRuntime({ runLoop } = {}) {
       return { ok: false, kind, error: 'goal 过短（至少 4 个字符）' };
     }
     const turns = clampMaxTurns(kind, maxTurns);
-    const subagentId = nextId();
+    const subagentId = requestedId || nextId();
     const t0 = Date.now();
 
     if (ctx.signal?.aborted) throw makeAbortedError();
@@ -253,10 +302,10 @@ function createSubagentRuntime({ runLoop } = {}) {
 
     try {
       const result = await runLoop({
-        project: ctx.project,
+        project: childProject || ctx.project,
         settings: childSettings(ctx.settings, turns),
         messages: [{ role: 'user', content: g }],
-        gate: ctx.gate,
+        gate: childGate || ctx.gate,
         onEvent: (ev) => {
           if (ev && typeof ev === 'object') {
             ctx.onEvent?.({ ...ev, subagent: true, subagentId, kind });
@@ -285,9 +334,10 @@ function createSubagentRuntime({ runLoop } = {}) {
         subagentId,
         summary,
         turns: result.turns,
+        terminalReason: result.terminalReason || 'completed',
         agentLog: slimLog(result.agentLog),
       };
-      if (kind === 'implement') out.fileChanges = fileChanges;
+      if (kind === 'implement' && !worktreeHandle) out.fileChanges = fileChanges;
 
       ctx.onEvent?.({
         type: AGENT_EVENTS.SUBAGENT_END,
@@ -298,7 +348,7 @@ function createSubagentRuntime({ runLoop } = {}) {
         durationMs: Date.now() - t0,
         fileChangeCount: fileChanges.length,
         ...(batchId ? { batchId } : {}),
-        ...(kind === 'implement' && fileChanges.length ? { fileChanges } : {}),
+        ...(kind === 'implement' && fileChanges.length && !worktreeHandle ? { fileChanges } : {}),
       });
       return out;
     } catch (err) {
@@ -342,7 +392,82 @@ function createSubagentRuntime({ runLoop } = {}) {
   async function runImplement(ctx, { goal, maxTurns } = {}) {
     const early = precheckChild(ctx, { kind: 'implement', goal });
     if (early) return early;
-    return withImplementLock(ctx, () => runChild(ctx, { kind: 'implement', goal, maxTurns }));
+    return withImplementLock(ctx, async () => {
+      const manager = worktreeManager || ctx.extensions?.worktreeManager;
+      if (!manager || typeof manager.create !== 'function') {
+        return {
+          ok: false,
+          kind: 'implement',
+          isolation: 'worktree',
+          code: 'WORKTREE_UNAVAILABLE',
+          error: '隔离 worktree manager 不可用，已拒绝在主项目中执行修改',
+        };
+      }
+      const subagentId = nextId();
+      const created = await manager.create({
+        project: ctx.project,
+        projectBindingId: ctx.projectBindingId,
+        sessionId: ctx.sessionKey,
+        subagentId,
+        goal,
+        signal: ctx.signal,
+      });
+      if (!created?.ok) return created || { ok: false, kind: 'implement', error: '隔离 worktree 创建失败' };
+      const handle = created.handle;
+      const child = {
+        ...(ctx.project || {}),
+        path: handle.childProjectPath,
+      };
+      const gate = isolatedGate(handle.childProjectPath);
+      let childResult;
+      try {
+        childResult = await runChild(ctx, {
+          kind: 'implement', goal, maxTurns,
+          childProject: child,
+          childGate: gate,
+          worktreeHandle: handle,
+          subagentId,
+        });
+      } catch (err) {
+        const collected = await manager.collect(handle, { incomplete: true });
+        if (collected?.ok && collected.changed && collected.result) {
+          ctx.onEvent?.({ type: AGENT_EVENTS.WORKTREE_READY, result: collected.result, subagentId });
+        }
+        throw err;
+      }
+      const collected = await manager.collect(handle, {
+        incomplete: childResult.ok !== true || childResult.terminalReason !== 'completed',
+      });
+      if (!collected?.ok) {
+        return {
+          ...childResult,
+          ok: false,
+          isolation: 'worktree',
+          code: collected.code || 'COLLECT_FAILED',
+          result: collected.result,
+          error: collected.error || '隔离改动收集失败',
+        };
+      }
+      if (!collected.changed) {
+        return { ...childResult, isolation: 'worktree', result: { changed: false } };
+      }
+      const result = collected.result;
+      ctx.onEvent?.({ type: AGENT_EVENTS.WORKTREE_READY, result, subagentId: childResult.subagentId });
+      return {
+        ...childResult,
+        isolation: 'worktree',
+        result: {
+          id: result.id,
+          state: result.state,
+          incomplete: result.incomplete,
+          fileCount: result.stats?.files || 0,
+          additions: result.stats?.additions || 0,
+          deletions: result.stats?.deletions || 0,
+          hasBinary: (result.stats?.binaryFiles || 0) > 0,
+          message: '改动在隔离 worktree 中，等待用户在聊天卡片应用或丢弃',
+        },
+      };
+    });
   }
 
   async function runExplores(ctx, { goals, maxTurns } = {}) {

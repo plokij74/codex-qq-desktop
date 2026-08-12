@@ -61,6 +61,8 @@ const {
 } = require('./ai/memory-ipc');
 const { fetchUrl } = require('./ai/web-fetch');
 const { aggregate } = require('./ai/usage');
+const { createWorktreeManager } = require('./ai/worktree');
+const { createWorktreeIpcHandlers } = require('./ai/worktree-ipc');
 const {
   usageFilePath,
   appendRecord,
@@ -118,6 +120,22 @@ const pendingPlansBySession = new Map();
  * @type {{ abort: AbortController, gate: ReturnType<typeof createPermissionGate>, sessionId: string, sender: Electron.WebContents, termId: string } | null}
  */
 let manualTerm = null;
+let worktreeMutation = false;
+
+const worktreeManager = createWorktreeManager();
+const worktreeIpc = createWorktreeIpcHandlers({
+  manager: worktreeManager,
+  isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
+  withMutation: async (fn) => {
+    if (activeRun || manualTerm || worktreeMutation) return { ok: false, code: 'BUSY', error: '有对话或终端正在进行，请稍后重试' };
+    worktreeMutation = true;
+    try { return await fn(); } finally { worktreeMutation = false; }
+  },
+  openPath: async (target) => {
+    if (!target || !fs.existsSync(target)) return '路径不存在';
+    return shell.openPath(target);
+  },
+});
 
 function userDataPath() {
   return app.getPath('userData');
@@ -266,6 +284,11 @@ function createWindow() {
       sandbox: true,
     },
   });
+  const worktreeSenderId = win.webContents.id;
+  win.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
+    if (isMainFrame !== false) worktreeIpc.dropSender(worktreeSenderId);
+  });
+  win.webContents.once('destroyed', () => worktreeIpc.dropSender(worktreeSenderId));
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -522,6 +545,18 @@ ipcMain.handle('memory:update', async (_e, payload = {}) => memoryUpdate({
   settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
 }));
 
+// Phase D.5 worktree results. Only bind accepts a project path; every later
+// call routes through the sender-scoped opaque binding token.
+ipcMain.handle('worktree:bind', async (event, payload = {}) => worktreeIpc.bind(event, payload));
+ipcMain.handle('worktree:unbind', async (event, payload = {}) => worktreeIpc.unbind(event, payload));
+ipcMain.handle('worktree:list', async (event, payload = {}) => worktreeIpc.list(event, payload));
+ipcMain.handle('worktree:get', async (event, payload = {}) => worktreeIpc.get(event, payload));
+ipcMain.handle('worktree:apply', async (event, payload = {}) => worktreeIpc.apply(event, payload));
+ipcMain.handle('worktree:discard', async (event, payload = {}) => worktreeIpc.discard(event, payload));
+ipcMain.handle('worktree:retryCollect', async (event, payload = {}) => worktreeIpc.retryCollect(event, payload));
+ipcMain.handle('worktree:cleanup', async (event, payload = {}) => worktreeIpc.cleanup(event, payload));
+ipcMain.handle('worktree:open', async (event, payload = {}) => worktreeIpc.open(event, payload));
+
 ipcMain.handle('dialog:selectDirectory', async () => {
   const win = BrowserWindow.getFocusedWindow();
   const result = await dialog.showOpenDialog(win || undefined, {
@@ -618,6 +653,10 @@ ipcMain.handle('terminal:run', async (event, payload = {}) => {
   const command = String(payload.command || '').trim();
   const cwdOpt = typeof payload.cwd === 'string' && payload.cwd.trim() ? payload.cwd.trim() : undefined;
   const sender = event.sender;
+
+  if (worktreeMutation) {
+    return { ok: false, code: 'BUSY', error: '隔离改动正在应用或清理，请稍后重试' };
+  }
 
   if (!sessionId || !projectPath || !command) {
     return { ok: false, error: '参数无效：需要 sessionId、projectPath、command' };
@@ -791,6 +830,7 @@ ipcMain.handle('atRef:expand', async (_e, payload = {}) => {
  * @param {{ stopPrevious?: boolean }} [opts]
  */
 async function startChatRun(event, payload = {}, opts = {}) {
+  if (worktreeMutation) return { ok: false, code: 'BUSY', error: '隔离改动正在应用或清理，请稍后重试' };
   const stopPrevious = opts.stopPrevious !== false;
   if (stopPrevious) {
     abortActiveRun();
@@ -979,6 +1019,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
         registry: project?.path ? undefined : createMemoryOnlyRegistry(),
         extensions: {
           userDataPath: userDataPath(),
+          worktreeManager,
         },
       });
       const out = {
@@ -1091,6 +1132,9 @@ ipcMain.handle('chat:approvePlan', async (event, payload = {}) => {
   const planId = payload.planId;
   if (!sessionId || !planId) {
     return { ok: false, error: '缺少 sessionId 或 planId' };
+  }
+  if (worktreeMutation) {
+    return { ok: false, code: 'BUSY', error: '隔离改动正在应用或清理，请稍后重试' };
   }
   const pending = pendingPlansBySession.get(sessionId);
   if (!pending || pending.planId !== planId) {

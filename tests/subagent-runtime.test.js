@@ -7,6 +7,19 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function unchangedWorktreeManager() {
+  let sequence = 0;
+  return {
+    async create() {
+      sequence += 1;
+      return { ok: true, handle: { id: `wt_test${sequence}abc`, childProjectPath: process.cwd() } };
+    },
+    async collect() {
+      return { ok: true, changed: false };
+    },
+  };
+}
+
 describe('D.3 usage forwarding', () => {
   it('overrides kind on forwarded usage events', async () => {
     const events = [];
@@ -123,6 +136,7 @@ describe('subagent-runtime', () => {
   it('serializes implement runs', async () => {
     const order = [];
     const rt = createSubagentRuntime({
+      worktreeManager: unchangedWorktreeManager(),
       runLoop: async (opts) => {
         const tag = String(opts.messages[0].content);
         order.push('start:' + tag);
@@ -149,6 +163,104 @@ describe('subagent-runtime', () => {
     assert.equal(firstStart.slice(6), firstEnd.slice(4));
     assert.equal(secondStart.slice(6), secondEnd.slice(4));
     assert.notEqual(firstStart.slice(6), secondStart.slice(6));
+  });
+
+  it('runs implement inside the manager worktree and returns only an opaque result summary', async () => {
+    let seen;
+    const calls = [];
+    const manager = {
+      async create(input) {
+        calls.push(['create', input]);
+        return { ok: true, handle: { id: 'wt_ab12cd34', childProjectPath: process.cwd() } };
+      },
+      async collect(handle, opts) {
+        calls.push(['collect', handle, opts]);
+        return {
+          ok: true,
+          changed: true,
+          result: {
+            id: 'wt_ab12cd34', state: 'ready', incomplete: false,
+            stats: { files: 2, additions: 4, deletions: 1, binaryFiles: 0 },
+          },
+        };
+      },
+    };
+    const rt = createSubagentRuntime({
+      worktreeManager: manager,
+      runLoop: async (opts) => {
+        seen = opts;
+        return {
+          content: 'done', turns: 2, terminalReason: 'completed', agentLog: [],
+          fileChanges: [{ path: 'a.js', op: 'write' }],
+        };
+      },
+    });
+    const { ctx, events } = makeCtx();
+    ctx.settings.webEnabled = true;
+    ctx.gate = { authorize: async () => ({ allowed: false }) };
+    const out = await rt.runImplement(ctx, { goal: 'change isolated files' });
+    assert.equal(out.ok, true);
+    assert.equal(out.isolation, 'worktree');
+    assert.equal(out.fileChanges, undefined);
+    assert.equal(out.result.id, 'wt_ab12cd34');
+    assert.equal(seen.project.path, process.cwd());
+    assert.equal(seen.settings.webEnabled, false);
+    assert.notEqual(seen.gate, ctx.gate);
+    assert.equal((await seen.gate.authorize({ tool: 'write_file', risk: 'write', path: 'a.js' })).allowed, true);
+    assert.equal((await seen.gate.validatePath({ tool: 'write_file', risk: 'write', path: '../outside.js', allowMissing: true })).allowed, false);
+    assert.equal((await seen.gate.authorize({ tool: 'read_file', risk: 'read', path: '.git/config' })).allowed, false);
+    assert.equal((await seen.gate.authorize({ tool: 'run_terminal', risk: 'terminal', path: '.' })).allowed, false);
+    assert.equal(calls[0][0], 'create');
+    assert.equal(calls[1][0], 'collect');
+    assert.equal(events.some((event) => event.type === 'worktree-ready'), true);
+  });
+
+  it('fails closed when worktree creation fails', async () => {
+    let ran = false;
+    const rt = createSubagentRuntime({
+      worktreeManager: {
+        async create() { return { ok: false, code: 'DIRTY_BASE', error: 'dirty' }; },
+      },
+      runLoop: async () => { ran = true; return {}; },
+    });
+    const { ctx } = makeCtx();
+    const out = await rt.runImplement(ctx, { goal: 'change isolated files' });
+    assert.equal(out.ok, false);
+    assert.equal(out.code, 'DIRTY_BASE');
+    assert.equal(ran, false);
+  });
+
+  it('fails closed when the worktree manager is unavailable', async () => {
+    let ran = false;
+    const rt = createSubagentRuntime({
+      runLoop: async () => { ran = true; return {}; },
+    });
+    const { ctx } = makeCtx();
+    const out = await rt.runImplement(ctx, { goal: 'change isolated files' });
+    assert.equal(out.ok, false);
+    assert.equal(out.code, 'WORKTREE_UNAVAILABLE');
+    assert.equal(out.isolation, 'worktree');
+    assert.equal(ran, false);
+  });
+
+  it('reports collect failure as a failed isolated result without direct-write fallback', async () => {
+    let runs = 0;
+    const rt = createSubagentRuntime({
+      worktreeManager: {
+        async create() { return { ok: true, handle: { id: 'wt_ab12cd34', childProjectPath: '/isolated/project' } }; },
+        async collect() { return { ok: false, code: 'COLLECT_FAILED', error: 'cannot collect' }; },
+      },
+      runLoop: async () => {
+        runs++;
+        return { content: 'changed', turns: 1, terminalReason: 'completed', agentLog: [], fileChanges: [] };
+      },
+    });
+    const { ctx } = makeCtx();
+    const out = await rt.runImplement(ctx, { goal: 'change isolated files' });
+    assert.equal(out.ok, false);
+    assert.equal(out.isolation, 'worktree');
+    assert.equal(out.code, 'COLLECT_FAILED');
+    assert.equal(runs, 1);
   });
 
   it('runExplores preserves goal order and sets parallel', async () => {
@@ -211,6 +323,7 @@ describe('subagent-runtime', () => {
     const ac = new AbortController();
     let bStarted = false;
     const rt = createSubagentRuntime({
+      worktreeManager: unchangedWorktreeManager(),
       runLoop: async (opts) => {
         const tag = String(opts.messages[0].content);
         if (tag.includes('AAA')) {
@@ -322,5 +435,16 @@ describe('subagent-runtime', () => {
     }));
     assert.equal(arr.length, 1);
     assert.equal(arr[0].path, 'ok.js');
+  });
+
+  it('does not merge pending worktree changes into parent fileChanges', () => {
+    const arr = [];
+    mergeSubagentFileChanges(arr, 'spawn_implement', JSON.stringify({
+      ok: true,
+      kind: 'implement',
+      isolation: 'worktree',
+      fileChanges: [{ path: 'isolated.js', op: 'write' }],
+    }));
+    assert.deepEqual(arr, []);
   });
 });

@@ -44,7 +44,14 @@ describe('implement provider', () => {
       project: { path: process.cwd(), name: 't' },
       gate: createPermissionGate({ permissionMode: 'full-auto', agentMode: 'agent' }),
       onEvent: (e) => events.push(e),
-      extensions: {},
+      extensions: {
+        worktreeManager: {
+          async create() {
+            return { ok: true, handle: { id: 'wt_testabc123', childProjectPath: process.cwd() } };
+          },
+          async collect() { return { ok: true, changed: false }; },
+        },
+      },
     });
     const parsed = JSON.parse(raw);
     assert.equal(parsed.ok, true);
@@ -52,7 +59,8 @@ describe('implement provider', () => {
     assert.equal(seen.subagentKind, 'implement');
     assert.equal(seen.subagentDepth, 1);
     assert.equal(seen.settings.maxAgentTurns, 5);
-    assert.ok(Array.isArray(parsed.fileChanges));
+    assert.equal(parsed.fileChanges, undefined);
+    assert.equal(parsed.isolation, 'worktree');
     assert.ok(events.some((e) => e.type === 'subagent-start' && e.kind === 'implement'));
     assert.ok(events.some((e) => e.type === 'subagent-end' && e.ok));
   });

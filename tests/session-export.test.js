@@ -125,4 +125,22 @@ describe('session-export', () => {
     assert.equal(parsed.version, 1);
     assert.equal('pendingMemoryCandidates' in parsed.session, false);
   });
+
+  it('never exports pending worktree result authority or preview data', () => {
+    const session = sampleSession();
+    session.pendingWorktreeResults = [{
+      id: 'wt_private',
+      goal: 'PRIVATE_WORKTREE_GOAL',
+      files: [{ path: 'PRIVATE_FILE_PATH' }],
+      preview: 'PRIVATE_PATCH_PREVIEW',
+      checkout: 'C:/private/checkout',
+    }];
+    const markdown = exportSessionMarkdown(session);
+    const json = exportSessionJson(session);
+    for (const secret of ['wt_private', 'PRIVATE_WORKTREE_GOAL', 'PRIVATE_FILE_PATH', 'PRIVATE_PATCH_PREVIEW', 'C:/private/checkout']) {
+      assert.equal(markdown.includes(secret), false);
+      assert.equal(json.includes(secret), false);
+    }
+    assert.equal('pendingWorktreeResults' in JSON.parse(json).session, false);
+  });
 });

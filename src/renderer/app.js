@@ -45,6 +45,10 @@ const FRIENDS = [
 ];
 let sessions = [];
 let projects = [];
+const worktreeBindings = new Map();
+const worktreePreviews = new Map();
+const worktreeActionBusy = new Set();
+const worktreeReconcileSeq = new Map();
 let activeSessionId = '';
 let currentView = 'chat';
 let sending = false;
@@ -523,6 +527,96 @@ function ensureSessionCandidateState(session) {
   return session.pendingMemoryCandidates;
 }
 
+function ensureSessionWorktreeState(session) {
+  if (!session || !window.WorktreeResultState) return [];
+  session.pendingWorktreeResults = window.WorktreeResultState.normalizeList(session.pendingWorktreeResults);
+  return session.pendingWorktreeResults;
+}
+
+function projectWorktreeSession(projectId, sessionId = '') {
+  if (sessionId) {
+    const exact = sessions.find((item) => item.id === sessionId && item.projectId === projectId);
+    if (exact) return exact;
+  }
+  return sessions.find((item) => item.kind === 'project' && item.projectId === projectId)
+    || sessions.find((item) => item.projectId === projectId)
+    || null;
+}
+
+function attachWorktreeResult(result, projectId, sessionId = '') {
+  if (!result || !window.WorktreeResultState) return;
+  const session = projectWorktreeSession(projectId, sessionId);
+  if (!session) return;
+  const next = { ...result, projectId, sessionId: result.sessionId || session.id };
+  session.pendingWorktreeResults = window.WorktreeResultState.upsert(
+    ensureSessionWorktreeState(session), next
+  );
+  session.updatedAt = Date.now();
+  saveState();
+}
+
+function replaceProjectWorktreeResults(projectId, rawResults) {
+  if (!window.WorktreeResultState) return;
+  const results = window.WorktreeResultState.normalizeList(
+    (Array.isArray(rawResults) ? rawResults : []).map((result) => ({ ...result, projectId }))
+  );
+  for (const session of sessions) {
+    if (session.projectId !== projectId) continue;
+    session.pendingWorktreeResults = window.WorktreeResultState.replaceAuthoritative(
+      ensureSessionWorktreeState(session), [], projectId
+    );
+  }
+  for (const result of results) {
+    const session = projectWorktreeSession(projectId, result.sessionId);
+    if (!session) continue;
+    session.pendingWorktreeResults = window.WorktreeResultState.upsert(
+      ensureSessionWorktreeState(session),
+      { ...result, projectId, sessionId: result.sessionId || session.id }
+    );
+    session.updatedAt = Date.now();
+  }
+  saveState();
+}
+
+async function bindWorktreeProject(project, force = false) {
+  if (force) worktreeBindings.delete(project.id);
+  let token = worktreeBindings.get(project.id);
+  if (token) return token;
+  const bound = await window.codex.bindWorktreeProject({ projectId: project.id, projectPath: project.path });
+  if (!bound?.ok || !bound.projectBindingId) return '';
+  token = bound.projectBindingId;
+  worktreeBindings.set(project.id, token);
+  return token;
+}
+
+async function reconcileWorktreeResults(project) {
+  if (!project?.id || !project.path || !window.codex?.bindWorktreeProject) return;
+  const sequence = (worktreeReconcileSeq.get(project.id) || 0) + 1;
+  worktreeReconcileSeq.set(project.id, sequence);
+  try {
+    let token = await bindWorktreeProject(project);
+    if (!token) return;
+    let listed = await window.codex.listWorktreeResults({ projectBindingId: token });
+    if (!listed?.ok && listed?.code === 'RESULT_NOT_FOUND') {
+      token = await bindWorktreeProject(project, true);
+      if (!token) return;
+      listed = await window.codex.listWorktreeResults({ projectBindingId: token });
+    }
+    if (!listed?.ok) return;
+    if (worktreeReconcileSeq.get(project.id) !== sequence) return;
+    replaceProjectWorktreeResults(project.id, listed.results);
+    if (activeSession()?.projectId === project.id) renderMessages();
+  } catch {
+    // Recovery is best effort; the next project open/event retries reconciliation.
+  }
+}
+
+function worktreeRefsForSession(session) {
+  return window.WorktreeResultState
+    ? ensureSessionWorktreeState(session)
+    : [];
+}
+
 function uid(prefix = 's') {
   return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
 }
@@ -548,6 +642,7 @@ function loadState() {
     if (!raw) {
       sessions = defaultSessions();
       sessions.forEach(ensureSessionCandidateState);
+      sessions.forEach(ensureSessionWorktreeState);
       projects = defaultProjects();
       activeSessionId = sessions[0].id;
       return;
@@ -558,22 +653,26 @@ function loadState() {
         const mode = normalizeSessionAgentMode(s.agentMode);
         const session = { pinned: false, projectId: null, ...s, agentMode: mode };
         ensureSessionCandidateState(session);
+        ensureSessionWorktreeState(session);
         return session;
       })
       : defaultSessions();
     sessions.forEach(ensureSessionCandidateState);
+    sessions.forEach(ensureSessionWorktreeState);
     projects = Array.isArray(data.projects) && data.projects.length ? data.projects : defaultProjects();
     activeSessionId = data.activeSessionId && sessions.some((s) => s.id === data.activeSessionId) ? data.activeSessionId : sessions[0].id;
     if (data.pluginState) pluginState = { ...pluginState, ...data.pluginState };
   } catch {
     sessions = defaultSessions();
     sessions.forEach(ensureSessionCandidateState);
+    sessions.forEach(ensureSessionWorktreeState);
     projects = defaultProjects();
     activeSessionId = sessions[0].id;
   }
 }
 function saveState() {
   sessions.forEach(ensureSessionCandidateState);
+  sessions.forEach(ensureSessionWorktreeState);
   localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions, projects, activeSessionId, pluginState }));
 }
 function activeSession() { return sessions.find((s) => s.id === activeSessionId) || sessions[0]; }
@@ -937,6 +1036,140 @@ function fileChangesStripHtml(changes) {
   );
 }
 
+function worktreeStateLabel(state) {
+  return ({
+    creating: '创建中', running: '子 Agent 运行中', collecting: '收集中', ready: '待审',
+    collect_failed: '收集失败', oversize: '补丁过大', conflict: '与主项目冲突', applying: '应用中',
+    apply_uncertain: '应用状态不确定', applied_cleanup_pending: '已应用，待清理',
+    discarded_cleanup_pending: '已丢弃，待清理',
+  })[state] || state;
+}
+
+function updateWorktreeRef(session, ref) {
+  if (!session || !window.WorktreeResultState) return;
+  session.pendingWorktreeResults = window.WorktreeResultState.upsert(
+    ensureSessionWorktreeState(session), ref
+  );
+  saveState();
+}
+
+async function worktreeAction(session, ref, action) {
+  const project = sessionProject(session);
+  const token = project ? worktreeBindings.get(project.id) : null;
+  if (!project?.path || !token || worktreeActionBusy.has(ref.id)) {
+    toast('项目绑定已失效，请重新打开项目');
+    if (project) reconcileWorktreeResults(project);
+    return;
+  }
+  if (action === 'discard' && !confirm('确定丢弃这批隔离改动？主项目不会被修改。')) return;
+  worktreeActionBusy.add(ref.id);
+  renderMessages();
+  try {
+    let response;
+    if (action === 'preview') {
+      response = await window.codex.getWorktreeResult({ projectBindingId: token, resultId: ref.id, preview: true });
+      if (response?.ok) worktreePreviews.set(ref.id, response.preview || '(没有文本 diff)');
+    } else if (action === 'open') {
+      response = await window.codex.openWorktreeResult({ projectBindingId: token, resultId: ref.id });
+    } else if (action === 'apply') {
+      response = await window.codex.applyWorktreeResult({ projectBindingId: token, resultId: ref.id });
+      if (response?.ok && response.applied && !response.cleanupWarning) {
+        session.pendingWorktreeResults = window.WorktreeResultState.remove(session.pendingWorktreeResults, ref.id);
+        worktreePreviews.delete(ref.id);
+        saveState();
+      } else if (response?.result) {
+        updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
+      }
+    } else if (action === 'discard') {
+      response = await window.codex.discardWorktreeResult({ projectBindingId: token, resultId: ref.id });
+      if (response?.ok && response.cleaned) {
+        session.pendingWorktreeResults = window.WorktreeResultState.remove(session.pendingWorktreeResults, ref.id);
+        worktreePreviews.delete(ref.id);
+        saveState();
+      }
+    } else if (action === 'retryCollect') {
+      response = await window.codex.retryCollectWorktreeResult({ projectBindingId: token, resultId: ref.id });
+      if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
+    } else if (action === 'cleanup') {
+      response = await window.codex.cleanupWorktreeResult({ projectBindingId: token, resultId: ref.id });
+      if (response?.ok) {
+        session.pendingWorktreeResults = window.WorktreeResultState.remove(session.pendingWorktreeResults, ref.id);
+        saveState();
+      }
+    }
+    if (!response?.ok) {
+      if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
+      toast(response?.error || '隔离改动操作失败');
+      reconcileWorktreeResults(project);
+    } else if (action === 'preview') {
+      renderMessages();
+      return;
+    } else if (action === 'open') {
+      toast('已打开隔离目录');
+    } else if (action === 'apply') {
+      toast(response.cleanupWarning ? '已应用，清理待重试' : '隔离改动已应用到主项目');
+    }
+  } catch (error) {
+    toast(error?.message || String(error));
+  } finally {
+    worktreeActionBusy.delete(ref.id);
+    renderMessages();
+  }
+}
+
+function renderWorktreeCards(root, session) {
+  if (!root || !session) return;
+  for (const ref of worktreeRefsForSession(session)) {
+    const card = document.createElement('section');
+    card.className = 'worktree-result-card';
+    card.dataset.resultId = ref.id;
+    const stats = ref.stats || {};
+    const fileCount = Number(stats.files) || ref.files.length;
+    const head = ref.baseHead ? ref.baseHead.slice(0, 8) : '-';
+    const title = document.createElement('div');
+    title.className = 'worktree-result-title';
+    title.textContent = `隔离改动待审 · ${worktreeStateLabel(ref.state)}`;
+    const goal = document.createElement('div');
+    goal.className = 'worktree-result-goal';
+    goal.textContent = ref.goal || '未命名子任务';
+    const summary = document.createElement('div');
+    summary.className = 'worktree-result-summary';
+    summary.textContent = `${fileCount} 个文件 · +${stats.additions || 0}/-${stats.deletions || 0}${stats.binaryFiles ? ` · 二进制 ${stats.binaryFiles}` : ''} · 基线 ${head}`;
+    card.append(title, goal, summary);
+
+    if (ref.incomplete) {
+      const note = document.createElement('div'); note.className = 'worktree-result-note'; note.textContent = '子 Agent 未完整结束，仍可审阅并应用或丢弃。'; card.appendChild(note);
+    }
+    if (ref.error) {
+      const note = document.createElement('div'); note.className = 'worktree-result-note is-error'; note.textContent = `${ref.errorCode || '错误'}：${ref.error}`; card.appendChild(note);
+    }
+    const files = document.createElement('details');
+    files.className = 'worktree-result-files';
+    const fileSummary = document.createElement('summary'); fileSummary.textContent = `查看文件${ref.filesTruncated ? '（前 200 条）' : ''}`; files.appendChild(fileSummary);
+    const list = document.createElement('ul');
+    for (const file of ref.files) { const li = document.createElement('li'); li.textContent = `${file.status} ${file.path}${file.binary ? ' · binary' : ''}`; list.appendChild(li); }
+    files.appendChild(list); card.appendChild(files);
+
+    const preview = worktreePreviews.get(ref.id);
+    if (preview) { const pre = document.createElement('pre'); pre.className = 'worktree-result-preview'; pre.textContent = preview; card.appendChild(pre); }
+    const actions = document.createElement('div'); actions.className = 'worktree-result-actions';
+    const busy = worktreeActionBusy.has(ref.id);
+    const mutationBlocked = sending || anyTermRunning();
+    const addButton = (label, action, enabled = true, primary = false, mutation = false) => {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.disabled = busy || !enabled || (mutation && mutationBlocked); if (primary) button.className = 'btn-primary'; else button.className = 'btn-secondary';
+      button.addEventListener('click', () => worktreeAction(session, ref, action)); actions.appendChild(button);
+    };
+    addButton(`应用全部（${fileCount} 个文件）`, 'apply', ref.canApply, true, true);
+    addButton('查看 diff', 'preview', ref.canPreview);
+    addButton('丢弃', 'discard', ref.canDiscard, false, true);
+    if (ref.canRetryCollect) addButton('重试收集', 'retryCollect', true, false, true);
+    if (ref.canCleanup) addButton('重试清理', 'cleanup', true, false, true);
+    if (ref.canOpen) addButton('打开隔离目录', 'open', true);
+    card.appendChild(actions);
+    root.appendChild(card);
+  }
+}
+
 function bindFileChangesToggles(root) {
   if (!root) return;
   root.querySelectorAll('.file-changes-strip').forEach((strip) => {
@@ -965,6 +1198,7 @@ function renderMessages() {
     const strip = msg.role === 'assistant' ? fileChangesStripHtml(msg.fileChanges) : '';
     return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+strip+renderMarkdownLite(msg.content)+'</div></div>';
   }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '');
+  renderWorktreeCards(list, session);
   bindFileChangesToggles(list);
   if (liveRun && chatRun.el) {
     list.appendChild(chatRun.el);
@@ -1480,11 +1714,29 @@ function finalizeChatRun(opts = {}) {
   renderMessages();
 }
 
+function handleWorktreeEvent(ev) {
+  if (!ev || !ev.result) return;
+  const sessionId = String(ev.sessionId || ev.result.sessionId || '');
+  const projectId = sessionId
+    ? sessions.find((item) => item.id === sessionId)?.projectId
+    : sessionProject()?.id;
+  if (!projectId) return;
+  attachWorktreeResult(ev.result, projectId, sessionId);
+  const project = getProject(projectId);
+  if (project?.path) reconcileWorktreeResults(project);
+  if (activeSession()?.projectId === projectId) renderMessages();
+}
+
 function handleChatEvent(ev) {
   if (!ev) return;
   // Terminal panel events (agent + manual) always go to the shared panel.
   // Manual approvals may also land here without an active chatRun.
   if (handleTerminalPanelEvent(ev)) return;
+
+  if (ev.type === 'worktree-ready' || ev.type === 'worktree-state' || ev.type === 'worktree-recovered') {
+    handleWorktreeEvent(ev);
+    return;
+  }
 
   if (!chatRun || chatRun.finalized) return;
   // Route by active run once runId is known; accept first event to bind runId
@@ -1770,6 +2022,11 @@ function deleteProject(id) {
     && sessions.some((session) => session.id === chatRun.sessionId && session.projectId === id);
   if (running) return toast('生成中无法删除该项目，请先停止');
   if (!confirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）')) return;
+  const worktreeBindingId = worktreeBindings.get(id);
+  if (worktreeBindingId) {
+    window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
+    worktreeBindings.delete(id);
+  }
   projects = projects.filter((x) => x.id !== id);
   sessions = sessions.filter((s) => s.projectId !== id);
   if (!sessions.length) sessions = defaultSessions();
@@ -1786,8 +2043,17 @@ function renameProject(id) {
 async function bindProjectPath(id) {
   const p = getProject(id); if (!p) return;
   const dir = await window.codex.selectDirectory(); if (!dir) return;
+  const previous = p.path;
   p.path = dir;
+  const bound = await window.codex.bindWorktreeProject({ projectId: p.id, projectPath: dir });
+  if (!bound?.ok) {
+    p.path = previous;
+    toast(bound?.error || '项目绑定失败');
+    return;
+  }
+  worktreeBindings.set(p.id, bound.projectBindingId);
   saveState(); renderLeftDynamic(); toast('已绑定：' + dir);
+  reconcileWorktreeResults(p);
   if (sessionProject()?.id === id) updateHeader();
 }
 function openProjectModal() {
@@ -1828,6 +2094,7 @@ function openProjectChat(projectId) {
     sessions.unshift(session);
   }
   activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle();
+  reconcileWorktreeResults(p);
 }
 function renderFriends() {
   const ul = document.getElementById('friend-list');
@@ -1967,10 +2234,14 @@ function showChatView() {
   document.getElementById('view-chat').classList.remove('hidden');
   document.getElementById('view-work').classList.add('hidden');
   updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
+  const project = sessionProject();
+  if (project?.path) reconcileWorktreeResults(project);
 }
 function switchSession(id) {
   if (!sessions.some((s) => s.id === id)) return;
   activeSessionId = id; saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
+  const project = sessionProject();
+  if (project?.path) reconcileWorktreeResults(project);
 }
 function openFriendChat(friendId) {
   const friend = FRIENDS.find((f) => f.id === friendId); if (!friend) return;
@@ -3180,6 +3451,12 @@ async function sendMessage() {
       agentMode: sessionAgentMode(session),
     };
     invokeResult = await window.codex.sendChat(payload);
+    if (invokeResult?.ok === false && invokeResult.error) {
+      const error = new Error(invokeResult.error);
+      error.code = invokeResult.code;
+      invokeError = error;
+      invokeResult = null;
+    }
   } catch (err) {
     invokeError = err;
   } finally {
@@ -3354,6 +3631,7 @@ function boot() {
     });
   }
   setView('chat');
+  for (const project of projects) if (project.path) reconcileWorktreeResults(project);
   updateAgentModeToggle();
   updateStatusBar();
   updateClock();

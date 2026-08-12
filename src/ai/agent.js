@@ -345,7 +345,7 @@ function agentSystemPrompt(project, settings, opts = {}) {
 
   if (settings?.subagentEnabled !== false && mode === 'agent') {
     parts.push('');
-    parts.push('【子 Agent】复杂调研：spawn_explore / spawn_explores（可并行只读）；委派改文件：spawn_implement（仅 write_file/search_replace，无终端/提交）；子 Agent 不能再 spawn；验证由你负责。');
+    parts.push('【子 Agent】复杂调研：spawn_explore / spawn_explores（可并行只读）；spawn_implement 只在隔离 Git worktree 中使用 write_file/search_replace，结果不会自动进入主项目，必须等待用户在聊天卡片应用或丢弃；子 Agent 无终端/提交且不能再 spawn；应用后的验证由你负责。');
   }
 
   if (project?.path) {
@@ -1068,6 +1068,18 @@ async function applyWriteFencesWithGate(projectRoot, content, {
     let auth;
     let endEmitted = false;
     try {
+      if (gate && typeof gate.validatePath === 'function') {
+        const checked = await gate.validatePath({
+          tool: 'write_file', risk: 'write', path: op.path, allowMissing: true,
+        });
+        if (!checked?.allowed) {
+          const reason = checked?.reason || '隔离写入路径不安全';
+          applied.push({ path: op.path, ok: false, error: reason });
+          onEvent?.({ type: AGENT_EVENTS.TOOL_END, tool: 'write_fence', ok: false, summary: reason });
+          endEmitted = true;
+          continue;
+        }
+      }
       let before = '';
       try {
         const full = resolveSafe(projectRoot, op.path);
@@ -1115,6 +1127,12 @@ async function applyWriteFencesWithGate(projectRoot, content, {
       }
 
       try {
+        if (gate && typeof gate.validatePath === 'function') {
+          const checked = await gate.validatePath({
+            tool: 'write_file', risk: 'write', path: op.path, allowMissing: true,
+          });
+          if (!checked?.allowed) throw new Error(checked?.reason || '隔离写入路径不安全');
+        }
         const r = writeFile(projectRoot, op.path, op.content);
         applied.push({ path: r.path, ok: true, bytes: r.bytes, mode: 'write_fence' });
         if (fileChanges) {
@@ -1510,6 +1528,19 @@ async function runAgentLoop({
             let detail = toolDetail(name, args);
             let diffPayload;
 
+            async function validateMutationPath(pathToCheck, toolName = name) {
+              if (!hasProject || !MUTATING_TOOLS.has(toolName)
+                || !effectiveGate || typeof effectiveGate.validatePath !== 'function') return true;
+              const checked = await effectiveGate.validatePath({
+                tool: toolName,
+                risk: 'write',
+                path: pathToCheck || '',
+                allowMissing: toolName === 'write_file',
+              });
+              if (!checked?.allowed) throw new Error(checked?.reason || '隔离写入路径不安全');
+              return true;
+            }
+
             // git_commit: enrich authorize detail with message + intended paths (stage runs after allow)
             if (name === 'git_commit') {
               detail = [
@@ -1525,6 +1556,7 @@ async function runAgentLoop({
             if (hasProject && MUTATING_TOOLS.has(name)) {
               // Preview before authorize so gate can show unified diff; write only if allowed.
               try {
+                await validateMutationPath(relPath);
                 mutatePreview = previewMutatingTool(name, args, project.path, relPath || '');
                 fileOp = mutatePreview.op;
                 const built = buildDiffForAuthorize(relPath || '', mutatePreview.before, mutatePreview.after, {
@@ -1551,6 +1583,7 @@ async function runAgentLoop({
              * Uses effectiveArgs / effectiveRelPath (may differ after Pre rewrite).
              */
             async function executeAllowedTool() {
+              await validateMutationPath(effectiveRelPath);
               if (name === 'search_replace' && mutatePreview) {
                 // Apply approved preview.after (do not re-run searchReplace / re-preview).
                 try {
@@ -1662,6 +1695,7 @@ async function runAgentLoop({
 
                   if (hasProject && MUTATING_TOOLS.has(name)) {
                     try {
+                      await validateMutationPath(effectiveRelPath);
                       mutatePreview = previewMutatingTool(
                         name,
                         effectiveArgs,
@@ -1746,6 +1780,7 @@ async function runAgentLoop({
               } else if (name === 'search_replace' && mutatePreview) {
                 // No hooks: existing apply path.
                 try {
+                  await validateMutationPath(relPath);
                   const w = writeFile(project.path, relPath || '', mutatePreview.after);
                   const replacements = mutatePreview.previewMeta?.replacements ?? 1;
                   resultStr = JSON.stringify({
@@ -1759,6 +1794,7 @@ async function runAgentLoop({
                   resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
                 }
               } else {
+                await validateMutationPath(relPath);
                 resultStr = await registry.execute(name, args, {
                   ...runCtx,
                   project,
@@ -2007,6 +2043,7 @@ async function runAgentLoop({
         applied,
         agentLog,
         turns: turn,
+        terminalReason: 'completed',
         toolsSupported,
         fileChanges,
         agentMode: mode,
@@ -2020,7 +2057,7 @@ async function runAgentLoop({
       applied,
       maxTurns
     );
-    return { content, applied, agentLog, turns: maxTurns, toolsSupported, fileChanges };
+    return { content, applied, agentLog, turns: maxTurns, terminalReason: 'max_turns', toolsSupported, fileChanges };
     } catch (err) {
       stopReason = (err && err.code === 'ABORTED') || signal?.aborted ? 'aborted' : 'error';
       throw err;

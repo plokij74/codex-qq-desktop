@@ -955,6 +955,28 @@ html, body {
   font-family: Consolas, "Courier New", monospace;
   margin-right: 2px;
 }
+
+.worktree-result-card {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid #a8bfd3;
+  border-left: 3px solid #2b6f9f;
+  background: #f7fbfe;
+  color: #263746;
+  font-size: 12px;
+}
+.worktree-result-title { font-weight: 700; color: #20547b; margin-bottom: 4px; }
+.worktree-result-goal { white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: 4px; }
+.worktree-result-summary { color: #5c7181; }
+.worktree-result-note { margin-top: 6px; color: #795d14; }
+.worktree-result-note.is-error { color: #a13a3a; overflow-wrap: anywhere; }
+.worktree-result-files { margin-top: 7px; border-top: 1px solid #d9e5ee; padding-top: 6px; }
+.worktree-result-files summary { cursor: pointer; color: #28648e; }
+.worktree-result-files ul { max-height: 150px; overflow: auto; margin: 5px 0 0 18px; padding: 0; }
+.worktree-result-files li { overflow-wrap: anywhere; margin: 2px 0; font-family: Consolas, monospace; font-size: 11px; }
+.worktree-result-preview { max-height: 260px; overflow: auto; margin: 8px 0 0; padding: 8px; background: #18232c; color: #d6e7f2; font: 11px/1.4 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.worktree-result-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.worktree-result-actions button { min-height: 28px; }
 .approval-card .appr-actions {
   display: flex;
   flex-wrap: wrap;

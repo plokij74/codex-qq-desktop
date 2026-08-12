@@ -40,4 +40,13 @@ contextBridge.exposeInMainWorld('codex', {
   webFetch: (payload) => ipcRenderer.invoke('web:fetch', payload || {}),
   usageSummary: (payload) => ipcRenderer.invoke('usage:summary', payload || {}),
   usageClear: () => ipcRenderer.invoke('usage:clear'),
+  bindWorktreeProject: (payload) => ipcRenderer.invoke('worktree:bind', payload || {}),
+  unbindWorktreeProject: (payload) => ipcRenderer.invoke('worktree:unbind', payload || {}),
+  listWorktreeResults: (payload) => ipcRenderer.invoke('worktree:list', payload || {}),
+  getWorktreeResult: (payload) => ipcRenderer.invoke('worktree:get', payload || {}),
+  applyWorktreeResult: (payload) => ipcRenderer.invoke('worktree:apply', payload || {}),
+  discardWorktreeResult: (payload) => ipcRenderer.invoke('worktree:discard', payload || {}),
+  retryCollectWorktreeResult: (payload) => ipcRenderer.invoke('worktree:retryCollect', payload || {}),
+  cleanupWorktreeResult: (payload) => ipcRenderer.invoke('worktree:cleanup', payload || {}),
+  openWorktreeResult: (payload) => ipcRenderer.invoke('worktree:open', payload || {}),
 });
