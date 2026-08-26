@@ -9,7 +9,8 @@
   const STATES = new Set([
     'creating', 'running', 'collecting', 'ready', 'collect_failed', 'oversize',
     'conflict', 'applying', 'apply_uncertain', 'applied_cleanup_pending',
-    'discarded_cleanup_pending',
+    'discarded_cleanup_pending', 'pr_preparing', 'pr_committing', 'pr_pushing',
+    'pr_creating', 'pr_failed', 'pr_cleanup_pending', 'pr_created',
   ]);
   const MAX_GOAL = 160;
   const MAX_FILES = 200;
@@ -38,6 +39,7 @@
     };
     const createdAt = n(raw.createdAt);
     const updatedAt = n(raw.updatedAt) || createdAt;
+    const rawPr = raw.pr && typeof raw.pr === 'object' ? raw.pr : {};
     return {
       id,
       projectId: String(raw.projectId || ''),
@@ -59,12 +61,44 @@
       },
       errorCode: raw.errorCode ? trim(raw.errorCode, 80) : null,
       error: raw.error ? trim(raw.error, 300) : null,
+      pr: {
+        host: trim(rawPr.host, 255),
+        owner: trim(rawPr.owner, 255),
+        repo: trim(rawPr.repo, 255),
+        base: trim(rawPr.base, 255),
+        head: trim(rawPr.head, 255),
+        commit: /^[a-f0-9]{40}$/i.test(String(rawPr.commit || '')) ? String(rawPr.commit).toLowerCase() : '',
+        url: /^https?:\/\//i.test(String(rawPr.url || '')) ? trim(rawPr.url, 2000) : '',
+        number: n(rawPr.number),
+        draft: rawPr.draft !== false,
+        title: trim(rawPr.title, 300),
+        pushed: rawPr.pushed === true,
+        state: ['OPEN', 'CLOSED', 'MERGED'].includes(String(rawPr.state || '').toUpperCase()) ? String(rawPr.state).toUpperCase() : '',
+        headSha: /^[a-f0-9]{40}$/i.test(String(rawPr.headSha || '')) ? String(rawPr.headSha).toLowerCase() : '',
+        mergeable: trim(rawPr.mergeable, 40).toUpperCase(),
+        mergeStateStatus: trim(rawPr.mergeStateStatus, 60).toUpperCase(),
+        updatedAt: trim(rawPr.updatedAt, 80),
+        checksSummary: {
+          total: n(rawPr.checksSummary?.total),
+          passed: n(rawPr.checksSummary?.passed),
+          pending: n(rawPr.checksSummary?.pending),
+          failed: n(rawPr.checksSummary?.failed),
+          skipped: n(rawPr.checksSummary?.skipped),
+          unknown: n(rawPr.checksSummary?.unknown),
+        },
+      },
+      prDraftTitle: trim(raw.prDraftTitle, 300),
+      prDraftBody: trim(raw.prDraftBody, 10000),
       canApply: raw.canApply === true,
       canDiscard: raw.canDiscard === true,
       canRetryCollect: raw.canRetryCollect === true,
       canCleanup: raw.canCleanup === true,
       canOpen: raw.canOpen === true,
       canPreview: raw.canPreview === true,
+      canCreatePr: raw.canCreatePr === true,
+      canRetryPr: raw.canRetryPr === true,
+      canCleanupPr: raw.canCleanupPr === true,
+      canOpenPr: raw.canOpenPr === true,
     };
   }
 
@@ -97,9 +131,14 @@
   // accept its current state even when a local clock made updatedAt appear older.
   function replaceAuthoritative(existing, incoming, projectId) {
     const scope = String(projectId || '');
-    const current = normalizeList(existing).filter((item) => item.projectId !== scope);
+    const normalizedExisting = normalizeList(existing);
+    const drafts = new Map(normalizedExisting.map((item) => [item.id, {
+      prDraftTitle: item.prDraftTitle,
+      prDraftBody: item.prDraftBody,
+    }]));
+    const current = normalizedExisting.filter((item) => item.projectId !== scope);
     const authoritative = normalizeList((Array.isArray(incoming) ? incoming : [])
-      .map((item) => ({ ...item, projectId: scope })));
+      .map((item) => ({ ...item, ...drafts.get(String(item?.id || '')), projectId: scope })));
     return normalizeList([...current, ...authoritative]);
   }
 
@@ -109,7 +148,7 @@
   }
 
   function unresolved(items) {
-    return normalizeList(items).filter((item) => !['applied_cleanup_pending', 'discarded_cleanup_pending'].includes(item.state));
+    return normalizeList(items).filter((item) => !['applied_cleanup_pending', 'discarded_cleanup_pending', 'pr_created'].includes(item.state));
   }
 
   return { ID_RE, normalizeOne, normalizeList, merge, upsert, replaceAuthoritative, remove, unresolved };

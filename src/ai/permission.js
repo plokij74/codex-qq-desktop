@@ -23,6 +23,7 @@ const globalSessionAllows = new Map();
 
 function riskForTool(toolName) {
   const name = String(toolName || '');
+  if (name === 'sampling/createMessage' || name === 'mcp_sampling') return 'mcp-sampling';
   if (name.startsWith('mcp_')) return 'mcp';
   if (READ_TOOLS.has(name)) return 'read';
   if (WRITE_TOOLS.has(name)) return 'write';
@@ -82,6 +83,9 @@ function createPermissionGate({
   terminalRequireConfirm = true,
   webEnabled = false,
   webRequireConfirm = true,
+  // Some capabilities (MCP sampling) are always interactive, including in
+  // full-auto mode. The risk branch below also gives them server-scoped
+  // allow_session memory without weakening ordinary tool policy.
   agentMode = 'agent',
   onApprovalNeeded,
 } = {}) {
@@ -145,6 +149,9 @@ function createPermissionGate({
           path: payload.path,
           scope: payload.scope,
           diff: payload.diff, // may be undefined
+          source: payload.source,
+          server: payload.server,
+          context: payload.context,
         });
       }
       const result = await waitPromise;
@@ -164,7 +171,8 @@ function createPermissionGate({
   }
 
   async function authorize({
-    tool, risk, summary, detail, path, scope, sessionKey, signal, diff, agentMode: callAgentMode,
+    tool, risk, summary, detail, path, scope, sessionKey, signal, diff, source, server, context,
+    agentMode: callAgentMode,
   } = {}) {
     const effectiveRisk = risk || riskForTool(tool);
     const mode = normalizeAgentMode(
@@ -183,6 +191,24 @@ function createPermissionGate({
     // Terminal disabled always denies terminal tools
     if (effectiveRisk === 'terminal' && terminalEnabled === false) {
       return { allowed: false, reason: '终端未启用，不允许执行终端命令' };
+    }
+
+    // MCP sampling is an explicit, host-controlled capability. Never let
+    // permissionMode=full-auto bypass this approval; allow_session is scoped
+    // to the server by the caller's scope string.
+    if (effectiveRisk === 'mcp-sampling') {
+      const allowKey = scope ? `mcp-sampling:${scope}` : 'mcp-sampling';
+      if (isSessionAllowed(sessionKey, allowKey)) return { allowed: true };
+      const decision = await waitForApproval(
+        { tool, risk: effectiveRisk, summary, detail, path, scope, diff, source, server, context },
+        signal,
+      );
+      if (decision.decision === 'allow_session') {
+        rememberSession(sessionKey, allowKey);
+        return { allowed: true };
+      }
+      if (decision.decision === 'allow') return { allowed: true };
+      return { allowed: false, reason: '用户拒绝' };
     }
 
     // Network access has its own switch and approval policy. In particular,

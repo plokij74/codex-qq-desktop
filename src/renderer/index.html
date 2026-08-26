@@ -15,6 +15,11 @@
       </div>
       <div class="qq-titlebar-right">
         <button type="button" class="win-btn" id="btn-settings" title="设置">⚙</button>
+        <div class="window-controls" aria-label="窗口控制">
+          <button type="button" class="window-control" id="btn-window-minimize" title="最小化" aria-label="最小化">−</button>
+          <button type="button" class="window-control" id="btn-window-maximize" title="最大化或还原" aria-label="最大化或还原">□</button>
+          <button type="button" class="window-control window-close" id="btn-window-close" title="关闭" aria-label="关闭">×</button>
+        </div>
       </div>
     </header>
 
@@ -245,7 +250,7 @@
               <button type="button" id="btn-mcp-import-cancel" class="btn-small">取消</button>
             </div>
           </div>
-          <small class="field-hint">stdio 填命令；sse/http 填 URL。保存时过滤无效项。远程 URL 请仅连接信任源。</small>
+          <small class="field-hint">stdio 填命令；sse/http 填 URL。远程地址默认拒绝私网，按服务器显式允许后才放行。OAuth 只在这里手动授权，不会因 Agent 或 401 自动打开浏览器；高级端点不填写时自动发现。</small>
         </div>
         <label class="switch-row"><input type="checkbox" id="set-auto-compact" /> <span>发送前自动压缩会话（超阈值时，默认关）</span></label>
         <label class="field">
@@ -354,11 +359,27 @@
     </div>
   </div>
 
+  <div id="app-dialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" aria-describedby="app-dialog-message">
+    <div class="modal-card app-dialog-card">
+      <div class="modal-title" id="app-dialog-title">提示</div>
+      <div class="app-dialog-message" id="app-dialog-message"></div>
+      <label class="field app-dialog-input-wrap hidden" id="app-dialog-input-wrap">
+        <span>名称</span>
+        <input id="app-dialog-input" type="text" autocomplete="off" />
+      </label>
+      <div class="modal-actions">
+        <button type="button" id="app-dialog-cancel" class="btn-secondary">取消</button>
+        <button type="button" id="app-dialog-ok" class="btn-primary">知道了</button>
+      </div>
+    </div>
+  </div>
+
   <div id="ctx-menu" class="ctx-menu hidden"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="memory-commands.js"></script>
   <script src="memory-candidate-state.js"></script>
   <script src="worktree-result-state.js"></script>
+  <script src="pr-state.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -4,286 +4,333 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const { checkUrl } = require('./url-guard');
+const { makeSafeLookup, redactSensitive } = require('./network-security');
+const { createMcpRpcDispatcher, rpcError } = require('./mcp-rpc');
 
 const PROTOCOL_VERSION = '2024-11-05';
 const REQUEST_TIMEOUT_MS = 60_000;
+const BODY_MAX = 1024 * 1024;
 
-function assertMcpUrl(rawUrl) {
-  const checked = checkUrl(rawUrl, { allowPrivate: true });
+function assertMcpUrl(rawUrl, { allowPrivate = false } = {}) {
+  const checked = checkUrl(rawUrl, { allowPrivate });
   if (!checked.ok) {
-    throw new Error(`MCP URL 不合法（${checked.code}）：${checked.reason}`);
+    const code = checked.code === 'PRIVATE_IP' || checked.code === 'PORT' ? 'MCP_SSRF_PRIVATE' : checked.code;
+    const error = new Error(`MCP URL 不合法（${code}）：${checked.reason}`);
+    error.code = code;
+    throw error;
   }
+  return checked;
 }
 
-/**
- * Parse JSON body or text/event-stream data lines into a JSON-RPC message.
- * @param {string} bodyText
- * @param {Record<string, string>|object} headers
- * @returns {object|null}
- */
+function mergeHeaders(staticHeaders, dynamicHeaders, hasAuthProvider) {
+  const out = { ...(staticHeaders || {}) };
+  if (hasAuthProvider) {
+    for (const key of Object.keys(out)) if (String(key).toLowerCase() === 'authorization') delete out[key];
+  }
+  for (const [key, value] of Object.entries(dynamicHeaders || {})) {
+    if (String(key).toLowerCase() === 'authorization') {
+      for (const existing of Object.keys(out)) if (String(existing).toLowerCase() === 'authorization') delete out[existing];
+    }
+    out[key] = String(value);
+  }
+  return out;
+}
+
+function httpStatusError(status, bodyText) {
+  const error = new Error(`MCP HTTP ${status}`);
+  error.code = Number(status) === 401 ? 'MCP_AUTH_REQUIRED' : `MCP_HTTP_${status}`;
+  if (Number(status) === 404 || Number(status) === 410) error.code = 'MCP_SESSION_EXPIRED';
+  error.detail = redactSensitive(String(bodyText || '').slice(0, 200));
+  return error;
+}
+
 function parseSseOrJson(bodyText, headers) {
   const text = String(bodyText || '').trim();
   if (!text) return null;
-  const ct = String(
-    (headers && (headers['content-type'] || headers['Content-Type'])) || ''
-  ).toLowerCase();
-
+  const ct = String((headers && (headers['content-type'] || headers['Content-Type'])) || '').toLowerCase();
   if (ct.includes('text/event-stream') || text.includes('\ndata:') || text.startsWith('data:')) {
     const lines = text.split(/\r?\n/);
     for (const line of lines) {
       if (!line.startsWith('data:')) continue;
       const data = line.slice(5).trim();
       if (!data || data === '[DONE]') continue;
-      try {
-        return JSON.parse(data);
-      } catch {
-        /* try next data line */
-      }
+      try { return JSON.parse(data); } catch { /* next event */ }
     }
   }
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(text); } catch { return null; }
 }
 
-/**
- * Default HTTP(S) request using Node built-ins.
- * @param {string} url
- * @param {{ method?: string, headers?: object, body?: string, signal?: AbortSignal }} opts
- * @returns {Promise<{ status: number, headers: object, bodyText: string }>}
- */
+function parseMessages(bodyText, headers) {
+  const text = String(bodyText || '').trim();
+  if (!text) return [];
+  const ct = String((headers && (headers['content-type'] || headers['Content-Type'])) || '').toLowerCase();
+  if (ct.includes('text/event-stream') || text.includes('\ndata:') || text.startsWith('data:')) {
+    const messages = [];
+    let dataLines = [];
+    const flush = () => {
+      const data = dataLines.join('\n').trim();
+      dataLines = [];
+      if (!data || data === '[DONE]') return;
+      try { messages.push(JSON.parse(data)); } catch { /* ignore malformed event */ }
+    };
+    for (const line of text.split(/\r?\n/)) {
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+      else if (!line.trim()) flush();
+    }
+    flush();
+    return messages;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch { return []; }
+}
+
 function defaultRequestFn(url, opts = {}) {
   return new Promise((resolve, reject) => {
     let parsed;
-    try {
-      parsed = new URL(url);
-    } catch (err) {
-      reject(err);
-      return;
-    }
+    try { parsed = new URL(url); } catch (error) { reject(error); return; }
     const isHttps = parsed.protocol === 'https:';
     const lib = isHttps ? https : http;
-    const method = opts.method || 'POST';
     const headers = { ...(opts.headers || {}) };
     const body = opts.body != null ? String(opts.body) : '';
-    if (body && !headers['Content-Length'] && !headers['content-length']) {
-      headers['Content-Length'] = Buffer.byteLength(body, 'utf8');
-    }
-
-    const req = lib.request(
-      {
-        protocol: parsed.protocol,
-        hostname: parsed.hostname,
-        port: parsed.port || (isHttps ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method,
-        headers,
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          resolve({
-            status: res.statusCode || 0,
-            headers: res.headers || {},
-            bodyText: Buffer.concat(chunks).toString('utf8'),
-          });
-        });
-      }
-    );
-
-    const onAbort = () => {
-      req.destroy(new Error('aborted'));
-    };
+    if (body && !headers['Content-Length'] && !headers['content-length']) headers['Content-Length'] = Buffer.byteLength(body, 'utf8');
+    const req = lib.request({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: opts.method || 'POST',
+      headers,
+      servername: isHttps ? parsed.hostname : undefined,
+      lookup: opts.lookup || makeSafeLookup(opts.dnsLookup, { allowPrivate: opts.allowPrivate === true }),
+    }, (res) => {
+      const chunks = [];
+      let bytes = 0;
+      res.on('data', (chunk) => {
+        bytes += Buffer.byteLength(chunk);
+        if (bytes <= BODY_MAX) chunks.push(chunk);
+        else req.destroy(new Error('MCP response too large'));
+      });
+      res.on('end', () => resolve({
+        status: res.statusCode || 0,
+        headers: res.headers || {},
+        bodyText: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    const onAbort = () => req.destroy(new Error('aborted'));
     if (opts.signal) {
-      if (opts.signal.aborted) {
-        onAbort();
-        reject(new Error('aborted'));
-        return;
-      }
+      if (opts.signal.aborted) { onAbort(); reject(new Error('aborted')); return; }
       opts.signal.addEventListener('abort', onAbort, { once: true });
     }
-
-    req.on('error', (err) => {
-      if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
-      reject(err);
+    req.on('error', (error) => {
+      opts.signal?.removeEventListener?.('abort', onAbort);
+      reject(error);
     });
     req.end(body || undefined);
   });
 }
 
-/**
- * Minimal Streamable HTTP MCP client (JSON-RPC over POST).
- *
- * @param {{
- *   url: string,
- *   headers?: Record<string, string>,
- *   timeoutMs?: number,
- *   requestFn?: Function,
- * }} opts
- */
+function capabilityOptions(opts) {
+  const capabilities = opts.capabilities && typeof opts.capabilities === 'object' ? { ...opts.capabilities } : {};
+  if (opts.rootsProvider || opts.getRoots) capabilities.roots = { listChanged: true };
+  if (opts.samplingHandler) capabilities.sampling = {};
+  return capabilities;
+}
+
 function createMcpHttpClient(opts = {}) {
   const url = String(opts.url || '').trim();
-  const extraHeaders =
-    opts.headers && typeof opts.headers === 'object' && !Array.isArray(opts.headers)
-      ? { ...opts.headers }
-      : {};
-  const timeoutMs =
-    typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
-      ? opts.timeoutMs
-      : REQUEST_TIMEOUT_MS;
+  const extraHeaders = opts.headers && typeof opts.headers === 'object' && !Array.isArray(opts.headers) ? { ...opts.headers } : {};
+  const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) && Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : REQUEST_TIMEOUT_MS;
   const requestFn = typeof opts.requestFn === 'function' ? opts.requestFn : defaultRequestFn;
-
-  let nextId = 1;
+  const allowPrivate = opts.allowPrivate === true;
+  const authProvider = opts.authProvider && typeof opts.authProvider === 'object' ? opts.authProvider : null;
   let closed = false;
   let started = false;
+  let rpc = null;
+  let serverCapabilities = {};
+  let sessionId = '';
+  let reconnecting = null;
+  let transportErrorReported = false;
 
-  function baseHeaders() {
-    return {
+  function reportTransportError(error) {
+    if (closed || transportErrorReported) return;
+    transportErrorReported = true;
+    opts.onTransportError?.(error);
+  }
+
+  function baseHeaders(dynamicHeaders) {
+    const headers = {
       Accept: 'application/json, text/event-stream',
       'Content-Type': 'application/json',
-      ...extraHeaders,
+      ...mergeHeaders(extraHeaders, dynamicHeaders, Boolean(authProvider)),
     };
+    if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+    return headers;
   }
 
-  async function postMessage(msg, { expectResponse = true } = {}) {
+  async function rawPost(message, { expectResponse = true } = {}) {
     if (closed) throw new Error('MCP client closed');
     if (!url) throw new Error('MCP url required');
-    assertMcpUrl(url);
-
-    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = setTimeout(() => {
+    assertMcpUrl(url, { allowPrivate });
+    let retried = false;
+    while (true) {
+      const serialized = JSON.stringify(message);
+      if (Buffer.byteLength(serialized, 'utf8') > BODY_MAX) throw rpcError('MCP request too large', -32003);
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = setTimeout(() => controller?.abort?.(), timeoutMs);
       try {
-        controller?.abort();
-      } catch {
-        /* ignore */
-      }
-    }, timeoutMs);
-
-    try {
-      const res = await requestFn(url, {
-        method: 'POST',
-        headers: baseHeaders(),
-        body: JSON.stringify(msg),
-        signal: controller ? controller.signal : undefined,
-      });
-
-      if (!expectResponse) return null;
-
-      if (res.status >= 400) {
-        throw new Error(`MCP HTTP ${res.status}: ${(res.bodyText || '').slice(0, 200)}`);
-      }
-
-      // Notifications may return empty / 202
-      if (!res.bodyText || !String(res.bodyText).trim()) {
-        if (msg.id === undefined) return null;
-        throw new Error(`MCP empty response for ${msg.method || 'request'}`);
-      }
-
-      const parsed = parseSseOrJson(res.bodyText, res.headers || {});
-      if (!parsed || typeof parsed !== 'object') {
-        throw new Error(`MCP invalid response for ${msg.method || 'request'}`);
-      }
-      if (parsed.error) {
-        const e = new Error(
-          (parsed.error && parsed.error.message) || JSON.stringify(parsed.error)
-        );
-        e.code = parsed.error.code;
-        e.data = parsed.error.data;
-        throw e;
-      }
-      return parsed.result;
-    } catch (err) {
-      if (closed) throw new Error('MCP client closed');
-      if (err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || err)))) {
-        throw new Error(`MCP request timeout: ${msg.method || 'request'}`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(timer);
+        const dynamicHeaders = authProvider?.getHeaders ? await authProvider.getHeaders() : {};
+        const res = await requestFn(url, {
+          method: 'POST',
+          headers: baseHeaders(dynamicHeaders),
+          body: serialized,
+          signal: controller?.signal,
+          allowPrivate,
+          lookup: opts.lookup,
+          dnsLookup: opts.dnsLookup,
+        });
+        const headers = res?.headers || {};
+        const returnedSession = Object.entries(headers).find(([key]) => String(key).toLowerCase() === 'mcp-session-id')?.[1];
+        const sessionText = Array.isArray(returnedSession) ? returnedSession[0] : returnedSession;
+        if (sessionText && String(sessionText).length <= 256 && !/[\r\n\t]/.test(String(sessionText))) {
+          sessionId = String(sessionText);
+        }
+        if (Number(res?.status) === 401 && !retried) {
+          if (!authProvider?.refresh) throw httpStatusError(401, res?.bodyText);
+          retried = true;
+          if (await authProvider.refresh() === false) throw httpStatusError(401, res?.bodyText);
+          continue;
+        }
+        if (Number(res?.status) === 401) throw httpStatusError(401, res?.bodyText);
+        if (Number(res?.status) === 404 || Number(res?.status) === 410) throw httpStatusError(res.status, res.bodyText);
+        if (Number(res?.status) >= 400) throw httpStatusError(res.status, res.bodyText);
+        if (expectResponse) {
+          for (const inbound of parseMessages(res?.bodyText, headers)) rpc?.dispatch(inbound);
+        }
+        return res;
+      } catch (error) {
+        if (closed) throw new Error('MCP client closed');
+        if (error?.name === 'AbortError' || /aborted/i.test(String(error?.message || error))) {
+          const timeoutError = new Error(`MCP request timeout: ${message.method || 'request'}`);
+          timeoutError.code = 'MCP_TIMEOUT';
+          reportTransportError(timeoutError);
+          throw timeoutError;
+        }
+        reportTransportError(error);
+        throw error;
+      } finally { clearTimeout(timer); }
     }
   }
 
-  function request(method, params) {
-    if (closed) return Promise.reject(new Error('MCP client closed'));
-    const id = nextId++;
-    const msg = { jsonrpc: '2.0', id, method };
-    if (params !== undefined) msg.params = params;
-    return postMessage(msg, { expectResponse: true });
-  }
-
-  async function notify(method, params) {
-    const msg = { jsonrpc: '2.0', method };
-    if (params !== undefined) msg.params = params;
-    try {
-      await postMessage(msg, { expectResponse: false });
-    } catch {
-      /* notification best-effort */
-    }
+  function makeDispatcher() {
+    rpc = createMcpRpcDispatcher({
+      timeoutMs,
+      // Notifications commonly return an empty 202, while requests return
+      // the JSON-RPC response that must be fed back into the dispatcher.
+      send: (message) => rawPost(message, { expectResponse: true }),
+      requestHandler: async (method, params, _message, signal) => {
+        if (method === 'roots/list') {
+          const provider = opts.rootsProvider || opts.getRoots;
+          if (!provider) { const e = new Error('roots unavailable'); e.code = 'MCP_METHOD_NOT_FOUND'; throw e; }
+          return provider(params, signal);
+        }
+        if (method === 'sampling/createMessage' && typeof opts.samplingHandler === 'function') {
+          if (!serverCapabilities || typeof serverCapabilities.sampling !== 'object') {
+            const error = new Error('MCP server did not declare sampling capability');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
+          return opts.samplingHandler(params, signal);
+        }
+        const error = new Error(`MCP method not found: ${method}`);
+        error.code = 'MCP_METHOD_NOT_FOUND';
+        throw error;
+      },
+      notificationHandler: opts.notificationHandler,
+      onError: opts.onError,
+    });
   }
 
   async function start() {
     if (started) return;
     if (closed) throw new Error('MCP client closed');
     if (!url) throw new Error('MCP url required');
-    assertMcpUrl(url);
-
+    assertMcpUrl(url, { allowPrivate });
+    transportErrorReported = false;
+    makeDispatcher();
     try {
-      await request('initialize', {
+      const result = await rpc.request('initialize', {
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: {},
+        capabilities: capabilityOptions(opts),
         clientInfo: { name: 'codex-qq', version: '1.0.0' },
-      });
-      await notify('notifications/initialized', {});
+      }, { replayable: true });
+      serverCapabilities = result?.capabilities && typeof result.capabilities === 'object' ? result.capabilities : {};
+      await rpc.notify('notifications/initialized', {});
       started = true;
-    } catch (err) {
-      close();
-      throw err;
+    } catch (error) {
+      try { rpc?.close(error); } catch { /* ignore */ }
+      throw error;
     }
   }
 
+  async function reconnect(reason) {
+    if (closed) throw new Error('MCP client closed');
+    if (reconnecting) return reconnecting;
+    reconnecting = (async () => {
+      started = false;
+      try { rpc?.close(new Error(`MCP reconnect: ${reason || 'transport error'}`)); } catch { /* ignore */ }
+      if (String(reason || '').toUpperCase().includes('EXPIRED')) sessionId = '';
+      serverCapabilities = {};
+      await start();
+    })();
+    try { await reconnecting; } finally { reconnecting = null; }
+  }
+  function request(method, params, requestOptions) {
+    if (closed) return Promise.reject(new Error('MCP client closed'));
+    if (!rpc || !started) return Promise.reject(new Error('MCP client not started'));
+    return rpc.request(method, params, requestOptions);
+  }
+  function notify(method, params) {
+    if (closed) return Promise.reject(new Error('MCP client closed'));
+    if (!rpc || !started) return Promise.reject(new Error('MCP client not started'));
+    return rpc.notify(method, params);
+  }
   async function listTools() {
-    const result = await request('tools/list', {});
-    if (Array.isArray(result?.tools)) return result.tools;
-    if (Array.isArray(result)) return result;
-    return [];
+    const result = await request('tools/list', {}, { replayable: true });
+    return Array.isArray(result?.tools) ? result.tools : (Array.isArray(result) ? result : []);
   }
-
-  async function callTool(name, toolArgs) {
-    return request('tools/call', {
-      name,
-      arguments: toolArgs && typeof toolArgs === 'object' ? toolArgs : {},
-    });
+  async function callTool(name, args, requestOptions = {}) {
+    return request('tools/call', { name: String(name || ''), arguments: args && typeof args === 'object' && !Array.isArray(args) ? args : {} }, { ...requestOptions, replayable: false });
   }
-
   async function listResources() {
-    try {
-      const result = await request('resources/list', {});
-      if (Array.isArray(result?.resources)) return result.resources;
-      return [];
-    } catch {
-      return [];
-    }
+    try { const result = await request('resources/list', {}, { replayable: true }); return Array.isArray(result?.resources) ? result.resources : []; } catch { return []; }
   }
-
-  async function readResource(uri) {
-    return request('resources/read', { uri: String(uri || '') });
-  }
-
-  function close() {
+  async function readResource(uri, requestOptions = {}) { return request('resources/read', { uri: String(uri || '') }, { ...requestOptions, replayable: false }); }
+  async function listPrompts() { const result = await request('prompts/list', {}, { replayable: true }); return Array.isArray(result?.prompts) ? result.prompts : []; }
+  async function getPrompt(name, args, requestOptions = {}) { return request('prompts/get', { name: String(name || ''), arguments: args && typeof args === 'object' && !Array.isArray(args) ? args : {} }, { ...requestOptions, replayable: false }); }
+  async function notifyRootsChanged() { return notify('notifications/roots/list_changed', {}); }
+  async function close() {
     closed = true;
     started = false;
+    sessionId = '';
+    try { rpc?.close(); } catch { /* ignore */ }
   }
 
   return {
     start,
+    reconnect,
+    request,
+    notify,
     listTools,
     callTool,
     listResources,
     readResource,
+    listPrompts,
+    getPrompt,
+    notifyRootsChanged,
+    getServerCapabilities: () => ({ ...serverCapabilities }),
+    getSessionId: () => sessionId ? 'active' : null,
     close,
   };
 }
@@ -292,7 +339,9 @@ module.exports = {
   createMcpHttpClient,
   assertMcpUrl,
   parseSseOrJson,
+  parseMessages,
   defaultRequestFn,
   PROTOCOL_VERSION,
   REQUEST_TIMEOUT_MS,
+  BODY_MAX,
 };

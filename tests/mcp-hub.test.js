@@ -303,6 +303,35 @@ describe('createMcpHub', () => {
     assert.deepEqual(arg.headers, { a: '1' });
     await hub.stopAll();
   });
+
+  it('passes project cwd to the session manager unless the server overrides it', async () => {
+    const acquired = [];
+    const client = {
+      async listTools() { return []; },
+      async listResources() { return []; },
+      async listPrompts() { return []; },
+    };
+    const sessionManager = {
+      async acquire(cfg) {
+        acquired.push(cfg);
+        return {
+          client,
+          async release() {},
+          status: () => ({ server: cfg.name, state: 'connected', reusable: true }),
+        };
+      },
+      status() { return []; },
+    };
+    const hub = createMcpHub({ sessionManager });
+
+    await hub.startAll([{ name: 'project-cwd', command: 'node' }], { cwd: '/project' });
+    assert.equal(acquired[0].cwd, '/project');
+    assert.equal(acquired[0].transport, 'stdio');
+
+    await hub.startAll([{ name: 'server-cwd', command: 'node', cwd: '/server' }], { cwd: '/project' });
+    assert.equal(acquired[1].cwd, '/server');
+    await hub.stopAll();
+  });
 });
 
 describe('createMcpProvider', () => {

@@ -14,7 +14,7 @@ function senderId(event) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath } = {}) {
+function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, openExternal } = {}) {
   if (!manager) throw new Error('worktree IPC requires manager');
   const bindingsBySender = new Map();
 
@@ -70,6 +70,20 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath } =
     return { projectPath: binding.projectPath, resultId };
   }
 
+  function prReferenceArgs(event, payload = {}) {
+    const binding = resolveBinding(event, payload);
+    if (!binding) return null;
+    const resultId = String(payload.resultId || '');
+    const number = Number(payload.number);
+    const hasResult = Boolean(resultId);
+    const hasNumber = Number.isInteger(number) && number > 0 && number <= 0x7fffffff;
+    if (hasResult === hasNumber) return null;
+    if (hasResult && !isResultId(resultId)) return null;
+    return hasResult
+      ? { projectPath: binding.projectPath, resultId }
+      : { projectPath: binding.projectPath, number };
+  }
+
   async function list(event, payload = {}) {
     const binding = resolveBinding(event, payload);
     if (!binding) return ipcError('RESULT_NOT_FOUND', '项目绑定已失效，请重新打开项目');
@@ -112,6 +126,29 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath } =
     return { ok: true };
   }
 
+  async function prMutate(event, payload, method) {
+    payload = payload && typeof payload === 'object' ? payload : {};
+    const args = resultArgs(event, payload);
+    if (!args) return ipcError('RESULT_NOT_FOUND', '隔离结果不存在');
+    if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
+    const run = () => manager[method]({
+      ...args,
+      title: String(payload.title || '').slice(0, 300),
+      body: String(payload.body || '').slice(0, 10000),
+      draft: payload.draft !== false,
+    });
+    return typeof withMutation === 'function' ? withMutation(run) : run();
+  }
+
+  async function prLifecycleMutate(event, payload, method, extra = {}) {
+    payload = payload && typeof payload === 'object' ? payload : {};
+    const args = prReferenceArgs(event, payload);
+    if (!args || typeof manager[method] !== 'function') return ipcError('PR_INVALID', 'PR 引用无效');
+    if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
+    const run = () => manager[method]({ ...args, ...extra });
+    return typeof withMutation === 'function' ? withMutation(run) : run();
+  }
+
   return {
     bind,
     unbind,
@@ -122,6 +159,66 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath } =
     retryCollect: (event, payload) => mutate(event, payload, 'retryCollect'),
     cleanup: (event, payload) => mutate(event, payload, 'cleanup'),
     open,
+    preflight: async (event, payload = {}) => {
+      const args = resultArgs(event, payload);
+      if (!args || typeof manager.preflightPr !== 'function') return ipcError('RESULT_NOT_FOUND', '隔离结果不存在');
+      return manager.preflightPr(args);
+    },
+    createPr: (event, payload) => prMutate(event, payload, 'createPr'),
+    retryPr: (event, payload) => prMutate(event, payload, 'retryPr'),
+    cleanupPr: (event, payload) => {
+      const args = resultArgs(event, payload);
+      if (!args) return ipcError('RESULT_NOT_FOUND', '隔离结果不存在');
+      if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
+      const run = () => manager.cleanupPr(args);
+      return typeof withMutation === 'function' ? withMutation(run) : run();
+    },
+    listPrs: async (event, payload = {}) => {
+      const binding = resolveBinding(event, payload);
+      if (!binding || typeof manager.listPrs !== 'function') return ipcError('RESULT_NOT_FOUND', '项目绑定已失效，请重新打开项目');
+      const state = ['open', 'closed', 'merged', 'all'].includes(String(payload.state || '')) ? String(payload.state) : 'open';
+      return manager.listPrs({ projectPath: binding.projectPath, state });
+    },
+    getPr: async (event, payload = {}) => {
+      const args = prReferenceArgs(event, payload);
+      if (!args || typeof manager.getPr !== 'function') return ipcError('PR_INVALID', 'PR 引用无效');
+      if (!args.resultId) return manager.getPr(args);
+      if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
+      const run = () => manager.getPr(args);
+      return typeof withMutation === 'function' ? withMutation(run) : run();
+    },
+    editPr: (event, payload = {}) => prLifecycleMutate(event, payload, 'editPr', {
+      title: String(payload.title || '').slice(0, 300),
+      body: String(payload.body || '').slice(0, 10000),
+    }),
+    commentPr: (event, payload = {}) => prLifecycleMutate(event, payload, 'commentPr', {
+      body: String(payload.body || '').slice(0, 10000),
+    }),
+    closeLifecyclePr: (event, payload = {}) => prLifecycleMutate(event, payload, 'closePr'),
+    reopenPr: (event, payload = {}) => prLifecycleMutate(event, payload, 'reopenPr'),
+    readyPr: (event, payload = {}) => prLifecycleMutate(event, payload, 'readyPr'),
+    mergePr: (event, payload = {}) => prLifecycleMutate(event, payload, 'mergePr', {
+      method: ['merge', 'squash', 'rebase'].includes(String(payload.method || '')) ? String(payload.method) : 'squash',
+    }),
+    openPr: async (event, payload = {}) => {
+      const args = prReferenceArgs(event, payload);
+      if (!args || typeof manager.getPr !== 'function') return ipcError('PR_INVALID', 'PR 引用无效');
+      const resolved = await manager.getPr({ ...args, syncMarker: false });
+      const url = resolved?.pr?.url;
+      let parsed;
+      try { parsed = new URL(String(url || '')); } catch { parsed = null; }
+      const repo = resolved?.repo || {};
+      const number = Number(resolved?.pr?.number);
+      const repoPrefix = `/${repo.owner}/${repo.repo}/pull/${number}`;
+      if (!resolved?.ok || !number || parsed?.protocol !== 'https:'
+        || parsed.username || parsed.password
+        || parsed.host.toLowerCase() !== String(repo.host || '').toLowerCase()
+        || (parsed.pathname !== repoPrefix && !parsed.pathname.startsWith(`${repoPrefix}/`))) {
+        return ipcError('PR_INVALID', 'PR 地址不可用');
+      }
+      if (typeof openExternal === 'function') await openExternal(url);
+      return { ok: true };
+    },
     dropSender(eventOrId) {
       const id = typeof eventOrId === 'number' ? eventOrId : senderId(eventOrId);
       if (id != null) bindingsBySender.delete(id);

@@ -134,10 +134,12 @@ describe('session-export', () => {
       files: [{ path: 'PRIVATE_FILE_PATH' }],
       preview: 'PRIVATE_PATCH_PREVIEW',
       checkout: 'C:/private/checkout',
+      prDraftTitle: 'PRIVATE_PR_TITLE',
+      prDraftBody: 'PRIVATE_PR_BODY',
     }];
     const markdown = exportSessionMarkdown(session);
     const json = exportSessionJson(session);
-    for (const secret of ['wt_private', 'PRIVATE_WORKTREE_GOAL', 'PRIVATE_FILE_PATH', 'PRIVATE_PATCH_PREVIEW', 'C:/private/checkout']) {
+    for (const secret of ['wt_private', 'PRIVATE_WORKTREE_GOAL', 'PRIVATE_FILE_PATH', 'PRIVATE_PATCH_PREVIEW', 'C:/private/checkout', 'PRIVATE_PR_TITLE', 'PRIVATE_PR_BODY']) {
       assert.equal(markdown.includes(secret), false);
       assert.equal(json.includes(secret), false);
     }

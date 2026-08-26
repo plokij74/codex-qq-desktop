@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const {
@@ -41,6 +42,10 @@ const {
 const { discoverSkills, loadSkillBody } = require('./ai/skills-loader');
 const { loadHooks } = require('./ai/hooks-loader');
 const { sanitizeMcpServers } = require('./ai/mcp-config');
+const { createMcpOAuthManager } = require('./ai/mcp-oauth');
+const { createMcpSessionManager } = require('./ai/mcp-session-manager');
+const { createMcpHub } = require('./ai/mcp-hub');
+const { createMcpSamplingController } = require('./ai/mcp-sampling');
 const {
   planCompact,
   serializeOlderTranscript,
@@ -121,6 +126,14 @@ const pendingPlansBySession = new Map();
  */
 let manualTerm = null;
 let worktreeMutation = false;
+let mcpOAuthManager = null;
+let mcpSessionManager = null;
+let quitting = false;
+const oauthFlowOwners = new Map();
+const oauthPendingOwnersByName = new Map();
+const rootTokensBySender = new Map();
+const rootTokenRecords = new Map();
+const mcpProjectBySender = new Map();
 
 const worktreeManager = createWorktreeManager();
 const worktreeIpc = createWorktreeIpcHandlers({
@@ -135,10 +148,58 @@ const worktreeIpc = createWorktreeIpcHandlers({
     if (!target || !fs.existsSync(target)) return '路径不存在';
     return shell.openPath(target);
   },
+  openExternal: async (url) => shell.openExternal(url),
 });
 
 function userDataPath() {
   return app.getPath('userData');
+}
+
+function getMcpOAuthManager() {
+  if (mcpOAuthManager) return mcpOAuthManager;
+  mcpOAuthManager = createMcpOAuthManager({
+    userDataPath: userDataPath(),
+    openExternal: (url) => shell.openExternal(url),
+  });
+  mcpOAuthManager.onEvent((event) => {
+    const pendingSenderId = oauthPendingOwnersByName.get(event.name);
+    if (event.flowId && pendingSenderId != null && event.state === 'starting') {
+      oauthFlowOwners.set(event.flowId, pendingSenderId);
+    }
+    if (event.state === 'success' || event.state === 'error' || event.state === 'cancelled') {
+      if (event.flowId) oauthFlowOwners.delete(event.flowId);
+      oauthPendingOwnersByName.delete(event.name);
+    }
+    for (const win of BrowserWindow.getAllWindows()) {
+      safeSend(win.webContents, 'mcp:oauth:event', event);
+    }
+  });
+  return mcpOAuthManager;
+}
+
+function getMcpSessionManager() {
+  if (mcpSessionManager) return mcpSessionManager;
+  mcpSessionManager = createMcpSessionManager({
+    onStatus: (status) => {
+      // Session summaries are intentionally identifier-free; broadcast only
+      // state/reconnect changes to windows that can render them.
+      for (const win of BrowserWindow.getAllWindows()) safeSend(win.webContents, 'mcp:session:event', status);
+    },
+  });
+  return mcpSessionManager;
+}
+
+function cancelOAuthFlowsForSender(senderId) {
+  const manager = mcpOAuthManager;
+  if (!manager) return;
+  for (const [flowId, ownerId] of oauthFlowOwners) {
+    if (ownerId !== senderId) continue;
+    manager.cancel(flowId);
+    oauthFlowOwners.delete(flowId);
+  }
+  for (const [name, ownerId] of oauthPendingOwnersByName) {
+    if (ownerId === senderId) oauthPendingOwnersByName.delete(name);
+  }
 }
 
 function persistUsageEvent(settings, sessionId, event) {
@@ -171,7 +232,87 @@ function bundledSkillsDir() {
   return path.join(__dirname, 'skills');
 }
 
-function toPublicSettings(s) {
+function makePublicRootToken(senderId, name, rootId) {
+  if (senderId == null) return String(rootId || '');
+  const ownerId = Number(senderId);
+  let tokens = rootTokensBySender.get(ownerId);
+  if (!tokens) {
+    tokens = new Map();
+    rootTokensBySender.set(ownerId, tokens);
+  }
+  const key = `${String(name || '')}:${String(rootId || '')}`;
+  const existing = tokens.get(key);
+  if (existing) return existing;
+  const token = `rt_${crypto.randomBytes(18).toString('base64url')}`;
+  tokens.set(key, token);
+  rootTokenRecords.set(token, { senderId: ownerId, name: String(name || ''), rootId: String(rootId || '') });
+  return token;
+}
+
+function resolvePublicRootId(senderId, name, token) {
+  const record = rootTokenRecords.get(String(token || ''));
+  if (!record || record.senderId !== Number(senderId) || record.name !== String(name || '')) return '';
+  return record.rootId;
+}
+
+function dropMcpRootTokens(senderId) {
+  const ownerId = Number(senderId);
+  const tokens = rootTokensBySender.get(ownerId);
+  if (!tokens) return;
+  for (const token of tokens.values()) rootTokenRecords.delete(token);
+  rootTokensBySender.delete(ownerId);
+}
+
+function publicMcpServer(server, status, senderId) {
+  const out = {
+    name: String(server?.name || ''),
+    transport: String(server?.transport || 'stdio'),
+    enabled: server?.enabled !== false,
+    sessionRecovery: server?.sessionRecovery === true,
+    sampling: { enabled: server?.sampling?.enabled === true },
+    roots: Array.isArray(server?.roots) ? server.roots.map((root) => ({
+      rootId: makePublicRootToken(senderId, server.name, root.rootId),
+      label: root.label,
+    })) : [],
+    session: status
+      ? publicSessionStatus(status)
+      : {
+        state: server?.sessionRecovery ? 'idle' : 'disabled',
+        reusable: server?.sessionRecovery === true,
+        lastErrorCode: null,
+      },
+  };
+  // These fields are needed to edit the server row. Do not spread the
+  // persisted object: stdio env and remote headers may contain credentials.
+  if (server?.command) out.command = String(server.command);
+  if (server?.url) out.url = String(server.url);
+  if (server?.timeoutMs != null) out.timeoutMs = Number(server.timeoutMs);
+  if (server?.allowPrivate === true) out.allowPrivate = true;
+  if (server?.auth === 'oauth') {
+    out.auth = 'oauth';
+    const oauth = server.oauth && typeof server.oauth === 'object' ? server.oauth : {};
+    out.oauth = {};
+    for (const key of [
+      'clientId',
+      'resource',
+      'authorizationServer',
+      'authorizationEndpoint',
+      'tokenEndpoint',
+      'registrationEndpoint',
+      'revocationEndpoint',
+    ]) {
+      if (oauth[key]) out.oauth[key] = String(oauth[key]);
+    }
+    if (Array.isArray(oauth.scopes)) out.oauth.scopes = oauth.scopes.map(String).slice(0, 32);
+  } else {
+    out.auth = 'none';
+  }
+  return out;
+}
+
+function toPublicSettings(s, senderId) {
+  const servers = sanitizeMcpServers(s.mcpServers);
+  const statuses = new Map(getMcpSessionManager().status().map((status) => [status.server, status]));
   return {
     mode: s.mode,
     baseUrl: s.baseUrl,
@@ -190,7 +331,7 @@ function toPublicSettings(s) {
     skillsEnabled: s.skillsEnabled !== false,
     subagentEnabled: s.subagentEnabled !== false,
     mcpEnabled: Boolean(s.mcpEnabled),
-    mcpServers: sanitizeMcpServers(s.mcpServers),
+    mcpServers: servers.map((server) => publicMcpServer(server, statuses.get(server.name), senderId)),
     hooksEnabled: s.hooksEnabled !== false,
     exploreMaxParallel: (() => {
       const n = Number(s.exploreMaxParallel);
@@ -277,6 +418,8 @@ function createWindow() {
     minWidth: 900,
     minHeight: 580,
     backgroundColor: '#c3d9f1',
+    frame: false,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -289,6 +432,11 @@ function createWindow() {
     if (isMainFrame !== false) worktreeIpc.dropSender(worktreeSenderId);
   });
   win.webContents.once('destroyed', () => worktreeIpc.dropSender(worktreeSenderId));
+  win.webContents.once('destroyed', () => cancelOAuthFlowsForSender(worktreeSenderId));
+  win.webContents.once('destroyed', () => {
+    dropMcpRootTokens(worktreeSenderId);
+    mcpProjectBySender.delete(worktreeSenderId);
+  });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -304,6 +452,8 @@ if (!hasSingleInstanceLock) {
     win.focus();
   });
   app.whenReady().then(() => {
+    Menu?.setApplicationMenu(null);
+    getMcpOAuthManager();
     createWindow();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -315,10 +465,47 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-ipcMain.handle('settings:get', async () => toPublicSettings(loadSettings(userDataPath())));
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  event.preventDefault();
+  quitting = true;
+  Promise.all([
+    Promise.resolve().then(() => mcpOAuthManager?.closeAll?.()),
+    Promise.resolve().then(() => mcpSessionManager?.closeAll?.()),
+  ]).catch(() => {}).finally(() => app.quit());
+});
 
-ipcMain.handle('settings:save', async (_e, partial = {}) => {
+function windowFromEvent(event) {
+  return BrowserWindow.fromWebContents?.(event?.sender)
+    || BrowserWindow.getFocusedWindow?.()
+    || null;
+}
+
+ipcMain.handle('window:minimize', (event) => {
+  const win = windowFromEvent(event);
+  if (win && !win.isDestroyed?.()) win.minimize();
+  return { ok: Boolean(win) };
+});
+
+ipcMain.handle('window:toggle-maximize', (event) => {
+  const win = windowFromEvent(event);
+  if (!win || win.isDestroyed?.()) return { ok: false, maximized: false };
+  if (win.isMaximized()) win.unmaximize();
+  else win.maximize();
+  return { ok: true, maximized: win.isMaximized() };
+});
+
+ipcMain.handle('window:close', (event) => {
+  const win = windowFromEvent(event);
+  if (win && !win.isDestroyed?.()) win.close();
+  return { ok: Boolean(win) };
+});
+
+ipcMain.handle('settings:get', async (event) => toPublicSettings(loadSettings(userDataPath()), event.sender.id));
+
+ipcMain.handle('settings:save', async (event, partial = {}) => {
   const nextPartial = { ...partial };
+  const currentSettings = loadSettings(userDataPath());
   if (!nextPartial.apiKey) delete nextPartial.apiKey;
   for (const k of [
     'agentEnabled',
@@ -373,17 +560,66 @@ ipcMain.handle('settings:save', async (_e, partial = {}) => {
     nextPartial.verifyCommand = String(nextPartial.verifyCommand ?? '');
   }
   if ('mcpServers' in nextPartial) {
-    nextPartial.mcpServers = sanitizeMcpServers(nextPartial.mcpServers);
+    const incoming = sanitizeMcpServers(nextPartial.mcpServers);
+    // Keep paths for roots that were already authorized by main. A renderer
+    // payload may carry only rootId/label; arbitrary submitted paths never
+    // enter settings through this handler.
+    const currentByServer = new Map((currentSettings.mcpServers || []).map((server) => [server.name, server]));
+    nextPartial.mcpServers = incoming.map((server) => {
+      const previous = currentByServer.get(server.name);
+      const previousRoots = new Map((previous?.roots || []).map((root) => [root.rootId, root]));
+      const sameTransport = previous && previous.transport === server.transport;
+      const preserved = sameTransport
+        ? {
+          ...(server.transport === 'stdio' && server.args === undefined && Array.isArray(previous.args) ? { args: previous.args } : {}),
+          ...(server.transport === 'stdio' && server.cwd === undefined && previous.cwd ? { cwd: previous.cwd } : {}),
+          ...(server.transport === 'stdio' && server.env === undefined && previous.env ? { env: previous.env } : {}),
+          ...(server.transport !== 'stdio' && server.headers === undefined && previous.headers ? { headers: previous.headers } : {}),
+        }
+        : {};
+      return {
+        ...server,
+        ...preserved,
+        roots: (server.roots || []).map((root) => {
+          const persistedRootId = resolvePublicRootId(event.sender.id, server.name, root.rootId) || root.rootId;
+          const authorized = previousRoots.get(persistedRootId);
+          return authorized ? { ...root, rootId: authorized.rootId, label: authorized.label, path: authorized.path } : null;
+        }).filter(Boolean),
+      };
+    });
   }
-  return toPublicSettings(saveSettings(userDataPath(), nextPartial));
+  const saved = saveSettings(userDataPath(), nextPartial);
+  if ('mcpServers' in nextPartial) {
+    await getMcpSessionManager().invalidate(null, 'config-changed');
+  }
+  return toPublicSettings(saved, event.sender.id);
 });
 
 ipcMain.handle('mcp:testServer', async (_e, rawCfg) => {
   const list = sanitizeMcpServers([rawCfg]);
   if (!list.length) return { ok: false, error: '无效配置' };
-  const cfg = list[0];
+  let cfg = list[0];
+  const saved = loadSettings(userDataPath()).mcpServers.find((server) => server.name === cfg.name);
+  if (saved && rawCfg && typeof rawCfg === 'object') {
+    const sameTransport = saved.transport === cfg.transport;
+    const preserved = sameTransport
+      ? {
+        ...(cfg.transport === 'stdio' && !Object.prototype.hasOwnProperty.call(rawCfg, 'args') && Array.isArray(saved.args) ? { args: saved.args } : {}),
+        ...(cfg.transport === 'stdio' && !Object.prototype.hasOwnProperty.call(rawCfg, 'cwd') && saved.cwd ? { cwd: saved.cwd } : {}),
+        ...(cfg.transport === 'stdio' && !Object.prototype.hasOwnProperty.call(rawCfg, 'env') && saved.env ? { env: saved.env } : {}),
+        ...(cfg.transport !== 'stdio' && !Object.prototype.hasOwnProperty.call(rawCfg, 'headers') && saved.headers ? { headers: saved.headers } : {}),
+      }
+      : {};
+    cfg = { ...saved, ...cfg, ...preserved };
+  }
   const { createMcpClient } = require('./ai/mcp-client');
-  const client = createMcpClient({ ...cfg, timeoutMs: Math.min(cfg.timeoutMs || 15000, 15000) });
+  const manager = cfg.auth === 'oauth' ? getMcpOAuthManager() : null;
+  const client = createMcpClient({
+    ...cfg,
+    timeoutMs: Math.min(cfg.timeoutMs || 15000, 15000),
+    allowPrivate: cfg.allowPrivate === true,
+    authProvider: manager?.getAuthProvider?.(cfg.name, cfg),
+  });
   try {
     await client.start();
     const tools = await client.listTools();
@@ -392,11 +628,202 @@ ipcMain.handle('mcp:testServer', async (_e, rawCfg) => {
       const res = await client.listResources();
       resourcesCount = Array.isArray(res) ? res.length : 0;
     } catch { /* ignore */ }
+    let promptsCount = 0;
+    try {
+      const prompts = await client.listPrompts?.();
+      promptsCount = Array.isArray(prompts) ? prompts.length : 0;
+    } catch { /* ignore */ }
     await client.close();
-    return { ok: true, toolsCount: tools.length, resourcesCount, transport: cfg.transport };
+    return { ok: true, toolsCount: tools.length, resourcesCount, promptsCount, transport: cfg.transport };
   } catch (err) {
     try { await client.close(); } catch { /* */ }
     return { ok: false, error: err.message || String(err), transport: cfg.transport };
+  }
+});
+
+function publicSessionStatus(status) {
+  return {
+    state: ['disabled', 'idle', 'connected', 'reconnecting', 'error'].includes(status?.state) ? status.state : 'idle',
+    reusable: status?.reusable === true,
+    lastErrorCode: status?.lastErrorCode ? String(status.lastErrorCode).slice(0, 64) : null,
+  };
+}
+
+function savedMcpServer(name) {
+  const settings = loadSettings(userDataPath());
+  const server = settings.mcpServers.find((item) => item.name === String(name || '').trim());
+  return { settings, server };
+}
+
+function canonicalDirectory(rawPath) {
+  const candidate = String(rawPath || '').trim();
+  if (!candidate || !path.isAbsolute(candidate) || !fs.existsSync(candidate)) return '';
+  try {
+    const canonical = fs.realpathSync.native ? fs.realpathSync.native(candidate) : fs.realpathSync(candidate);
+    if (!fs.statSync(canonical).isDirectory()) return '';
+    return canonical;
+  } catch { return ''; }
+}
+
+function makeRootId() {
+  return `root_${crypto.randomBytes(18).toString('base64url')}`;
+}
+
+ipcMain.handle('mcp:roots:choose', async (event, payload = {}) => {
+  const name = String(payload?.name || '').trim();
+  const { settings, server } = savedMcpServer(name);
+  if (!server) return { ok: false, code: 'MCP_SERVER_NOT_FOUND', error: 'MCP 服务器未保存' };
+  const currentRoots = Array.isArray(server.roots) ? server.roots : [];
+  if (currentRoots.length >= 8) return { ok: false, code: 'MCP_ROOT_LIMIT', error: '每个 MCP 服务器最多授权 8 个目录' };
+  const win = windowFromEvent(event);
+  const result = await dialog.showOpenDialog(win || undefined, {
+    title: `为 ${name} 授权 MCP 目录`,
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || !result.filePaths?.[0]) return { ok: false, canceled: true };
+  const canonical = canonicalDirectory(result.filePaths[0]);
+  if (!canonical) return { ok: false, code: 'MCP_ROOT_INVALID', error: '所选路径不是有效目录' };
+  const existing = currentRoots.find((item) => item?.path && canonicalDirectory(item.path) === canonical);
+  if (existing) {
+    return {
+      ok: true,
+      root: { rootId: makePublicRootToken(event.sender.id, name, existing.rootId), label: existing.label },
+      settings: toPublicSettings(settings, event.sender.id),
+    };
+  }
+  const root = {
+    rootId: makeRootId(),
+    label: path.basename(canonical) || canonical,
+    path: canonical,
+  };
+  const nextServers = settings.mcpServers.map((item) => item.name === name
+    ? { ...item, roots: [...currentRoots, root].slice(0, 8) }
+    : item);
+  const saved = saveSettings(userDataPath(), { mcpServers: nextServers });
+  await getMcpSessionManager().notifyRootsChanged?.(name);
+  await getMcpSessionManager().invalidate(name, 'roots-changed');
+  return { ok: true, root: { rootId: makePublicRootToken(event.sender.id, name, root.rootId), label: root.label }, settings: toPublicSettings(saved, event.sender.id) };
+});
+
+ipcMain.handle('mcp:roots:remove', async (event, payload = {}) => {
+  const name = String(payload?.name || '').trim();
+  const rootId = String(payload?.rootId || '').trim();
+  if (!name || !rootId) return { ok: false, code: 'MCP_ROOT_INVALID', error: 'name/rootId 必填' };
+  const persistedRootId = resolvePublicRootId(event.sender.id, name, rootId);
+  if (!persistedRootId) return { ok: false, code: 'MCP_ROOT_OWNER', error: '无权操作此目录授权' };
+  const { settings, server } = savedMcpServer(name);
+  if (!server) return { ok: false, code: 'MCP_SERVER_NOT_FOUND', error: 'MCP 服务器未保存' };
+  const roots = (server.roots || []).filter((root) => root.rootId !== persistedRootId);
+  if (roots.length === (server.roots || []).length) return { ok: false, code: 'MCP_ROOT_NOT_FOUND', error: '目录授权不存在' };
+  const saved = saveSettings(userDataPath(), { mcpServers: settings.mcpServers.map((item) => item.name === name ? { ...item, roots } : item) });
+  await getMcpSessionManager().notifyRootsChanged?.(name);
+  await getMcpSessionManager().invalidate(name, 'roots-changed');
+  return { ok: true, settings: toPublicSettings(saved, event.sender.id) };
+});
+
+ipcMain.handle('mcp:session:status', async (_event, payload = {}) => {
+  const name = payload?.name ? String(payload.name).trim() : '';
+  const statuses = getMcpSessionManager().status(name).map((status) => ({ name: status.server, session: publicSessionStatus(status) }));
+  const settings = loadSettings(userDataPath());
+  if (name) return { ok: true, name, session: statuses[0]?.session || { state: 'disabled', reusable: false, lastErrorCode: null } };
+  return {
+    ok: true,
+    sessions: settings.mcpServers.map((server) => ({ name: server.name, session: statuses.find((item) => item.name === server.name)?.session || { state: server.sessionRecovery ? 'idle' : 'disabled', reusable: server.sessionRecovery === true, lastErrorCode: null } })),
+  };
+});
+
+ipcMain.handle('mcp:session:reset', async (_event, payload = {}) => {
+  const name = payload?.name ? String(payload.name).trim() : null;
+  await getMcpSessionManager().invalidate(name, 'manual-reset');
+  return { ok: true };
+});
+
+async function withPromptHub(senderId, payload, callback) {
+  const settings = loadSettings(userDataPath());
+  const projectPath = mcpProjectBySender.get(Number(senderId)) || '';
+  const requestedServer = payload?.server ? String(payload.server).trim() : '';
+  const serverConfigs = requestedServer
+    ? settings.mcpServers.filter((server) => server.name === requestedServer)
+    : settings.mcpServers;
+  const hub = createMcpHub({ sessionManager: getMcpSessionManager() });
+  try {
+    await hub.startAll(serverConfigs, {
+      cwd: projectPath || undefined,
+      project: projectPath ? { path: projectPath, name: path.basename(projectPath) } : null,
+      oauthManager: getMcpOAuthManager(),
+    });
+    return await callback(hub, settings);
+  } finally {
+    await hub.stopAll();
+  }
+}
+
+ipcMain.handle('mcp:prompts:list', async (event, payload = {}) => {
+  const name = payload?.server ? String(payload.server).trim() : '';
+  const { server } = name ? savedMcpServer(name) : { server: true };
+  if (name && !server) return { ok: false, code: 'MCP_SERVER_NOT_FOUND', error: 'MCP 服务器未保存' };
+  try { return await withPromptHub(event.sender.id, payload, (hub) => hub.listPrompts(name)); } catch (error) { return { ok: false, code: error?.code || 'MCP_PROMPT_FAILED', error: error?.message || String(error) }; }
+});
+
+ipcMain.handle('mcp:prompts:get', async (event, payload = {}) => {
+  const server = String(payload?.server || '').trim();
+  const name = String(payload?.name || '').trim();
+  const saved = savedMcpServer(server).server;
+  if (!saved) return { ok: false, code: 'MCP_SERVER_NOT_FOUND', error: 'MCP 服务器未保存' };
+  if (!name) return { ok: false, code: 'MCP_PROMPT_ARGUMENTS_INVALID', error: 'prompt name 必填' };
+  try { return await withPromptHub(event.sender.id, payload, (hub) => hub.getPrompt(server, name, payload.arguments)); } catch (error) { return { ok: false, code: error?.code || 'MCP_PROMPT_FAILED', error: error?.message || String(error) }; }
+});
+
+ipcMain.handle('mcp:oauth:status', async () => {
+  const settings = loadSettings(userDataPath());
+  return {
+    ok: true,
+    statuses: getMcpOAuthManager().statuses(settings.mcpServers),
+  };
+});
+
+ipcMain.handle('mcp:oauth:authorize', async (event, payload = {}) => {
+  const name = String(payload?.name || '').trim();
+  const settings = loadSettings(userDataPath());
+  const cfg = settings.mcpServers.find((item) => item.name === name);
+  if (!cfg || cfg.auth !== 'oauth') return { ok: false, code: 'MCP_OAUTH_METADATA_INVALID', error: '请先保存有效的 OAuth MCP 配置' };
+  if (oauthPendingOwnersByName.has(name)) return { ok: false, code: 'MCP_OAUTH_CALLBACK_TIMEOUT', error: '该服务器已有授权流程正在进行' };
+  const manager = getMcpOAuthManager();
+  oauthPendingOwnersByName.set(name, event.sender.id);
+  try {
+    const status = await manager.authorize(name, cfg);
+    return { ok: true, status };
+  } catch (error) {
+    return {
+      ok: false,
+      code: error?.code || 'MCP_OAUTH_TOKEN_FAILED',
+      error: error?.message || 'OAuth 授权失败',
+    };
+  } finally {
+    oauthPendingOwnersByName.delete(name);
+  }
+});
+
+ipcMain.handle('mcp:oauth:cancel', async (event, payload = {}) => {
+  const flowId = String(payload?.flowId || '').trim();
+  if (!flowId || oauthFlowOwners.get(flowId) !== event.sender.id) {
+    return { ok: false, code: 'MCP_OAUTH_STATE_MISMATCH', error: '无权取消此授权流程' };
+  }
+  const ok = getMcpOAuthManager().cancel(flowId);
+  return ok ? { ok: true } : { ok: false, code: 'MCP_OAUTH_STATE_MISMATCH', error: '授权流程不存在' };
+});
+
+ipcMain.handle('mcp:oauth:logout', async (_event, payload = {}) => {
+  const name = String(payload?.name || '').trim();
+  const settings = loadSettings(userDataPath());
+  const cfg = settings.mcpServers.find((item) => item.name === name);
+  if (!cfg || cfg.auth !== 'oauth') return { ok: false, code: 'MCP_OAUTH_METADATA_INVALID', error: 'OAuth MCP 配置不存在' };
+  try {
+    const result = await getMcpOAuthManager().logout(name, cfg);
+    await getMcpSessionManager().invalidate(name, 'oauth-logout');
+    return result;
+  } catch (error) {
+    return { ok: false, code: error?.code || 'MCP_OAUTH_STORE_UNAVAILABLE', error: error?.message || '退出授权失败' };
   }
 });
 
@@ -556,6 +983,19 @@ ipcMain.handle('worktree:discard', async (event, payload = {}) => worktreeIpc.di
 ipcMain.handle('worktree:retryCollect', async (event, payload = {}) => worktreeIpc.retryCollect(event, payload));
 ipcMain.handle('worktree:cleanup', async (event, payload = {}) => worktreeIpc.cleanup(event, payload));
 ipcMain.handle('worktree:open', async (event, payload = {}) => worktreeIpc.open(event, payload));
+ipcMain.handle('worktree:pr:preflight', async (event, payload = {}) => worktreeIpc.preflight(event, payload));
+ipcMain.handle('worktree:pr:create', async (event, payload = {}) => worktreeIpc.createPr(event, payload));
+ipcMain.handle('worktree:pr:retry', async (event, payload = {}) => worktreeIpc.retryPr(event, payload));
+ipcMain.handle('worktree:pr:cleanup', async (event, payload = {}) => worktreeIpc.cleanupPr(event, payload));
+ipcMain.handle('worktree:pr:list', async (event, payload = {}) => worktreeIpc.listPrs(event, payload));
+ipcMain.handle('worktree:pr:get', async (event, payload = {}) => worktreeIpc.getPr(event, payload));
+ipcMain.handle('worktree:pr:edit', async (event, payload = {}) => worktreeIpc.editPr(event, payload));
+ipcMain.handle('worktree:pr:comment', async (event, payload = {}) => worktreeIpc.commentPr(event, payload));
+ipcMain.handle('worktree:pr:close', async (event, payload = {}) => worktreeIpc.closeLifecyclePr(event, payload));
+ipcMain.handle('worktree:pr:reopen', async (event, payload = {}) => worktreeIpc.reopenPr(event, payload));
+ipcMain.handle('worktree:pr:ready', async (event, payload = {}) => worktreeIpc.readyPr(event, payload));
+ipcMain.handle('worktree:pr:merge', async (event, payload = {}) => worktreeIpc.mergePr(event, payload));
+ipcMain.handle('worktree:pr:open', async (event, payload = {}) => worktreeIpc.openPr(event, payload));
 
 ipcMain.handle('dialog:selectDirectory', async () => {
   const win = BrowserWindow.getFocusedWindow();
@@ -613,7 +1053,7 @@ ipcMain.handle('chat:stop', async () => {
   return { ok: true };
 });
 
-ipcMain.handle('chat:approve', async (_e, payload = {}) => {
+ipcMain.handle('chat:approve', async (event, payload = {}) => {
   const approvalId = payload?.approvalId;
   const decision = payload?.decision;
   if (!approvalId) {
@@ -632,6 +1072,8 @@ ipcMain.handle('chat:approve', async (_e, payload = {}) => {
   }
 
   for (const c of candidates) {
+    if (c.sender && c.sender !== event.sender) continue;
+    if (payload?.runId && c.runId && String(payload.runId) !== String(c.runId)) continue;
     if (c.gate.resolveApproval(approvalId, normalized)) {
       safeSend(c.sender, 'chat:event', {
         type: AGENT_EVENTS.APPROVAL_RESOLVED,
@@ -891,6 +1333,35 @@ async function startChatRun(event, payload = {}, opts = {}) {
     const project = payload.project && payload.project.path
       ? { name: payload.project.name || path.basename(payload.project.path), path: payload.project.path }
       : null;
+    mcpProjectBySender.set(sender.id, project ? (canonicalDirectory(project.path) || '') : '');
+    // A retained MCP session is scoped to the bound project. Drop sessions
+    // from older project bindings before a new run can serve roots or
+    // sampling requests through them.
+    await getMcpSessionManager().invalidateOtherProjects(project?.path || '', 'project-changed');
+    const samplingController = createMcpSamplingController({
+      settings,
+      gate,
+      sessionKey: sessionId,
+      signal,
+      serverConfig: (name) => settings.mcpServers.find((server) => server.name === String(name || '').trim()),
+      getServerSummary: (name) => {
+        const server = settings.mcpServers.find((item) => item.name === String(name || '').trim());
+        if (!server) return '';
+        return JSON.stringify({
+          name: server.name,
+          transport: server.transport,
+          capabilities: ['tools', 'resources', 'prompts'],
+        }).slice(0, 4096);
+      },
+      onEvent: emit,
+    });
+    const runExtensions = {
+      userDataPath: userDataPath(),
+      worktreeManager,
+      mcpOAuthManager: getMcpOAuthManager(),
+      mcpSessionManager: getMcpSessionManager(),
+      mcpSampling: (server, params, _ctx, requestSignal) => samplingController.createMessage(server, params, requestSignal),
+    };
     // Expand @refs only on the copy fed to the model (history keeps original).
     const modelMessages = messagesForModel(messages, project?.path || null);
 
@@ -1017,10 +1488,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
         signal,
         agentMode,
         registry: project?.path ? undefined : createMemoryOnlyRegistry(),
-        extensions: {
-          userDataPath: userDataPath(),
-          worktreeManager,
-        },
+        extensions: runExtensions,
       });
       const out = {
         content: result.content,

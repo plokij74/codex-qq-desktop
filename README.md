@@ -336,7 +336,7 @@ implement 并行、子内再 spawn、独立侧栏多 Agent 面板。worktree 生
 
 ## Phase C.5：MCP 增强 + Skills 可执行 / 路由 + 列表 UI
 
-在 C.2 的 stdio MCP 与 Markdown Skills 之上：支持 **stdio / SSE / Streamable HTTP**、**只读 resources**、Skills **`run_skill` + triggers 提示路由**，以及设置页 **MCP 服务器列表（含测试连接）**。无新 npm 依赖；不实现 OAuth / MCP prompts / sampling。
+在 C.2 的 stdio MCP 与 Markdown Skills 之上：支持 **stdio / SSE / Streamable HTTP**、**只读 resources**、Skills **`run_skill` + triggers 提示路由**，以及设置页 **MCP 服务器列表（含测试连接）**。无新 npm 依赖；OAuth 由 D8 提供，prompts 与 sampling 由 D9 提供。
 
 ### 开关与配置
 
@@ -406,7 +406,6 @@ implement 并行、子内再 spawn、独立侧栏多 Agent 面板。worktree 生
 - `confirm-writes`：与其它 mcp 一样走内联审批；`allow_session` 可记 risk=`mcp`
 - `full-auto`：自动允许
 - 输出默认截断（约 32 KiB，标记 `truncated`）
-- **不支持** MCP prompts / sampling / OAuth 浏览器鉴权
 
 ### Skills：`run_skill` 与 triggers
 
@@ -462,7 +461,7 @@ cwd: project
 - 静态 `headers` / `env` 可放 token；**不会**把应用 API Key 自动写入 MCP
 - stdio / `run_skill` 均为 `shell: false`；`run_skill` 的 cwd 限制在项目根或 skill 目录
 - 可执行 skill 与 MCP 工具可能改文件或访问外网：请配合权限模式与审批使用
-- **明确不做**：OAuth、MCP prompts/sampling、skill 市场、require 用户模块进主进程
+- **明确不做**：skill 市场、require 用户模块进主进程
 
 ## Phase D.1：会话 Compact + 导出
 
@@ -670,6 +669,123 @@ D.5 把可写子 Agent 与主项目目录解耦。每次 `spawn_implement` 都�
 - patch 完整保存在项目 `.codex/worktrees/<resultId>/result.patch`，上限 16 MiB；renderer/localStorage、usage、memory 和会话导出只保存 opaque id 与 bounded 摘要，不保存 patch 或 checkout 绝对路径。
 - 结果最多同时保留 3 个未处理项。应用、丢弃或清理失败会进入可重试状态；`apply_uncertain` 不会自动重放或回滚。
 - 创建、收集、应用、打开和清理都会重新校验 canonical 路径、Git worktree registration 和 marker；未知目录、损坏 marker 或链接路径只报告 warning，不自动删除。
-- D.5 不回退到主目录直写，也不支持 dirty base 快照、逐文件选择、自动 commit/merge、PR 或 worktree 并行。
+- D.5 不回退到主目录直写，也不支持 dirty base 快照、逐文件选择、自动 commit/merge 或 worktree 并行。GitHub PR 交付由 Phase D.6 在这一隔离结果之上实现。
 
 临时资料可能包含源码或秘密。应用/丢弃并完成清理后目录会移除；合法 pending 结果不会因应用重启被静默删除。若主机上的其它进程同时修改 Git 元数据或文件，系统会保留现场并要求人工检查。
+
+## Phase D.6：GitHub Draft PR
+
+D6 为 D5 的待审卡增加第二条显式交付路径：“应用全部”仍把 patch 放入主工作区；“创建 Draft PR”则完全在隔离 worktree 中创建一次性提交、推送分支并通过 GitHub CLI 创建草稿 PR。两个动作互斥，`full-auto` 也不会自动创建 PR。
+
+### 前置条件
+
+- 安装 GitHub CLI，并为 `origin` 所在 host 完成 `gh auth login`。
+- 项目必须已有 `origin`，支持 `github.com` 或 GitHub Enterprise；D6 不新增 remote 或自动 fork。
+- `origin` 仓库的默认分支 HEAD 必须与 D5 结果基线完全一致；远端已前进时需同步并重新运行隔离任务。
+- 主工作区必须保持 clean。PR 流程不会修改主工作区 HEAD、index 或文件。
+
+### 使用与恢复
+
+- 点击“创建 Draft PR”先执行 CLI、登录、仓库和 base 预检，再显示可编辑 title/body；title 同时作为单次 commit subject。
+- D6 创建 `codex/<resultId>`，验证 commit tree 与 D5 完整 patch 一致，push 到 `origin` 后创建 Draft PR。
+- push 或 PR 创建失败会保留结果并允许重试。若 push 已成功，重试先按 head 分支查询现有 PR，不会盲目重复创建。
+- PR 成功后删除本地 checkout、完整 patch 和临时分支；远端分支保留，由用户在 GitHub 合并或关闭后处理。清理失败可从卡片重试。
+- 应用重启会恢复失败、中断、清理待重试和已创建 PR 卡；“打开 PR”只接受与 marker host/repo 一致的 HTTPS URL。
+
+应用不读取或保存 `gh` token。PR 正文草稿保存在当前 renderer session 中，不写入磁盘 marker，也不进入 Markdown/JSON 会话导出。D6 不实现 OAuth/PAT、PR 更新/评论/合并、自动转 Ready、force push、远端分支删除或自动测试。
+
+## Phase D.7：GitHub PR 生命周期
+
+D7 把“拉取请求”工作台从演示数据替换为当前绑定项目 `origin` 仓库的真实 PR 列表，并让 D6 已创建的 PR 卡片进入同一个管理界面。仍然只使用用户已登录的 `gh` CLI；应用不读取或保存 GitHub token。
+
+### 工作台与操作
+
+- 在项目会话中打开“拉取请求”，可按打开、关闭、已合并或全部筛选；每次最多显示 50 条。
+- PR 详情显示正文、分支、checks、文件摘要和评论；状态只在打开页面或点击“刷新”时读取，不后台轮询。
+- 可显式编辑标题/正文、发表评论、关闭、重开，以及把 Draft 转为 Ready。
+- 每个远端写操作都要求用户确认；`full-auto` 和 Agent 权限模式不会自动执行这些动作。
+- D6 聊天卡片可刷新状态、打开 GitHub，或跳转到完整 PR 管理界面。
+
+### 合并门槛
+
+- 默认使用 **Squash**，也可选择 Merge commit 或 Rebase。
+- 只允许合并打开、非 Draft、GitHub 标记为可合并的 PR。
+- 必须至少存在一个 check，且所有 checks 均通过、跳过或 neutral；等待、失败、取消和未知状态都会阻止合并。
+- 合并绑定刷新时看到的 head SHA，head 变化时拒绝继续；不会自动删除远端分支。
+
+PR 列表和详情仅存在当前 renderer 内存。D6 marker 只保存 title、状态、head SHA 和 checks 计数等脱敏摘要；正文、评论、完整 checks 和文件详情不会进入 localStorage、记忆、usage 或 Markdown/JSON 会话导出。命令超时且无法确认远端结果时会显示状态不确定，要求用户手动刷新，不会自动重放。D7 不实现 OAuth/PAT、自动 fork、跨仓库聚合、自动轮询、评论编辑/删除或合并后删除远端分支。
+
+## Phase D.8：MCP OAuth 与 SSRF 加固
+
+D8 为远程 HTTP/SSE MCP 增加主进程 OAuth 2.1 authorization code + PKCE，并把远程请求默认限制为公共地址。
+
+### OAuth 使用
+
+- 设置页的 MCP 服务器选择 `OAuth` 后保存配置，再点击“授权”；只使用系统浏览器和一次性 `127.0.0.1` 随机端口回调。
+- 优先自动发现 Protected Resource Metadata、Authorization Server Metadata 和 DCR；也可以填写公开 `clientId` 或高级 endpoint 覆盖。D8 不接受 client secret、device flow 或多账号。
+- access/refresh token 只在主进程保存。Electron `safeStorage` 可用时写入加密 envelope；不可用时只保留当前进程内存，绝不明文落盘。
+- Agent 运行、401 或测试连接不会自动打开浏览器。未授权 server 只返回 `MCP_AUTH_REQUIRED`；token 过期时允许静默 refresh，401 最多 refresh + retry 一次。
+- “退出授权”会尝试远端 revoke，然后无论远端结果如何删除本地凭据；状态只显示是否授权、过期时间、是否可刷新和存储模式。
+
+### 远程地址安全
+
+- HTTP/SSE MCP 默认拒绝 loopback、私网、链路本地、metadata、保留地址、DNS rebinding 和危险端口；每个 MCP server 必须显式打开“允许私网地址”才可连接 localhost 或内网。
+- DNS 的所有解析结果都会检查，混合公网/私网结果整体拒绝；JSON-RPC 不自动跟随重定向。SSE 服务端返回的 message endpoint 必须与配置 URL 同源。
+- OAuth discovery、token、registration 和 revocation endpoint 始终要求公共 HTTPS，不继承 MCP 的私网放行。
+- 现有 localhost/内网配置升级后需要手动保存 `allowPrivate: true`；stdio 行为、MCP 权限风险和每次 run 连接/断开生命周期不变。
+
+OAuth 配置示例：
+
+```json
+{
+  "name": "remote",
+  "transport": "http",
+  "url": "https://example.com/mcp",
+  "auth": "oauth",
+  "allowPrivate": false,
+  "oauth": {
+    "clientId": "public-client-id",
+    "scopes": ["tools"]
+  }
+}
+```
+
+D8 不实现 stdio OAuth、GitHub fork 或后台 MCP 轮询。token、authorization code、refresh token 和 client secret 不进入 renderer 状态、localStorage、session export、memory、usage、hooks 环境、Agent event 或日志。
+
+## Phase D.9：MCP prompts、roots、受控 sampling 与会话恢复
+
+D9 在 D8 的 OAuth/SSRF 边界上增加 MCP 高级能力。所有新增能力都按 server 单独配置，默认关闭；没有打开 D9 开关的旧配置继续使用每次 run 连接、结束断开的生命周期。
+
+### 配置与 prompts
+
+| 设置 | 默认 | 说明 |
+|------|------|------|
+| `sessionRecovery` | `false` | 仅当前进程内保留可复用 session；不会跨应用重启保存 session id |
+| `sampling.enabled` | `false` | 允许该 server 请求 host 模型采样；默认每次请求审批，可按当前 server 选择 `allow_session` |
+| `roots` | `[]` | 由主进程目录选择器授权的额外目录；最多 8 项 |
+
+- `/mcp-prompts [server]` 列出已连接 server 的 prompts。
+- `/mcp-prompt <server> <name> [JSON arguments]` 获取 prompt 并填入当前输入框；不会自动发送，也不会写入聊天历史。
+- prompt 名称、参数、描述和返回内容都有大小限制，并按不可信 MCP 数据处理。`prompts/list_changed` 会使对应缓存失效。
+
+### Roots 与路径边界
+
+- MCP 只能收到当前项目 root 和用户在设置页明确选择的额外目录；主进程负责存在性检查、canonical path 和授权状态。
+- renderer/public settings 只看到 `rootId` 与 label，不返回 absolute path；root token 由主进程按 sender/server/session 校验和注入。
+- 项目切换、roots 修改、配置变更、OAuth logout、session reset 和应用退出都会清理相关 session；活跃连接会收到 roots 变更通知。
+
+### Session recovery
+
+- `sessionRecovery` 显式开启后，session 按 transport/config/project 建立，lease 释放后保留至多 5 分钟，进程内最多 8 个；idle session 会自动回收。
+- HTTP 保留并发送 `Mcp-Session-Id`，SSE 支持事件流重连，stdio 支持子进程重启；每个 run 最多恢复一次，传输错误最多重连一次。
+- 只允许安全的 discovery/list 请求按规则重做；`tools/call`、`resources/read`、`prompts/get` 和 sampling response 不会自动重放。并发 run 不共享带有 roots/sampling 回调的 active client。
+- recovery 默认关闭，不增加后台连接，也不把 session identifier 放入 public settings、日志、事件、memory 或导出。
+
+### Sampling 与审批
+
+- 只有 `sampling.enabled=true`、API 模式可用且 server 声明 sampling capability 时才提供 `sampling/createMessage`。
+- MCP 提供的消息会被限制为文本并进行大小、角色、temperature、stop sequence 和 `maxTokens` 校验；采样调用固定无 tools、非流式，并禁止递归调用 MCP。
+- `none` 不附加 host 上下文；`thisServer` 需要额外确认且只允许有界的同 server 脱敏摘要；`allServers` 被拒绝。即使是 `full-auto`，sampling 仍需显式审批；`allow_session` 只记住当前 server 的 sampling scope。
+- 单次最多 2048 output tokens、60 秒；每 server 每 run 最多 3 次、累计最多 8192 tokens。usage 只记录 model 和 token/cost 摘要，不记录 prompt、response 或 server payload。
+
+prompt 内容、roots absolute path、session id、sampling body 和 sampling response 不写入 localStorage、session export、memory、usage、hooks 环境或普通 Agent event。

@@ -17,6 +17,7 @@ const {
   isResultId,
   isUnresolved,
 } = require('./worktree-state');
+const { createGithubCli } = require('./github-cli');
 
 const GIT_TIMEOUT_MS = 60000;
 const PATCH_DIFF_ARGS = Object.freeze([
@@ -30,7 +31,7 @@ const PATCH_DIFF_ARGS = Object.freeze([
 ]);
 
 function worktreeError(code, error, extra = {}) {
-  return { ok: false, code, error: String(error || code), ...extra };
+  return { ...extra, ok: false, code, error: String(error || code) };
 }
 
 function shortError(value) {
@@ -633,6 +634,27 @@ async function validateReadyResult(result, repo) {
   return { bytes, canonical };
 }
 
+async function validatePrWorktreeMetadata(result, repo) {
+  const record = (await worktreeRecords(repo.repoRoot)).find((entry) => samePath(entry.path, result.checkout));
+  if (!record || !record.locked) {
+    throw Object.assign(new Error('PR 隔离 worktree 注册或锁状态已变化'), { code: 'GIT_METADATA_CHANGED' });
+  }
+  const [top, gitDir, common] = await Promise.all([
+    git(result.checkout, ['rev-parse', '--show-toplevel']),
+    git(result.checkout, ['rev-parse', '--git-dir']),
+    git(result.checkout, ['rev-parse', '--git-common-dir']),
+  ]);
+  if (![top, gitDir, common].every((item) => item.ok)) {
+    throw Object.assign(new Error('无法读取 PR 隔离 worktree 元数据'), { code: 'GIT_METADATA_CHANGED' });
+  }
+  const resolveGitPath = (value) => path.isAbsolute(value) ? path.resolve(value) : path.resolve(result.checkout, value);
+  if (!samePath(top.stdout.toString('utf8').trim(), result.checkout)
+    || !samePath(resolveGitPath(gitDir.stdout.toString('utf8').trim()), result.marker.worktreeGitDir)
+    || !samePath(resolveGitPath(common.stdout.toString('utf8').trim()), repo.commonDir)) {
+    throw Object.assign(new Error('PR 隔离 worktree Git 元数据对账失败'), { code: 'GIT_METADATA_CHANGED' });
+  }
+}
+
 async function removeUnregisteredCreatingArtifact(result, repo) {
   if (await worktreeRegistration(result.checkout, repo.repoRoot) || fs.existsSync(result.checkout)) return false;
   const entries = await fsp.readdir(result.root);
@@ -661,8 +683,9 @@ async function withAlternateTree(repoRoot, baseHead) {
   });
 }
 
-function createWorktreeManager() {
+function createWorktreeManager(opts = {}) {
   const projectLocks = new Map();
+  const github = opts.githubCli || createGithubCli(opts.github || {});
 
   async function withProjectLock(identity, fn) {
     const previous = projectLocks.get(identity) || Promise.resolve();
@@ -708,6 +731,10 @@ function createWorktreeManager() {
             canCleanup: false,
             canOpen: false,
             canPreview: false,
+            canCreatePr: false,
+            canRetryPr: false,
+            canCleanupPr: false,
+            canOpenPr: false,
           };
         }
       }
@@ -762,6 +789,25 @@ function createWorktreeManager() {
             await updateState(result, 'apply_uncertain', { errorCode: 'APPLY_UNCERTAIN', error: shortError(err.message) });
             recovered.push(publicSummary(result.marker));
           } catch { warnings.push(`${marker.id}: ${err.message || '应用恢复失败'}`); }
+        }
+        continue;
+      }
+      if (['pr_preparing', 'pr_committing', 'pr_pushing', 'pr_creating'].includes(marker.state)) {
+        const result = await resultById(repo.projectRoot, marker.id);
+        if (!result) {
+          warnings.push(`${marker.id}: PR 中间状态无法恢复`);
+          continue;
+        }
+        try {
+          await updateState(result, 'pr_failed', {
+            errorCode: 'PR_INTERRUPTED',
+            error: marker.pr?.pushed
+              ? '应用在创建 PR 期间退出；重试时会先查询已存在的 PR'
+              : '应用在准备或推送 PR 期间退出；可安全重试',
+          });
+          recovered.push(publicSummary(result.marker));
+        } catch (err) {
+          warnings.push(`${marker.id}: ${shortError(err.message || 'PR 恢复失败')}`);
         }
         continue;
       }
@@ -1084,6 +1130,13 @@ function createWorktreeManager() {
       const result = await resultById(repo.projectRoot, resultId);
       if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
       if (result.marker.state === 'applied_cleanup_pending') return worktreeError('CLEANUP_FAILED', '已应用的结果只能重试清理');
+      if (result.marker.state === 'pr_failed') {
+        const cleaned = await cleanupPrCheckout(repo, result, result.marker.pr.head);
+        if (!cleaned.ok) return cleaned;
+        await updateState(result, 'discarded_cleanup_pending');
+        await removeArtifact(result);
+        return { ok: true, cleaned: true, remoteBranchRetained: result.marker.pr.pushed === true };
+      }
       if (result.marker.state !== 'discarded_cleanup_pending') {
         try { await updateState(result, 'discarded_cleanup_pending'); } catch (err) { return worktreeError(err.code || 'CLEANUP_FAILED', err.message); }
       }
@@ -1161,7 +1214,436 @@ function createWorktreeManager() {
     });
   }
 
-  return { create, collect, retryCollect, list, recover, get, open, apply, discard, cleanup };
+  function normalizePrInput(raw = {}) {
+    const title = String(raw.title || '').trim().replace(/[\r\n]+/g, ' ').slice(0, 300);
+    const body = String(raw.body || '').trim().slice(0, 10000);
+    if (!title) return { ok: false, code: 'PR_INVALID', error: 'PR 标题不能为空' };
+    if (!body) return { ok: false, code: 'PR_INVALID', error: 'PR 正文不能为空' };
+    return { ok: true, title, body, draft: raw.draft !== false };
+  }
+
+  async function cleanupPrCheckout(repo, result, branch) {
+    try {
+      const registered = await worktreeRegistration(result.checkout, repo.repoRoot);
+      if (registered) {
+        await git(repo.repoRoot, ['worktree', 'unlock', result.checkout], { allowNonZero: true });
+        const removed = await git(repo.repoRoot, ['worktree', 'remove', '--force', result.checkout]);
+        if (!removed.ok || await worktreeRegistration(result.checkout, repo.repoRoot)) {
+          throw Object.assign(new Error(removed.error || '无法清理 PR 隔离 worktree'), { code: 'CLEANUP_FAILED' });
+        }
+      }
+      if (branch) {
+        const deleted = await git(repo.repoRoot, ['branch', '-D', '--', branch], { allowNonZero: true });
+        if (deleted.code !== 0 && await branchExists(repo.repoRoot, branch)) {
+          throw Object.assign(new Error(deleted.error || '无法清理 PR 临时分支'), { code: 'CLEANUP_FAILED' });
+        }
+      }
+      const patchPath = path.join(result.root, 'result.patch');
+      try { await fsp.unlink(patchPath); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      return { ok: true };
+    } catch (err) {
+      return worktreeError('CLEANUP_FAILED', shortError(err.message || err));
+    }
+  }
+
+  async function branchExists(repoRoot, branch) {
+    const check = await git(repoRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { allowNonZero: true });
+    return check.code === 0;
+  }
+
+  function publicPrSummary(marker) {
+    const summary = publicSummary(marker);
+    if (!summary) return null;
+    return summary;
+  }
+
+  async function validateStoredPatch(result, repo) {
+    await validatePrWorktreeMetadata(result, repo);
+    await assertSafeExistingPath(result.patch);
+    const bytes = await fsp.readFile(result.patch);
+    if (bytes.length !== result.marker.patchBytes || hashBytes(bytes) !== result.marker.patchSha256) {
+      throw Object.assign(new Error('隔离补丁校验失败'), { code: 'PATCH_INVALID' });
+    }
+    const replayedTree = await replayPatchTree(repo.repoRoot, result.marker.baseHead, result.patch);
+    if (replayedTree !== result.marker.expectedTree) {
+      throw Object.assign(new Error('隔离补丁重放结果不一致'), { code: 'PATCH_INVALID' });
+    }
+  }
+
+  async function preparePrCommit(result, repo, branch, title) {
+    await validateStoredPatch(result, repo);
+    const detached = await git(result.checkout, ['checkout', '--detach', result.marker.baseHead]);
+    if (!detached.ok) throw Object.assign(new Error(detached.error || '无法恢复 PR 隔离基线'), { code: 'BRANCH_CREATE_FAILED' });
+    const reset = await git(result.checkout, ['reset', '--hard', result.marker.baseHead]);
+    if (!reset.ok) throw Object.assign(new Error(reset.error || '无法恢复 PR 隔离基线'), { code: 'BRANCH_CREATE_FAILED' });
+    const clean = await git(result.checkout, ['clean', '-fd']);
+    if (!clean.ok) throw Object.assign(new Error(clean.error || '无法清理 PR 隔离目录'), { code: 'BRANCH_CREATE_FAILED' });
+    const existing = await git(repo.repoRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { allowNonZero: true });
+    if (existing.code === 0) {
+      const removed = await git(repo.repoRoot, ['branch', '-D', '--', branch]);
+      if (!removed.ok) throw Object.assign(new Error(removed.error || 'PR 临时分支已存在且无法替换'), { code: 'BRANCH_EXISTS' });
+    }
+    const checkoutBranch = await git(result.checkout, ['checkout', '-b', branch]);
+    if (!checkoutBranch.ok) throw Object.assign(new Error(checkoutBranch.error || '无法创建 PR 临时分支'), { code: 'BRANCH_CREATE_FAILED' });
+    const applied = await git(result.checkout, ['apply', '--index', '--binary', result.patch]);
+    if (!applied.ok) throw Object.assign(new Error(applied.error || '无法恢复隔离补丁'), { code: 'PATCH_INVALID' });
+    if (await writeTree(result.checkout, undefined, 'COMMIT_INVALID') !== result.marker.expectedTree) {
+      throw Object.assign(new Error('PR commit tree 与隔离结果不一致'), { code: 'COMMIT_INVALID' });
+    }
+    const commit = await git(result.checkout, ['commit', '--no-verify', '--no-gpg-sign', '-m', title]);
+    if (!commit.ok) throw Object.assign(new Error(commit.error || '无法提交隔离改动'), { code: 'COMMIT_FAILED' });
+    const commitShaResult = await git(result.checkout, ['rev-parse', 'HEAD']);
+    const commitSha = commitShaResult.ok ? commitShaResult.stdout.toString('utf8').trim().toLowerCase() : '';
+    const commitTree = await git(result.checkout, ['rev-parse', 'HEAD^{tree}']);
+    if (!/^[a-f0-9]{40}$/.test(commitSha)
+      || !commitTree.ok
+      || commitTree.stdout.toString('utf8').trim().toLowerCase() !== result.marker.expectedTree) {
+      throw Object.assign(new Error('无法确认 PR commit'), { code: 'COMMIT_UNCERTAIN' });
+    }
+    return commitSha;
+  }
+
+  async function confirmStoredCommit(repo, result, commit) {
+    if (!/^[a-f0-9]{40}$/.test(String(commit || ''))) return false;
+    const tree = await git(repo.repoRoot, ['rev-parse', `${commit}^{tree}`]);
+    return tree.ok && tree.stdout.toString('utf8').trim().toLowerCase() === result.marker.expectedTree;
+  }
+
+  async function finishCreatedPr(repo, result, branch, pr, input, commitSha) {
+    await updateState(result, 'pr_cleanup_pending', {
+      error: null,
+      errorCode: null,
+      pr: {
+        ...result.marker.pr,
+        commit: commitSha,
+        url: String(pr?.url || '').slice(0, 2000),
+        number: Number(pr?.number) || 0,
+        draft: pr?.isDraft !== false && input.draft,
+        title: input.title,
+        pushed: true,
+      },
+    });
+    const cleaned = await cleanupPrCheckout(repo, result, branch);
+    if (!cleaned.ok) {
+      await writeMarker(result.root, { ...result.marker, errorCode: cleaned.code, error: cleaned.error, updatedAt: Date.now() });
+      result.marker = await readMarker(result.root);
+      return { ok: true, created: true, cleanupWarning: cleaned.error, result: publicPrSummary(result.marker) };
+    }
+    await updateState(result, 'pr_created', { error: null, errorCode: null });
+    return { ok: true, created: true, result: publicPrSummary(result.marker) };
+  }
+
+  async function preflightPr({ projectPath, resultId }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    const result = await resultById(repo.projectRoot, resultId);
+    if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+    if (!['ready', 'conflict', 'pr_failed'].includes(result.marker.state)) return worktreeError('PR_INVALID', '当前隔离结果不能创建 PR');
+    try {
+      if (['ready', 'conflict'].includes(result.marker.state)) await validateReadyResult(result, repo);
+      else await validateStoredPatch(result, repo);
+      if (!await statusIsClean(repo.repoRoot)) return worktreeError('WORKTREE_DIRTY', '主工作区存在变更，不能创建 PR');
+      const checked = await github.preflight({ repoRoot: repo.repoRoot, baseHead: result.marker.baseHead });
+      return checked.ok ? { ...checked, result: publicPrSummary(result.marker) } : checked;
+    } catch (err) {
+      return worktreeError(err.code || 'PR_INVALID', shortError(err.message || err));
+    }
+  }
+
+  async function createPr({ projectPath, resultId, title, body, draft = true }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const result = await resultById(repo.projectRoot, resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+      if (!['ready', 'conflict', 'pr_failed'].includes(result.marker.state)) return worktreeError('PR_INVALID', '当前隔离结果不能创建 PR', { result: publicPrSummary(result.marker) });
+      const input = normalizePrInput({ title, body, draft });
+      if (!input.ok) return input;
+      const priorPr = { ...result.marker.pr };
+      await updateState(result, 'pr_preparing', { error: null, errorCode: null, pr: { ...priorPr, title: input.title, draft: input.draft } });
+      const branch = `codex/${result.marker.id}`;
+      try {
+        if (!await statusIsClean(repo.repoRoot)) throw Object.assign(new Error('主工作区存在变更，不能创建 PR'), { code: 'WORKTREE_DIRTY' });
+        const preflight = await github.preflight({ repoRoot: repo.repoRoot, baseHead: result.marker.baseHead });
+        if (!preflight.ok) throw Object.assign(new Error(preflight.error), { code: preflight.code });
+        const remotePr = { host: preflight.remote.host, owner: preflight.remote.owner, repo: preflight.remote.repo, base: preflight.base, head: branch, title: input.title, draft: input.draft };
+        let commitSha = await confirmStoredCommit(repo, result, priorPr.commit) ? priorPr.commit : '';
+        if (priorPr.pushed) {
+          const existing = await github.findExistingPr({ repoRoot: repo.repoRoot, ...remotePr });
+          if (!existing.ok) throw Object.assign(new Error(existing.error), { code: existing.code });
+          if (existing.count > 1) throw Object.assign(new Error('同一分支存在多个 PR，无法安全继续'), { code: 'PR_AMBIGUOUS' });
+          if (existing.pr) {
+            await updateState(result, 'pr_creating', { pr: { ...result.marker.pr, ...remotePr, commit: commitSha, pushed: true } });
+            return finishCreatedPr(repo, result, branch, existing.pr, input, commitSha);
+          }
+          if (!commitSha) throw Object.assign(new Error('已推送提交无法在本地验证'), { code: 'COMMIT_UNCERTAIN' });
+        }
+        if (!commitSha) {
+          await updateState(result, 'pr_committing', { pr: { ...result.marker.pr, ...remotePr, pushed: false } });
+          commitSha = await preparePrCommit(result, repo, branch, input.title);
+        }
+        if (!priorPr.pushed) {
+          if (result.marker.state !== 'pr_pushing') await updateState(result, 'pr_pushing', { pr: { ...result.marker.pr, ...remotePr, commit: commitSha, pushed: false } });
+          const pushed = await github.pushBranch({ repoRoot: repo.repoRoot, branch, source: commitSha });
+          if (!pushed.ok) throw Object.assign(new Error(pushed.error), { code: pushed.code });
+        }
+        await updateState(result, 'pr_creating', { pr: { ...result.marker.pr, ...remotePr, commit: commitSha, pushed: true } });
+        const created = await github.createPr({ repoRoot: repo.repoRoot, ...remotePr, title: input.title, body: input.body, draft: input.draft });
+        if (!created.ok) throw Object.assign(new Error(created.error), { code: created.code });
+        return finishCreatedPr(repo, result, branch, created.pr, input, commitSha);
+      } catch (err) {
+        if (!['pr_cleanup_pending', 'pr_created'].includes(result.marker.state)) {
+          try { await updateState(result, 'pr_failed', { errorCode: err.code || 'PR_FAILED', error: shortError(err.message), pr: { ...result.marker.pr, head: branch, title: input.title, draft: input.draft } }); } catch { /* preserve response */ }
+        }
+        return worktreeError(err.code || 'PR_FAILED', shortError(err.message || err), { result: publicPrSummary(result.marker) });
+      }
+    });
+  }
+
+  async function retryPr(args) { return createPr(args); }
+
+  async function cleanupPr({ projectPath, resultId }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const result = await resultById(repo.projectRoot, resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+      if (result.marker.state !== 'pr_cleanup_pending') return worktreeError('CLEANUP_FAILED', '当前 PR 结果不需要清理');
+      const cleaned = await cleanupPrCheckout(repo, result, result.marker.pr.head);
+      if (!cleaned.ok) return cleaned;
+      await updateState(result, 'pr_created');
+      return { ok: true, cleaned: true, result: publicPrSummary(result.marker) };
+    });
+  }
+
+  function normalizePrNumber(value) {
+    const number = Number(value);
+    return Number.isInteger(number) && number > 0 && number <= 0x7fffffff ? number : 0;
+  }
+
+  function publicPrRepo(context) {
+    return {
+      host: String(context?.remote?.host || '').slice(0, 255),
+      owner: String(context?.remote?.owner || '').slice(0, 255),
+      repo: String(context?.remote?.repo || '').slice(0, 255),
+      base: String(context?.base || '').slice(0, 255),
+      nameWithOwner: String(context?.nameWithOwner || '').slice(0, 600),
+    };
+  }
+
+  async function resolvePrContext(repo) {
+    if (typeof github.repository !== 'function') return worktreeError('GH_REPO_FAILED', 'GitHub CLI 适配器不支持 PR 管理');
+    const context = await github.repository({ repoRoot: repo.repoRoot });
+    if (!context?.ok) return context || worktreeError('GH_REPO_FAILED', '无法读取 GitHub 仓库信息');
+    return context;
+  }
+
+  async function resolvePrTarget(repo, context, args = {}) {
+    let result = null;
+    let number = normalizePrNumber(args.number);
+    if (args.resultId) {
+      result = await resultById(repo.projectRoot, args.resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) {
+        return worktreeError('RESULT_NOT_FOUND', 'PR 结果不存在');
+      }
+      number = normalizePrNumber(result.marker.pr?.number);
+      const markerRepo = result.marker.pr || {};
+      const same = (left, right) => String(left || '').toLowerCase() === String(right || '').toLowerCase();
+      if (!number || !same(markerRepo.host, context.remote.host)
+        || !same(markerRepo.owner, context.remote.owner)
+        || !same(markerRepo.repo, context.remote.repo)) {
+        return worktreeError('PR_INVALID', 'PR marker 与当前 origin 不一致', { result: publicPrSummary(result.marker) });
+      }
+    }
+    if (!number) return worktreeError('PR_INVALID', 'PR 编号无效');
+    return { ok: true, number, result };
+  }
+
+  async function loadPrDetails(repo, context, target) {
+    const viewed = await github.getPr({
+      repoRoot: repo.repoRoot,
+      host: context.remote.host,
+      owner: context.remote.owner,
+      repo: context.remote.repo,
+      number: target.number,
+    });
+    if (!viewed?.ok || !viewed.pr) return viewed || worktreeError('PR_LOOKUP_FAILED', '无法读取 PR 详情');
+    const checks = typeof github.getChecks === 'function'
+      ? await github.getChecks({
+        repoRoot: repo.repoRoot,
+        host: context.remote.host,
+        owner: context.remote.owner,
+        repo: context.remote.repo,
+        number: target.number,
+      })
+      : { ok: false, code: 'PR_CHECKS_FAILED', error: 'GitHub CLI 不支持 checks' };
+    const pr = {
+      ...viewed.pr,
+      checks: checks.ok ? checks.checks : [],
+      checksSummary: checks.ok ? checks.summary : { total: 0, passed: 0, pending: 0, failed: 0, skipped: 0, unknown: 0 },
+    };
+    return {
+      ok: true,
+      repo: publicPrRepo(context),
+      pr,
+      checksOk: checks.ok,
+      warnings: checks.ok ? [] : [checks.code || 'PR_CHECKS_FAILED'],
+      checksError: checks.ok ? null : checks.error,
+      result: target.result ? publicSummary(target.result.marker) : null,
+    };
+  }
+
+  async function syncPrMarker(target, detail) {
+    if (!target?.result || !detail?.pr) return null;
+    const existing = target.result.marker.pr || {};
+    const nextPr = {
+      ...existing,
+      host: detail.repo.host,
+      owner: detail.repo.owner,
+      repo: detail.repo.repo,
+      base: detail.repo.base || existing.base,
+      number: detail.pr.number,
+      url: detail.pr.url,
+      title: detail.pr.title,
+      draft: detail.pr.isDraft,
+      state: detail.pr.state,
+      headSha: detail.pr.headSha || existing.headSha || existing.commit,
+      mergeable: detail.pr.mergeable,
+      mergeStateStatus: detail.pr.mergeStateStatus,
+      updatedAt: detail.pr.updatedAt,
+      checksSummary: detail.pr.checksSummary,
+    };
+    target.result.marker = await writeMarker(target.result.root, {
+      ...target.result.marker,
+      pr: nextPr,
+      updatedAt: Date.now(),
+    });
+    detail.result = publicSummary(target.result.marker);
+    return detail.result;
+  }
+
+  async function listPrs({ projectPath, state = 'open' }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    const context = await resolvePrContext(repo);
+    if (!context.ok) return context;
+    const listed = await github.listPrs({
+      repoRoot: repo.repoRoot,
+      host: context.remote.host,
+      owner: context.remote.owner,
+      repo: context.remote.repo,
+      state,
+      limit: 51,
+    });
+    if (!listed?.ok) return listed || worktreeError('PR_LOOKUP_FAILED', '无法读取 PR 列表');
+    return { ok: true, repo: publicPrRepo(context), prs: listed.prs, truncated: listed.truncated === true, state: listed.state };
+  }
+
+  async function getPr({ projectPath, number, resultId, syncMarker = true }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    const context = await resolvePrContext(repo);
+    if (!context.ok) return context;
+    const target = await resolvePrTarget(repo, context, { number, resultId });
+    if (!target.ok) return target;
+    const detail = await loadPrDetails(repo, context, target);
+    if (!detail.ok) return detail;
+    if (syncMarker !== false) {
+      try { await syncPrMarker(target, detail); } catch (err) { return worktreeError(err.code || 'PR_INVALID', shortError(err.message), { ...detail }); }
+    }
+    return detail;
+  }
+
+  async function runPrMutation({ projectPath, number, resultId }, action) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const context = await resolvePrContext(repo);
+      if (!context.ok) return context;
+      const target = await resolvePrTarget(repo, context, { number, resultId });
+      if (!target.ok) return target;
+      const before = await loadPrDetails(repo, context, target);
+      if (!before.ok) return before;
+      const outcome = await action({ repo, context, target, before });
+      if (!outcome?.ok && !outcome?.uncertain) return outcome || worktreeError('PR_ACTION_FAILED', 'PR 操作失败');
+      const after = await loadPrDetails(repo, context, target);
+      if (!after.ok) return worktreeError('PR_ACTION_UNCERTAIN', '操作已发出，但无法刷新确认 PR 状态', { before: before.pr, result: before.result });
+      try { await syncPrMarker(target, after); } catch (err) { return worktreeError(err.code || 'PR_INVALID', shortError(err.message), { ...after }); }
+      if (outcome.uncertain && typeof outcome.verify !== 'function') {
+        return worktreeError('PR_ACTION_UNCERTAIN', '操作可能已完成，但无法自动证明不会重复副作用', { ...after });
+      }
+      if (typeof outcome.verify === 'function' && !outcome.verify(after.pr)) {
+        return worktreeError('PR_ACTION_UNCERTAIN', '操作已发出，但刷新后的 PR 状态不符合预期', { ...after });
+      }
+      return { ...after, action: outcome.action || null, commentPosted: outcome.commentPosted === true, recoveredAfterUncertain: outcome.uncertain === true };
+    });
+  }
+
+  async function editPr(args = {}) {
+    const title = String(args.title || '').trim().replace(/[\r\n]+/g, ' ').slice(0, 300);
+    const body = String(args.body || '').slice(0, 10000);
+    if (!title) return worktreeError('PR_INVALID', 'PR 标题不能为空');
+    return runPrMutation(args, async ({ context, target, repo, before }) => {
+      if (before.pr.state === 'MERGED') return worktreeError('PR_INVALID', '已合并的 PR 不能编辑');
+      const result = await github.editPr({ repoRoot: repo.repoRoot, host: context.remote.host, owner: context.remote.owner, repo: context.remote.repo, number: target.number, title, body });
+      return { ...result, action: 'edit', verify: (pr) => pr.title === title && pr.body === body };
+    });
+  }
+
+  async function commentPr(args = {}) {
+    const body = String(args.body || '').trim().slice(0, 10000);
+    if (!body) return worktreeError('PR_INVALID', '评论不能为空');
+    return runPrMutation(args, async ({ context, target, repo }) => {
+      const result = await github.commentPr({ repoRoot: repo.repoRoot, host: context.remote.host, owner: context.remote.owner, repo: context.remote.repo, number: target.number, body });
+      return result.ok ? { ok: true, action: 'comment', commentPosted: true } : { ...result, action: 'comment', code: result.code || 'PR_ACTION_FAILED' };
+    });
+  }
+
+  async function closePr(args = {}) {
+    return runPrMutation(args, async ({ context, target, repo, before }) => {
+      if (before.pr.state !== 'OPEN') return worktreeError('PR_INVALID', '只有打开状态的 PR 才能关闭');
+      const result = await github.closePr({ repoRoot: repo.repoRoot, host: context.remote.host, owner: context.remote.owner, repo: context.remote.repo, number: target.number });
+      return { ...result, action: 'close', verify: (pr) => pr.state === 'CLOSED' };
+    });
+  }
+
+  async function reopenPr(args = {}) {
+    return runPrMutation(args, async ({ context, target, repo, before }) => {
+      if (before.pr.state !== 'CLOSED') return worktreeError('PR_INVALID', '只有关闭状态的 PR 才能重开');
+      const result = await github.reopenPr({ repoRoot: repo.repoRoot, host: context.remote.host, owner: context.remote.owner, repo: context.remote.repo, number: target.number });
+      return { ...result, action: 'reopen', verify: (pr) => pr.state === 'OPEN' };
+    });
+  }
+
+  async function readyPr(args = {}) {
+    return runPrMutation(args, async ({ context, target, repo, before }) => {
+      if (before.pr.state !== 'OPEN' || before.pr.isDraft !== true) return worktreeError('PR_INVALID', '只有打开状态的 Draft PR 才能转为 Ready');
+      const result = await github.readyPr({ repoRoot: repo.repoRoot, host: context.remote.host, owner: context.remote.owner, repo: context.remote.repo, number: target.number });
+      return { ...result, action: 'ready', verify: (pr) => pr.state === 'OPEN' && pr.isDraft === false };
+    });
+  }
+
+  async function mergePr(args = {}) {
+    const method = ['merge', 'squash', 'rebase'].includes(String(args.method || '')) ? String(args.method) : 'squash';
+    return runPrMutation(args, async ({ context, target, repo, before }) => {
+      const checks = before.pr.checksSummary || {};
+      if (before.pr.state !== 'OPEN' || before.pr.isDraft) return worktreeError('PR_MERGE_BLOCKED', 'Draft 或非打开状态的 PR 不能合并');
+      if (before.pr.mergeable !== 'MERGEABLE') return worktreeError('PR_MERGE_BLOCKED', 'GitHub 尚未确认 PR 可合并');
+      if (!checks.total) return worktreeError('PR_NO_CHECKS', '没有可用 checks，不能合并');
+      if (checks.pending || checks.failed || checks.unknown || checks.passed + checks.skipped !== checks.total) {
+        return worktreeError('PR_CHECKS_FAILED', 'checks 尚未全部通过，不能合并');
+      }
+      if (!/^[a-f0-9]{40}$/i.test(before.pr.headSha || '')) return worktreeError('PR_HEAD_CHANGED', '无法确认 PR head SHA');
+      const result = await github.mergePr({ repoRoot: repo.repoRoot, host: context.remote.host, owner: context.remote.owner, repo: context.remote.repo, number: target.number, method, headSha: before.pr.headSha });
+      return { ...result, action: `merge:${method}`, verify: (pr) => pr.state === 'MERGED' };
+    });
+  }
+
+  return {
+    create, collect, retryCollect, list, recover, get, open, apply, discard, cleanup,
+    preflightPr, createPr, retryPr, cleanupPr,
+    listPrs, getPr, editPr, commentPr, closePr, reopenPr, readyPr, mergePr,
+  };
 }
 
 module.exports = {

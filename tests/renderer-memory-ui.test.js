@@ -68,7 +68,7 @@ describe('D.4 renderer memory UI contract', () => {
   it('uses narrow accept IPC and confirmed reject actions', () => {
     assert.match(app, /window\.codex\.acceptMemory\(built\.payload\)/);
     assert.match(app, /for \(const candidate of selected\)/);
-    assert.match(app, /confirm\('确定拒绝所选记忆候选？'\)/);
+    assert.match(app, /appConfirm\('确定拒绝所选记忆候选？'\)/);
     assert.match(app, /buildAcceptPayload\(candidate, currentProjectRef\(session\)\)/);
     assert.match(app, /memoryCandidateInvalidIds\.has\(candidate\.id\)/);
   });

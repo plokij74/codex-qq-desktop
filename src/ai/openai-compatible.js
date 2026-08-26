@@ -6,6 +6,8 @@ function buildChatPayload(model, messages, extra = {}) {
   };
   if (extra.tools) body.tools = extra.tools;
   if (extra.tool_choice) body.tool_choice = extra.tool_choice;
+  if (extra.stop !== undefined) body.stop = extra.stop;
+  if (extra.maxTokens !== undefined) body.max_tokens = extra.maxTokens;
   if (extra.stream) body.stream = true;
   if (extra.stream && extra.includeUsage !== false) {
     body.stream_options = { include_usage: true };
@@ -129,6 +131,8 @@ async function postChatCompletions({
   tool_choice,
   fetchFn,
   temperature,
+  stop,
+  maxTokens,
   signal,
   stream,
   includeUsage,
@@ -143,6 +147,8 @@ async function postChatCompletions({
     tools,
     tool_choice,
     temperature,
+    stop,
+    maxTokens,
     stream: !!stream,
     includeUsage,
   });
@@ -174,6 +180,8 @@ async function chatRequest({
   tool_choice,
   fetchFn,
   temperature,
+  stop,
+  maxTokens,
   signal,
   includeUsage,
 }) {
@@ -186,6 +194,8 @@ async function chatRequest({
     tool_choice,
     fetchFn,
     temperature,
+    stop,
+    maxTokens,
     signal,
     stream: false,
     includeUsage,
@@ -207,6 +217,8 @@ async function streamChatCompletionMessage(opts) {
     tool_choice,
     fetchFn,
     temperature,
+    stop,
+    maxTokens,
     signal,
     onDelta,
     includeUsage,
@@ -221,6 +233,8 @@ async function streamChatCompletionMessage(opts) {
     tool_choice,
     fetchFn,
     temperature,
+    stop,
+    maxTokens,
     signal,
     stream: true,
     includeUsage,
@@ -237,12 +251,14 @@ async function streamChatCompletionMessage(opts) {
 
   let content = '';
   let usage;
+  let finishReason;
   const toolMap = new Map();
 
   try {
     for await (const event of iterateSse(res)) {
       if (signal?.aborted) throw abortedError();
       if (event?.usage && typeof event.usage === 'object') usage = event.usage;
+      if (event?.choices?.[0]?.finish_reason != null) finishReason = event.choices[0].finish_reason;
       const delta = event?.choices?.[0]?.delta;
       if (!delta) continue;
       if (typeof delta.content === 'string' && delta.content) {
@@ -271,6 +287,7 @@ async function streamChatCompletionMessage(opts) {
     content,
     tool_calls: tool_calls?.length ? tool_calls : undefined,
     usage,
+    ...(finishReason != null ? { finishReason } : {}),
   };
 }
 
@@ -290,6 +307,7 @@ async function chatCompletionMessage(opts) {
     content: typeof msg.content === 'string' ? msg.content : (msg.content ?? ''),
     tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : undefined,
     usage: json?.usage && typeof json.usage === 'object' ? json.usage : undefined,
+    ...(json?.choices?.[0]?.finish_reason != null ? { finishReason: json.choices[0].finish_reason } : {}),
   };
 }
 

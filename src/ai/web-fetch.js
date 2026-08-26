@@ -2,10 +2,10 @@
 
 const http = require('http');
 const https = require('https');
-const dns = require('dns');
 const zlib = require('zlib');
 const { URL } = require('url');
-const { checkUrl, isBlockedIp } = require('./url-guard');
+const { checkUrl } = require('./url-guard');
+const { makeSafeLookup } = require('./network-security');
 const { extractFromHtml } = require('./html-extract');
 
 const MAX_REDIRECTS = 5;
@@ -28,34 +28,6 @@ function makeTimeoutError() {
   const error = new Error('TIMEOUT');
   error.code = 'TIMEOUT';
   return error;
-}
-
-/**
- * Wrap dns.lookup so every answer is checked before the socket is opened.
- * The callback keeps Node's lookup(host, opts, cb) contract by returning one
- * already-validated address, while checking all answers for rebinding.
- */
-function makeSafeLookup(dnsLookupImpl) {
-  const impl = dnsLookupImpl || ((hostname, _opts, cb) => {
-    dns.lookup(hostname, { all: true }, cb);
-  });
-
-  return function safeLookup(hostname, opts, cb) {
-    const done = typeof opts === 'function' ? opts : cb;
-    const wantsAll = typeof opts === 'object' && opts?.all === true;
-    impl(hostname, { all: true }, (err, addresses) => {
-      if (err) return done(err);
-      const list = Array.isArray(addresses) ? addresses : [addresses];
-      if (!list.length) return done(new Error(`域名 ${hostname} 无解析结果`));
-      const bad = list.find((entry) => isBlockedIp(entry?.address));
-      if (bad) {
-        return done(new Error(`域名 ${hostname} 解析到内网/保留地址 ${bad.address}，已拒绝`));
-      }
-      if (wantsAll) return done(null, list);
-      const first = list[0];
-      return done(null, first.address, first.family);
-    });
-  };
 }
 
 /** Stream a response and stop reading once the compressed payload limit is hit. */

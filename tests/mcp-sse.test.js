@@ -228,6 +228,59 @@ describe('createMcpSseClient', () => {
     const initCall = calls.find((x) => x.msg && x.msg.method === 'initialize');
     assert.equal(initCall.headers.Authorization, 'Bearer t');
   });
+
+  it('dispatches inbound roots requests received on the SSE stream', async () => {
+    let streamListener = null;
+    const inboundResponses = [];
+    const { requestFn } = makeRequestFn();
+    const wrappedRequest = async (url, opts) => {
+      const msg = opts.body ? JSON.parse(opts.body) : null;
+      if (msg?.method === 'tools/list') {
+        setImmediate(() => streamListener?.({ jsonrpc: '2.0', id: 88, method: 'roots/list', params: {} }));
+      }
+      if (msg?.method === undefined && msg?.id === 88) inboundResponses.push(msg);
+      return requestFn(url, opts);
+    };
+    const openSseFn = async () => ({
+      bodyText: 'event: endpoint\ndata: https://example.com/message\n\n',
+      onMessage: (listener) => { streamListener = listener; return () => { streamListener = null; }; },
+      close() {},
+    });
+    const c = createMcpSseClient({
+      url: 'https://example.com/sse',
+      openSseFn,
+      requestFn: wrappedRequest,
+      rootsProvider: () => ({ roots: [{ name: 'project', uri: 'file:///project' }] }),
+    });
+    await c.start();
+    await c.listTools();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(inboundResponses[0].result.roots, [{ name: 'project', uri: 'file:///project' }]);
+    await c.close();
+  });
+
+  it('reports a remote stream close but not an intentional client close', async () => {
+    let closeListener = null;
+    let transportErrors = 0;
+    const { requestFn } = makeRequestFn();
+    const openSseFn = async () => ({
+      bodyText: 'event: endpoint\ndata: https://example.com/message\n\n',
+      onClose: (listener) => { closeListener = listener; return () => { if (closeListener === listener) closeListener = null; }; },
+      close() {},
+    });
+    const c = createMcpSseClient({
+      url: 'https://example.com/sse',
+      openSseFn,
+      requestFn,
+      onTransportError: () => { transportErrors += 1; },
+    });
+    await c.start();
+    closeListener();
+    assert.equal(transportErrors, 1);
+    await c.reconnect('MCP_SSE_CLOSED');
+    await c.close();
+    assert.equal(transportErrors, 1);
+  });
 });
 
 describe('createMcpClient factory sse', () => {

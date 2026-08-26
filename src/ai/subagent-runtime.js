@@ -227,6 +227,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
   function childExtensions(parentExt) {
     const childExt = { ...(parentExt || {}) };
     delete childExt.mcpHub;
+    delete childExt.mcpOAuthManager;
     delete childExt.subagentRuntime;
     delete childExt.worktreeManager;
     return childExt;

@@ -6,7 +6,7 @@ const { AGENT_EVENTS } = require('../agent-events');
 /**
  * MCP ToolProvider: starts hub on run, exposes mcp_* tools, always stops on end.
  */
-function createMcpProvider() {
+function createMcpProvider(options = {}) {
   return {
     id: 'mcp',
     isEnabled(ctx) {
@@ -18,14 +18,23 @@ function createMcpProvider() {
     },
     async onRunStart(ctx) {
       if (!ctx.extensions) ctx.extensions = {};
-      const hub = createMcpHub();
+      const hub = createMcpHub({
+        sessionManager: options.sessionManager || ctx.extensions.mcpSessionManager,
+        enableSessionRecoveryManager: true,
+        onSessionStatus: (status) => ctx.onEvent?.({ type: AGENT_EVENTS.MCP_STATUS, ...status }),
+      });
       ctx.extensions.mcpHub = hub;
       await hub.startAll(ctx.settings.mcpServers, {
         cwd: ctx.project?.path,
         signal: ctx.signal,
+        oauthManager: options.oauthManager || ctx.extensions.mcpOAuthManager,
+        project: ctx.project,
         onStatus: (st) => {
           ctx.onEvent?.({ type: AGENT_EVENTS.MCP_STATUS, ...st });
         },
+        samplingEnabled: ctx.settings?.mode === 'api',
+        samplingHandler: (server, params, signal) => ctx.extensions?.mcpSampling?.(server, params, ctx, signal),
+        onRootsChanged: (server) => ctx.onEvent?.({ type: AGENT_EVENTS.MCP_STATUS, server, ok: true, rootsChanged: true }),
       });
     },
     getTools(ctx) {

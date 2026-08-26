@@ -23,20 +23,34 @@ const STATES = new Set([
   'apply_uncertain',
   'applied_cleanup_pending',
   'discarded_cleanup_pending',
+  'pr_preparing',
+  'pr_committing',
+  'pr_pushing',
+  'pr_creating',
+  'pr_failed',
+  'pr_cleanup_pending',
+  'pr_created',
 ]);
 
 const TRANSITIONS = Object.freeze({
   creating: new Set(['running', 'collect_failed']),
   running: new Set(['collecting', 'collect_failed', 'discarded_cleanup_pending']),
   collecting: new Set(['ready', 'collect_failed', 'oversize', 'discarded_cleanup_pending']),
-  ready: new Set(['applying', 'discarded_cleanup_pending', 'conflict']),
+  ready: new Set(['applying', 'discarded_cleanup_pending', 'conflict', 'pr_preparing']),
   collect_failed: new Set(['collecting', 'discarded_cleanup_pending']),
   oversize: new Set(['discarded_cleanup_pending']),
-  conflict: new Set(['applying', 'discarded_cleanup_pending']),
+  conflict: new Set(['applying', 'discarded_cleanup_pending', 'pr_preparing']),
   applying: new Set(['ready', 'conflict', 'apply_uncertain', 'applied_cleanup_pending']),
   apply_uncertain: new Set(),
   applied_cleanup_pending: new Set(),
   discarded_cleanup_pending: new Set(),
+  pr_preparing: new Set(['pr_committing', 'pr_pushing', 'pr_creating', 'pr_failed', 'discarded_cleanup_pending']),
+  pr_committing: new Set(['pr_pushing', 'pr_failed']),
+  pr_pushing: new Set(['pr_creating', 'pr_failed']),
+  pr_creating: new Set(['pr_created', 'pr_failed', 'pr_cleanup_pending']),
+  pr_failed: new Set(['pr_preparing', 'discarded_cleanup_pending']),
+  pr_cleanup_pending: new Set(['pr_created']),
+  pr_created: new Set(),
 });
 
 function text(value, max = ERROR_MAX) {
@@ -95,6 +109,26 @@ function normalizeStats(raw, files) {
   };
 }
 
+function normalizePrChecks(raw) {
+  const input = raw && typeof raw === 'object' ? raw : {};
+  const finite = (value) => Number.isFinite(Number(value))
+    ? Math.min(200, Math.max(0, Math.floor(Number(value)))) : 0;
+  const total = finite(input.total);
+  const passed = finite(input.passed);
+  const pending = finite(input.pending);
+  const failed = finite(input.failed);
+  const skipped = finite(input.skipped);
+  const unknown = finite(input.unknown);
+  return {
+    total,
+    passed: Math.min(passed, total),
+    pending: Math.min(pending, total),
+    failed: Math.min(failed, total),
+    skipped: Math.min(skipped, total),
+    unknown: Math.min(unknown, total),
+  };
+}
+
 function normalizeMarker(raw, { now = Date.now() } = {}) {
   if (!raw || typeof raw !== 'object') return null;
   if (Number(raw.version) !== MARKER_VERSION || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
@@ -130,6 +164,27 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
   if (patchSha256 && !isSha256(patchSha256)) return null;
   if (expectedTree && !isSha1(expectedTree)) return null;
 
+  const rawPr = raw.pr && typeof raw.pr === 'object' ? raw.pr : {};
+  const pr = {
+    host: text(rawPr.host, 255),
+    owner: text(rawPr.owner, 255),
+    repo: text(rawPr.repo, 255),
+    base: text(rawPr.base, 255),
+    head: text(rawPr.head, 255),
+    commit: isSha1(rawPr.commit) ? String(rawPr.commit).toLowerCase() : '',
+    url: text(rawPr.url, 2000),
+    number: Number.isInteger(Number(rawPr.number)) && Number(rawPr.number) > 0 ? Number(rawPr.number) : 0,
+    draft: rawPr.draft !== false,
+    title: text(rawPr.title, 300),
+    pushed: rawPr.pushed === true,
+    state: ['OPEN', 'CLOSED', 'MERGED'].includes(String(rawPr.state || '').toUpperCase()) ? String(rawPr.state).toUpperCase() : '',
+    headSha: isSha1(rawPr.headSha) ? String(rawPr.headSha).toLowerCase() : '',
+    mergeable: text(rawPr.mergeable, 40).toUpperCase(),
+    mergeStateStatus: text(rawPr.mergeStateStatus, 60).toUpperCase(),
+    updatedAt: text(rawPr.updatedAt, 80),
+    checksSummary: normalizePrChecks(rawPr.checksSummary),
+  };
+
   return {
     version: MARKER_VERSION,
     id: String(raw.id),
@@ -154,6 +209,7 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     stats: normalizeStats(raw.stats, files),
     errorCode: raw.errorCode ? text(raw.errorCode, 80) : null,
     error: raw.error ? text(raw.error, ERROR_MAX) : null,
+    pr,
     ...(Number.isFinite(Number(now)) ? {} : {}),
   };
 }
@@ -194,21 +250,25 @@ function transitionMarker(marker, state, patch = {}, { now = Date.now() } = {}) 
 
 function isUnresolved(marker) {
   const value = typeof marker === 'string' ? marker : marker?.state;
-  return value !== 'applied_cleanup_pending' && value !== 'discarded_cleanup_pending';
+  return !['applied_cleanup_pending', 'discarded_cleanup_pending', 'pr_created'].includes(value);
 }
 
 function capabilityFor(marker) {
   const state = typeof marker === 'string' ? marker : marker?.state;
   const discardable = new Set([
-    'running', 'collecting', 'ready', 'collect_failed', 'oversize', 'conflict',
+    'running', 'collecting', 'ready', 'collect_failed', 'oversize', 'conflict', 'pr_failed',
   ]);
   return {
     canApply: state === 'ready' || state === 'conflict',
     canDiscard: discardable.has(state),
     canRetryCollect: state === 'collect_failed',
     canCleanup: state === 'applied_cleanup_pending' || state === 'discarded_cleanup_pending',
-    canOpen: STATES.has(state) && state !== 'creating',
+    canOpen: STATES.has(state) && !['creating', 'pr_created', 'pr_cleanup_pending'].includes(state),
     canPreview: state === 'ready' || state === 'conflict' || state === 'applied_cleanup_pending',
+    canCreatePr: state === 'ready' || state === 'conflict' || state === 'pr_failed',
+    canRetryPr: state === 'pr_failed',
+    canCleanupPr: state === 'pr_cleanup_pending',
+    canOpenPr: (state === 'pr_created' || state === 'pr_cleanup_pending') && Boolean(marker?.pr?.url),
   };
 }
 
@@ -230,6 +290,7 @@ function publicSummary(raw) {
     stats: marker.stats,
     errorCode: marker.errorCode,
     error: marker.error,
+    pr: marker.pr,
     ...capabilityFor(marker),
   };
 }

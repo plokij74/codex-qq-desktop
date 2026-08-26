@@ -50,4 +50,27 @@ describe('D5 renderer result state', () => {
     assert.equal(out.find((item) => item.projectId === 'p1').state, 'ready');
     assert.equal(out.find((item) => item.projectId === 'p2').id, 'wt_other1');
   });
+
+  it('keeps bounded PR drafts across authoritative disk reconciliation', () => {
+    const local = result({ prDraftTitle: 'Editable title', prDraftBody: 'Private draft body' });
+    const incoming = result({ state: 'pr_failed', updatedAt: 20, canApply: false, canCreatePr: true, canRetryPr: true });
+    const out = state.replaceAuthoritative([local], [incoming], 'p1');
+    assert.equal(out[0].state, 'pr_failed');
+    assert.equal(out[0].prDraftTitle, 'Editable title');
+    assert.equal(out[0].prDraftBody, 'Private draft body');
+  });
+
+  it('keeps only the D7 PR status summary in session state', () => {
+    const item = state.normalizeOne(result({
+      pr: {
+        host: 'github.com', owner: 'acme', repo: 'widget', number: 7,
+        url: 'https://github.com/acme/widget/pull/7', state: 'MERGED', headSha: 'd'.repeat(40),
+        checksSummary: { total: 1, passed: 1 }, body: 'private', comments: [{ body: 'private' }],
+      },
+    }));
+    assert.equal(item.pr.state, 'MERGED');
+    assert.equal(item.pr.checksSummary.passed, 1);
+    assert.equal('body' in item.pr, false);
+    assert.equal('comments' in item.pr, false);
+  });
 });

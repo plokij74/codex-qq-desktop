@@ -169,7 +169,10 @@ function loadSettings(userDataPath) {
     const parsed = JSON.parse(raw);
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
     merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
-    merged.mcpServers = sanitizeMcpServers(merged.mcpServers);
+    // Paths are retained only from the settings file written by main. JSON
+    // imports are sanitized before they reach this loader and cannot grant a
+    // new root without a picker-issued token.
+    merged.mcpServers = sanitizeMcpServers(merged.mcpServers, { allowRootPaths: true });
     clampCompactSettings(merged);
     clampMemorySettings(merged);
     clampWebSettings(merged);
@@ -182,7 +185,7 @@ function loadSettings(userDataPath) {
 function saveSettings(userDataPath, partial) {
   const next = { ...loadSettings(userDataPath), ...partial };
   next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
-  next.mcpServers = sanitizeMcpServers(next.mcpServers);
+  next.mcpServers = sanitizeMcpServers(next.mcpServers, { allowRootPaths: true });
   clampCompactSettings(next);
   clampMemorySettings(next);
   clampWebSettings(next);

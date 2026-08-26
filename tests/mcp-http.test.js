@@ -235,6 +235,71 @@ describe('createMcpHttpClient', () => {
     const initCall = calls.find((x) => x.msg && x.msg.method === 'initialize');
     assert.equal(initCall.headers.Authorization, 'Bearer t');
   });
+
+  it('persists the MCP session header across reconnect and clears it only on expiry', async () => {
+    const calls = [];
+    let sessionNumber = 1;
+    const requestFn = async (_url, opts) => {
+      const msg = JSON.parse(opts.body);
+      calls.push({ msg, headers: { ...opts.headers } });
+      let body = '';
+      if (msg.method === 'initialize') {
+        body = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { capabilities: {} } });
+      } else if (msg.method === 'notifications/initialized') {
+        return { status: 202, headers: { 'Mcp-Session-Id': `session-${sessionNumber}` }, bodyText: '' };
+      } else {
+        body = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } });
+      }
+      return { status: 200, headers: { 'mcp-session-id': `session-${sessionNumber}` }, bodyText: body };
+    };
+    const c = createMcpHttpClient({ url: 'https://example.com/mcp', requestFn });
+    await c.start();
+    await c.listTools();
+    await c.reconnect('transport-error');
+    await c.listTools();
+    const reconnectInit = calls.filter((call) => call.msg.method === 'initialize')[1];
+    assert.equal(reconnectInit.headers['Mcp-Session-Id'], 'session-1');
+    sessionNumber = 2;
+    await c.reconnect('MCP_SESSION_EXPIRED');
+    const expiredInit = calls.filter((call) => call.msg.method === 'initialize')[2];
+    assert.equal(expiredInit.headers['Mcp-Session-Id'], undefined);
+    await c.close();
+  });
+
+  it('dispatches inbound roots requests from a bounded HTTP response', async () => {
+    const inboundResponses = [];
+    const requestFn = async (_url, opts) => {
+      const msg = JSON.parse(opts.body);
+      if (msg.method === 'initialize') {
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          bodyText: JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { capabilities: {} } }),
+        };
+      }
+      if (msg.method === 'tools/list') {
+        const request = { jsonrpc: '2.0', id: 77, method: 'roots/list', params: {} };
+        const response = { jsonrpc: '2.0', id: msg.id, result: { tools: [] } };
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          bodyText: JSON.stringify([request, response]),
+        };
+      }
+      if (msg.method === undefined && msg.id === 77) inboundResponses.push(msg);
+      return { status: 202, headers: {}, bodyText: '' };
+    };
+    const c = createMcpHttpClient({
+      url: 'https://example.com/mcp',
+      requestFn,
+      rootsProvider: () => ({ roots: [{ name: 'project', uri: 'file:///project' }] }),
+    });
+    await c.start();
+    await c.listTools();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(inboundResponses[0].result.roots, [{ name: 'project', uri: 'file:///project' }]);
+    await c.close();
+  });
 });
 
 describe('createMcpClient factory http', () => {

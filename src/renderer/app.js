@@ -28,11 +28,6 @@ const SITES = [
   { id: 's2', name: 'haiker-staging', url: 'https://staging.haiker.example.com', status: 'degraded' },
   { id: 's3', name: 'docs', url: 'https://docs.example.com', status: 'healthy' },
 ];
-const PRS = [
-  { id: 128, title: 'fix: d1 migration history backfill', repo: 'haiker', status: 'open', author: 'you' },
-  { id: 126, title: 'feat: push delivery dedup', repo: 'haiker', status: 'review', author: 'Randy Lu' },
-  { id: 119, title: 'chore: bump wrangler', repo: 'infra', status: 'merged', author: 'bot' },
-];
 const SCHEDULED = [
   { id: 't1', title: '每晚 02:00 备份 D1', when: '每天 02:00', status: 'active' },
   { id: 't2', title: '周一汇总 KV 成本报告', when: '每周一 09:00', status: 'active' },
@@ -49,11 +44,18 @@ const worktreeBindings = new Map();
 const worktreePreviews = new Map();
 const worktreeActionBusy = new Set();
 const worktreeReconcileSeq = new Map();
+const worktreePrEditors = new Set();
+const pullRequestView = {
+  projectId: '', filter: 'open', repo: null, prs: [], truncated: false,
+  selectedNumber: 0, resultId: '', detail: null, loading: false, busy: false,
+  error: '', seq: 0, detailSeq: 0,
+};
 let activeSessionId = '';
 let currentView = 'chat';
 let sending = false;
 let currencySymbol = '$';
 let usageDisplayEnabled = true;
+let appDialogState = null;
 /** Seeds agentMode for newly created sessions (from settings.defaultAgentMode). */
 let defaultAgentModeSeed = 'agent';
 
@@ -944,13 +946,13 @@ async function acceptSelectedMemoryCandidates() {
   }
 }
 
-function rejectSelectedMemoryCandidates() {
+async function rejectSelectedMemoryCandidates() {
   const session = candidateSession();
   if (!session || memoryCandidateBusy) return;
   const ids = ensureSessionCandidateState(session)
     .filter((candidate) => memoryCandidateSelected.has(candidate.id))
     .map((candidate) => candidate.id);
-  if (!ids.length || !confirm('确定拒绝所选记忆候选？')) return;
+  if (!ids.length || !(await appConfirm('确定拒绝所选记忆候选？'))) return;
   session.pendingMemoryCandidates = window.MemoryCandidateState.removePendingCandidates(
     session.pendingMemoryCandidates,
     ids
@@ -980,6 +982,80 @@ function toast(msg, ms = 2400) {
   const el = document.getElementById('toast');
   el.textContent = msg; el.classList.remove('hidden');
   clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.add('hidden'), ms);
+}
+function resolveAppDialog(value) {
+  const current = appDialogState;
+  if (!current) return;
+  appDialogState = null;
+  current.modal.classList.add('hidden');
+  current.resolve(value);
+}
+function showAppDialog({ kind = 'alert', title = '', message = '', value = '', placeholder = '' } = {}) {
+  const modal = document.getElementById('app-dialog');
+  const titleEl = document.getElementById('app-dialog-title');
+  const messageEl = document.getElementById('app-dialog-message');
+  const inputWrap = document.getElementById('app-dialog-input-wrap');
+  const input = document.getElementById('app-dialog-input');
+  const cancel = document.getElementById('app-dialog-cancel');
+  const ok = document.getElementById('app-dialog-ok');
+  if (!modal || !titleEl || !messageEl || !inputWrap || !input || !cancel || !ok) {
+    return Promise.resolve(kind === 'alert' ? true : null);
+  }
+  if (appDialogState) resolveAppDialog(null);
+  titleEl.textContent = title || (kind === 'alert' ? '提示' : kind === 'prompt' ? '输入' : '确认');
+  messageEl.textContent = String(message || '');
+  inputWrap.classList.toggle('hidden', kind !== 'prompt');
+  input.value = String(value ?? '');
+  input.placeholder = String(placeholder || '');
+  cancel.classList.toggle('hidden', kind === 'alert');
+  ok.textContent = kind === 'alert' ? '知道了' : '确定';
+  modal.classList.remove('hidden');
+  return new Promise((resolve) => {
+    appDialogState = { kind, modal, input, resolve };
+    requestAnimationFrame(() => {
+      if (kind === 'prompt') {
+        input.focus();
+        input.select();
+      } else {
+        ok.focus();
+      }
+    });
+  });
+}
+function appAlert(message, title = '提示') {
+  return showAppDialog({ kind: 'alert', title, message });
+}
+function appConfirm(message, title = '确认操作') {
+  return showAppDialog({ kind: 'confirm', title, message }).then((value) => value === true);
+}
+function appPrompt(message, value = '', title = '重命名') {
+  return showAppDialog({ kind: 'prompt', title, message, value }).then((result) => (
+    result == null ? null : String(result)
+  ));
+}
+function bindAppDialog() {
+  const modal = document.getElementById('app-dialog');
+  if (!modal) return;
+  document.getElementById('app-dialog-cancel')?.addEventListener('click', () => resolveAppDialog(null));
+  document.getElementById('app-dialog-ok')?.addEventListener('click', () => {
+    const current = appDialogState;
+    resolveAppDialog(current?.kind === 'prompt' ? current.input.value : true);
+  });
+  modal.addEventListener('click', (event) => {
+    if (event.target !== modal) return;
+    resolveAppDialog(appDialogState?.kind === 'alert' ? true : null);
+  });
+  document.getElementById('app-dialog-input')?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    const current = appDialogState;
+    resolveAppDialog(current?.input.value || '');
+  });
+  document.addEventListener('keydown', (event) => {
+    if (!appDialogState || event.key !== 'Escape') return;
+    event.preventDefault();
+    resolveAppDialog(appDialogState.kind === 'alert' ? true : null);
+  });
 }
 function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -1042,7 +1118,36 @@ function worktreeStateLabel(state) {
     collect_failed: '收集失败', oversize: '补丁过大', conflict: '与主项目冲突', applying: '应用中',
     apply_uncertain: '应用状态不确定', applied_cleanup_pending: '已应用，待清理',
     discarded_cleanup_pending: '已丢弃，待清理',
+    pr_preparing: '检查 GitHub', pr_committing: '创建提交', pr_pushing: '推送分支',
+    pr_creating: '创建 Draft PR', pr_failed: 'PR 创建失败',
+    pr_cleanup_pending: 'PR 已创建，待清理', pr_created: 'Draft PR 已创建',
   })[state] || state;
+}
+
+function defaultWorktreePrTitle(ref) {
+  const goal = String(ref?.goal || '').trim().split(/\r?\n/)[0].slice(0, 280);
+  return goal || `codex: ${String(ref?.id || 'isolated change')}`;
+}
+
+function defaultWorktreePrBody(ref) {
+  const stats = ref?.stats || {};
+  const head = ref?.baseHead ? ref.baseHead.slice(0, 12) : '-';
+  return [
+    '## Summary',
+    '',
+    String(ref?.goal || 'Codex isolated change').slice(0, 2000),
+    '',
+    '## Change summary',
+    '',
+    `- Files: ${Number(stats.files) || 0}`,
+    `- Additions: ${Number(stats.additions) || 0}`,
+    `- Deletions: ${Number(stats.deletions) || 0}`,
+    `- Base: ${head}`,
+    '',
+    '## Verification',
+    '',
+    '- Not run automatically.',
+  ].join('\n');
 }
 
 function updateWorktreeRef(session, ref) {
@@ -1061,7 +1166,17 @@ async function worktreeAction(session, ref, action) {
     if (project) reconcileWorktreeResults(project);
     return;
   }
-  if (action === 'discard' && !confirm('确定丢弃这批隔离改动？主项目不会被修改。')) return;
+  if (action === 'managePr') {
+    openPullRequestManager(ref);
+    return;
+  }
+  if (action === 'discard') {
+    const remoteNote = ref.pr?.pushed ? '已推送的远端分支不会删除。' : '';
+    if (!(await appConfirm(`确定丢弃这批隔离改动？主项目不会被修改。${remoteNote}`))) return;
+  }
+  const card = document.querySelector(`.worktree-result-card[data-result-id="${ref.id}"]`);
+  const prTitle = card?.querySelector('.worktree-pr-title')?.value || ref.prDraftTitle || defaultWorktreePrTitle(ref);
+  const prBody = card?.querySelector('.worktree-pr-body')?.value || ref.prDraftBody || defaultWorktreePrBody(ref);
   worktreeActionBusy.add(ref.id);
   renderMessages();
   try {
@@ -1071,6 +1186,29 @@ async function worktreeAction(session, ref, action) {
       if (response?.ok) worktreePreviews.set(ref.id, response.preview || '(没有文本 diff)');
     } else if (action === 'open') {
       response = await window.codex.openWorktreeResult({ projectBindingId: token, resultId: ref.id });
+    } else if (action === 'prForm') {
+      response = await window.codex.preflightWorktreePr({ projectBindingId: token, resultId: ref.id });
+      if (response?.ok) {
+        worktreePrEditors.add(ref.id);
+        updateWorktreeRef(session, {
+          ...ref,
+          prDraftTitle: ref.prDraftTitle || defaultWorktreePrTitle(ref),
+          prDraftBody: ref.prDraftBody || defaultWorktreePrBody(ref),
+        });
+      }
+    } else if (action === 'createPr') {
+      const method = ref.canRetryPr ? window.codex.retryWorktreePr : window.codex.createWorktreePr;
+      response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true });
+      if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId, prDraftTitle: prTitle, prDraftBody: prBody });
+      if (response?.ok && response.created) worktreePrEditors.delete(ref.id);
+    } else if (action === 'cleanupPr') {
+      response = await window.codex.cleanupWorktreePr({ projectBindingId: token, resultId: ref.id });
+      if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
+    } else if (action === 'openPr') {
+      response = await window.codex.openWorktreePr({ projectBindingId: token, resultId: ref.id });
+    } else if (action === 'refreshPr') {
+      response = await window.codex.getPullRequest({ projectBindingId: token, resultId: ref.id });
+      if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
     } else if (action === 'apply') {
       response = await window.codex.applyWorktreeResult({ projectBindingId: token, resultId: ref.id });
       if (response?.ok && response.applied && !response.cleanupWarning) {
@@ -1106,6 +1244,12 @@ async function worktreeAction(session, ref, action) {
       return;
     } else if (action === 'open') {
       toast('已打开隔离目录');
+    } else if (action === 'openPr') {
+      toast('已在浏览器打开 PR');
+    } else if (action === 'refreshPr') {
+      toast('PR 状态已刷新');
+    } else if (action === 'createPr' && response.created) {
+      toast(response.cleanupWarning ? 'Draft PR 已创建，本地清理待重试' : 'Draft PR 已创建');
     } else if (action === 'apply') {
       toast(response.cleanupWarning ? '已应用，清理待重试' : '隔离改动已应用到主项目');
     }
@@ -1128,7 +1272,7 @@ function renderWorktreeCards(root, session) {
     const head = ref.baseHead ? ref.baseHead.slice(0, 8) : '-';
     const title = document.createElement('div');
     title.className = 'worktree-result-title';
-    title.textContent = `隔离改动待审 · ${worktreeStateLabel(ref.state)}`;
+    title.textContent = `${String(ref.state).startsWith('pr_') ? 'GitHub PR' : '隔离改动待审'} · ${worktreeStateLabel(ref.state)}`;
     const goal = document.createElement('div');
     goal.className = 'worktree-result-goal';
     goal.textContent = ref.goal || '未命名子任务';
@@ -1136,6 +1280,17 @@ function renderWorktreeCards(root, session) {
     summary.className = 'worktree-result-summary';
     summary.textContent = `${fileCount} 个文件 · +${stats.additions || 0}/-${stats.deletions || 0}${stats.binaryFiles ? ` · 二进制 ${stats.binaryFiles}` : ''} · 基线 ${head}`;
     card.append(title, goal, summary);
+
+    if (ref.pr?.url) {
+      const prSummary = document.createElement('div');
+      prSummary.className = 'worktree-pr-summary';
+      const repo = [ref.pr.host, ref.pr.owner, ref.pr.repo].filter(Boolean).join('/');
+      const remoteState = ref.pr.state ? ` · ${pullRequestStatus({ state: ref.pr.state, isDraft: ref.pr.draft })}` : '';
+      const checks = ref.pr.checksSummary || {};
+      const checkState = checks.total ? ` · checks ${checks.passed || 0}/${checks.total}` : '';
+      prSummary.textContent = `${ref.pr.draft ? 'Draft PR' : 'PR'}${ref.pr.number ? ` #${ref.pr.number}` : ''} · ${repo || 'GitHub'} · ${ref.pr.head || ''}${ref.pr.commit ? ` · ${ref.pr.commit.slice(0, 8)}` : ''}${remoteState}${checkState}`;
+      card.appendChild(prSummary);
+    }
 
     if (ref.incomplete) {
       const note = document.createElement('div'); note.className = 'worktree-result-note'; note.textContent = '子 Agent 未完整结束，仍可审阅并应用或丢弃。'; card.appendChild(note);
@@ -1152,18 +1307,40 @@ function renderWorktreeCards(root, session) {
 
     const preview = worktreePreviews.get(ref.id);
     if (preview) { const pre = document.createElement('pre'); pre.className = 'worktree-result-preview'; pre.textContent = preview; card.appendChild(pre); }
-    const actions = document.createElement('div'); actions.className = 'worktree-result-actions';
+
     const busy = worktreeActionBusy.has(ref.id);
     const mutationBlocked = sending || anyTermRunning();
+    if (worktreePrEditors.has(ref.id) && ref.canCreatePr) {
+      const form = document.createElement('div'); form.className = 'worktree-pr-form';
+      const titleInput = document.createElement('input'); titleInput.type = 'text'; titleInput.maxLength = 300; titleInput.className = 'worktree-pr-title'; titleInput.value = ref.prDraftTitle || defaultWorktreePrTitle(ref); titleInput.setAttribute('aria-label', 'PR 标题');
+      const bodyInput = document.createElement('textarea'); bodyInput.maxLength = 10000; bodyInput.rows = 7; bodyInput.className = 'worktree-pr-body'; bodyInput.value = ref.prDraftBody || defaultWorktreePrBody(ref); bodyInput.setAttribute('aria-label', 'PR 正文');
+      const saveDraft = () => {
+        ref.prDraftTitle = titleInput.value.slice(0, 300);
+        ref.prDraftBody = bodyInput.value.slice(0, 10000);
+        updateWorktreeRef(session, ref);
+      };
+      titleInput.addEventListener('input', saveDraft); bodyInput.addEventListener('input', saveDraft);
+      const submit = document.createElement('button'); submit.type = 'button'; submit.className = 'btn-primary'; submit.textContent = ref.canRetryPr ? '重试创建 Draft PR' : '确认创建 Draft PR'; submit.disabled = busy || mutationBlocked;
+      submit.addEventListener('click', () => worktreeAction(session, ref, 'createPr'));
+      form.append(titleInput, bodyInput, submit); card.appendChild(form);
+    }
+    const actions = document.createElement('div'); actions.className = 'worktree-result-actions';
     const addButton = (label, action, enabled = true, primary = false, mutation = false) => {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.disabled = busy || !enabled || (mutation && mutationBlocked); if (primary) button.className = 'btn-primary'; else button.className = 'btn-secondary';
       button.addEventListener('click', () => worktreeAction(session, ref, action)); actions.appendChild(button);
     };
-    addButton(`应用全部（${fileCount} 个文件）`, 'apply', ref.canApply, true, true);
-    addButton('查看 diff', 'preview', ref.canPreview);
-    addButton('丢弃', 'discard', ref.canDiscard, false, true);
+    if (ref.canApply) addButton(`应用全部（${fileCount} 个文件）`, 'apply', true, true, true);
+    if (ref.canCreatePr) addButton(ref.canRetryPr ? '重试 PR' : '创建 Draft PR', 'prForm', true, false, true);
+    if (ref.canPreview) addButton('查看 diff', 'preview', true);
+    if (ref.canDiscard) addButton('丢弃', 'discard', true, false, true);
     if (ref.canRetryCollect) addButton('重试收集', 'retryCollect', true, false, true);
     if (ref.canCleanup) addButton('重试清理', 'cleanup', true, false, true);
+    if (ref.canCleanupPr) addButton('重试 PR 清理', 'cleanupPr', true, false, true);
+    if (ref.canOpenPr) {
+      addButton('管理 PR', 'managePr', true);
+      addButton('刷新 PR', 'refreshPr', true);
+      addButton('打开 PR', 'openPr', true);
+    }
     if (ref.canOpen) addButton('打开隔离目录', 'open', true);
     card.appendChild(actions);
     root.appendChild(card);
@@ -2005,23 +2182,23 @@ function renderLeftDynamic() {
   const nt = document.getElementById('btn-left-new-task');
   if (nt) nt.addEventListener('click', (e) => { e.stopPropagation(); openTaskModal(); });
 }
-function deleteSession(id) {
+async function deleteSession(id) {
   if (sessions.length <= 1) return toast('至少保留一个会话');
   const s = sessions.find((x) => x.id === id); if (!s) return;
   if (chatRun && !chatRun.finalized && chatRun.sessionId === id) {
     return toast('生成中无法删除该会话，请先停止');
   }
-  if (!confirm('确定删除「' + s.title + '」？')) return;
+  if (!(await appConfirm('确定删除「' + s.title + '」？'))) return;
   sessions = sessions.filter((x) => x.id !== id);
   if (activeSessionId === id) activeSessionId = sessions[0].id;
   saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); toast('已删除');
 }
-function deleteProject(id) {
+async function deleteProject(id) {
   const p = getProject(id); if (!p) return;
   const running = chatRun && !chatRun.finalized
     && sessions.some((session) => session.id === chatRun.sessionId && session.projectId === id);
   if (running) return toast('生成中无法删除该项目，请先停止');
-  if (!confirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）')) return;
+  if (!(await appConfirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）'))) return;
   const worktreeBindingId = worktreeBindings.get(id);
   if (worktreeBindingId) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
@@ -2033,9 +2210,9 @@ function deleteProject(id) {
   if (!sessions.some((s) => s.id === activeSessionId)) activeSessionId = sessions[0].id;
   saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); toast('项目已删除（磁盘文件未动）');
 }
-function renameProject(id) {
+async function renameProject(id) {
   const p = getProject(id); if (!p) return;
-  const name = prompt('项目名称', p.name); if (!name || !name.trim()) return;
+  const name = await appPrompt('请输入项目名称', p.name); if (!name || !name.trim()) return;
   p.name = name.trim();
   sessions.forEach((s) => { if (s.projectId === id && s.kind === 'project') s.title = p.name; });
   saveState(); renderLeftDynamic(); updateHeader(); toast('已重命名');
@@ -2282,6 +2459,269 @@ function createTaskFromModal() {
   sessions.unshift(session); activeSessionId = session.id; saveState(); closeTaskModal(); setView('chat'); updateAgentModeToggle(); toast('任务已创建');
   if (brief) document.getElementById('chat-input').value = brief;
 }
+
+function resetPullRequestView(project) {
+  if (pullRequestView.projectId === String(project?.id || '')) return;
+  pullRequestView.projectId = String(project?.id || '');
+  pullRequestView.repo = null;
+  pullRequestView.prs = [];
+  pullRequestView.truncated = false;
+  pullRequestView.selectedNumber = 0;
+  pullRequestView.resultId = '';
+  pullRequestView.detail = null;
+  pullRequestView.error = '';
+}
+
+function pullRequestStatus(pr) {
+  if (pr?.state === 'MERGED') return '已合并';
+  if (pr?.state === 'CLOSED') return '已关闭';
+  if (pr?.isDraft) return 'Draft';
+  return pr?.state === 'OPEN' ? 'Open' : '未知';
+}
+
+function pullRequestBadgeClass(pr) {
+  if (pr?.state === 'MERGED') return 'merged';
+  if (pr?.state === 'CLOSED') return 'closed';
+  return pr?.isDraft ? 'review' : 'open';
+}
+
+function strictMergeReady(pr) {
+  const checks = pr?.checksSummary || {};
+  return pr?.state === 'OPEN' && !pr?.isDraft && pr?.mergeable === 'MERGEABLE'
+    && Number(checks.total) > 0 && !checks.pending && !checks.failed && !checks.unknown
+    && Number(checks.passed || 0) + Number(checks.skipped || 0) === Number(checks.total);
+}
+
+function pullRequestReference() {
+  return pullRequestView.resultId
+    ? { resultId: pullRequestView.resultId }
+    : { number: pullRequestView.selectedNumber };
+}
+
+function renderPullRequestView() {
+  if (currentView !== 'prs') return;
+  const body = document.getElementById('work-body');
+  if (!body) return;
+  const project = sessionProject();
+  resetPullRequestView(project);
+  if (!project?.path) {
+    body.innerHTML = '<div class="pr-empty"><strong>需要绑定项目</strong><span>先打开一个已绑定真实目录的项目会话，再查看该项目 origin 的拉取请求。</span></div>';
+    return;
+  }
+  const repo = pullRequestView.repo;
+  const filterOptions = ['open', 'closed', 'merged', 'all'].map((value) => {
+    const label = ({ open: '打开', closed: '关闭', merged: '已合并', all: '全部' })[value];
+    return `<option value="${value}"${pullRequestView.filter === value ? ' selected' : ''}>${label}</option>`;
+  }).join('');
+  const repoName = repo?.nameWithOwner || `${repo?.owner || ''}/${repo?.repo || ''}`.replace(/^\/$/, '') || project.name;
+  const listHtml = pullRequestView.prs.map((pr) => `
+    <button type="button" class="pr-list-item${pr.number === pullRequestView.selectedNumber ? ' is-selected' : ''}" data-pr-number="${pr.number}">
+      <span class="pr-list-title">#${pr.number} ${escapeHtml(pr.title || '(无标题)')}</span>
+      <span class="pr-list-meta">${escapeHtml(pr.author || '未知作者')} · <span class="badge ${pullRequestBadgeClass(pr)}">${pullRequestStatus(pr)}</span></span>
+    </button>`).join('');
+  let detailHtml = '<div class="pr-detail-empty">选择一个 PR 查看详情</div>';
+  const pr = pullRequestView.detail;
+  if (pr) {
+    const checks = pr.checksSummary || {};
+    const checkText = checks.total
+      ? `${checks.passed || 0} 通过 · ${checks.skipped || 0} 跳过 · ${checks.pending || 0} 等待 · ${checks.failed || 0} 失败${checks.unknown ? ` · ${checks.unknown} 未知` : ''}`
+      : '没有可用 checks';
+    const checksHtml = pr.checks.length
+      ? pr.checks.map((item) => `<li><span>${escapeHtml(item.name)}</span><strong>${escapeHtml(item.bucket || item.state || 'UNKNOWN')}</strong></li>`).join('')
+      : '<li class="muted">没有 checks</li>';
+    const commentsHtml = pr.comments.length
+      ? pr.comments.map((item) => `<div class="pr-comment"><div class="pr-comment-meta">${escapeHtml(item.author || '未知用户')} · ${escapeHtml(item.createdAt || '')}</div><div class="pr-comment-body">${escapeHtml(item.body)}</div></div>`).join('')
+      : '<div class="muted">暂无评论</div>';
+    const filesHtml = pr.files.length
+      ? pr.files.map((item) => `<li><span>${escapeHtml(item.path)}</span><span>+${item.additions}/-${item.deletions}</span></li>`).join('')
+      : '<li class="muted">未返回文件摘要</li>';
+    const blocked = pullRequestView.busy || sending || anyTermRunning();
+    detailHtml = `
+      <div class="pr-detail-head">
+        <div><span class="badge ${pullRequestBadgeClass(pr)}">${pullRequestStatus(pr)}</span> <strong>#${pr.number}</strong> · ${escapeHtml(pr.author || '未知作者')}</div>
+        <button type="button" class="ghost-btn" data-pr-action="open">打开 GitHub</button>
+      </div>
+      <div class="pr-branches">${escapeHtml(pr.headRefName || '-')} → ${escapeHtml(pr.baseRefName || '-')} ${pr.headSha ? `· ${pr.headSha.slice(0, 8)}` : ''}</div>
+      <div class="pr-edit-form">
+        <label>标题<input class="pr-edit-title" maxlength="300" value="${escapeHtml(pr.title)}" ${blocked ? 'disabled' : ''}></label>
+        <label>正文<textarea class="pr-edit-body" maxlength="10000" rows="8" ${blocked ? 'disabled' : ''}>${escapeHtml(pr.body)}</textarea></label>
+        <button type="button" class="btn-secondary" data-pr-action="edit" ${blocked || pr.state === 'MERGED' ? 'disabled' : ''}>保存标题与正文</button>
+      </div>
+      <section class="pr-detail-section">
+        <h2>Checks</h2><div class="pr-check-summary">${escapeHtml(checkText)}</div><ul class="pr-check-list">${checksHtml}</ul>
+      </section>
+      <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
+      <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
+        <textarea class="pr-comment-input" rows="4" maxlength="10000" placeholder="发表评论" ${blocked ? 'disabled' : ''}></textarea>
+        <button type="button" class="btn-secondary" data-pr-action="comment" ${blocked ? 'disabled' : ''}>发布评论</button>
+      </section>
+      <div class="pr-lifecycle-actions">
+        ${pr.state === 'OPEN' && pr.isDraft ? `<button type="button" class="btn-secondary" data-pr-action="ready" ${blocked ? 'disabled' : ''}>转为 Ready</button>` : ''}
+        ${pr.state === 'OPEN' ? `<button type="button" class="btn-secondary" data-pr-action="close" ${blocked ? 'disabled' : ''}>关闭 PR</button>` : ''}
+        ${pr.state === 'CLOSED' ? `<button type="button" class="btn-secondary" data-pr-action="reopen" ${blocked ? 'disabled' : ''}>重新打开</button>` : ''}
+        ${pr.state === 'OPEN' && !pr.isDraft ? `<select class="pr-merge-method" ${blocked ? 'disabled' : ''}><option value="squash">Squash</option><option value="merge">Merge commit</option><option value="rebase">Rebase</option></select><button type="button" class="btn-primary" data-pr-action="merge" ${blocked || !strictMergeReady(pr) ? 'disabled' : ''}>合并 PR</button>` : ''}
+      </div>`;
+  }
+  body.innerHTML = `
+    <div class="pr-toolbar">
+      <div><strong>${escapeHtml(repoName)}</strong><span>${escapeHtml(repo?.host || '')}</span></div>
+      <label>状态 <select id="pr-state-filter">${filterOptions}</select></label>
+      <button type="button" class="ghost-btn" id="btn-pr-refresh" ${pullRequestView.loading ? 'disabled' : ''}>${pullRequestView.loading ? '刷新中…' : '刷新'}</button>
+    </div>
+    ${pullRequestView.error ? `<div class="pr-error">${escapeHtml(pullRequestView.error)}</div>` : ''}
+    <div class="pr-workspace">
+      <div class="pr-list">${listHtml || `<div class="pr-empty-small">${pullRequestView.loading ? '正在读取 GitHub…' : '没有匹配的 PR'}</div>`}${pullRequestView.truncated ? '<div class="pr-truncated">仅显示前 50 条</div>' : ''}</div>
+      <div class="pr-detail">${detailHtml}</div>
+    </div>`;
+  document.getElementById('pr-state-filter')?.addEventListener('change', (event) => {
+    pullRequestView.filter = event.target.value;
+    pullRequestView.selectedNumber = 0;
+    pullRequestView.resultId = '';
+    pullRequestView.detail = null;
+    loadPullRequests();
+  });
+  document.getElementById('btn-pr-refresh')?.addEventListener('click', async () => {
+    const number = pullRequestView.selectedNumber;
+    const resultId = pullRequestView.resultId;
+    await loadPullRequests({ keepDetail: true });
+    if (number) loadPullRequestDetail(number, { resultId });
+  });
+  body.querySelectorAll('[data-pr-number]').forEach((button) => button.addEventListener('click', () => {
+    pullRequestView.resultId = '';
+    loadPullRequestDetail(Number(button.dataset.prNumber));
+  }));
+  body.querySelectorAll('[data-pr-action]').forEach((button) => button.addEventListener('click', () => runPullRequestAction(button.dataset.prAction)));
+}
+
+async function loadPullRequests({ keepDetail = false } = {}) {
+  const project = sessionProject();
+  resetPullRequestView(project);
+  if (!project?.path || !window.codex?.listPullRequests) return renderPullRequestView();
+  const sequence = ++pullRequestView.seq;
+  pullRequestView.loading = true;
+  pullRequestView.error = '';
+  renderPullRequestView();
+  try {
+    const token = await bindWorktreeProject(project);
+    if (!token) throw new Error('项目绑定已失效');
+    const response = await window.codex.listPullRequests({ projectBindingId: token, state: pullRequestView.filter });
+    if (sequence !== pullRequestView.seq) return;
+    if (!response?.ok) throw new Error(response?.error || '无法读取 PR 列表');
+    pullRequestView.repo = response.repo || null;
+    pullRequestView.prs = window.PullRequestState?.normalizeList(response.prs) || [];
+    pullRequestView.truncated = response.truncated === true;
+    if (!keepDetail) {
+      pullRequestView.selectedNumber = 0;
+      pullRequestView.resultId = '';
+      pullRequestView.detail = null;
+    }
+  } catch (error) {
+    if (sequence === pullRequestView.seq) pullRequestView.error = error?.message || String(error);
+  } finally {
+    if (sequence === pullRequestView.seq) {
+      pullRequestView.loading = false;
+      renderPullRequestView();
+    }
+  }
+}
+
+async function loadPullRequestDetail(number, { resultId = '' } = {}) {
+  const project = sessionProject();
+  if (!project?.path || !window.codex?.getPullRequest) return;
+  const sequence = ++pullRequestView.detailSeq;
+  pullRequestView.selectedNumber = Number(number) || 0;
+  pullRequestView.resultId = String(resultId || '');
+  pullRequestView.detail = null;
+  pullRequestView.error = '';
+  renderPullRequestView();
+  try {
+    const token = await bindWorktreeProject(project);
+    if (!token) throw new Error('项目绑定已失效');
+    const reference = pullRequestView.resultId ? { resultId: pullRequestView.resultId } : { number: pullRequestView.selectedNumber };
+    const response = await window.codex.getPullRequest({ projectBindingId: token, ...reference });
+    if (sequence !== pullRequestView.detailSeq) return;
+    if (!response?.ok) throw new Error(response?.error || '无法读取 PR 详情');
+    pullRequestView.repo = response.repo || pullRequestView.repo;
+    pullRequestView.detail = window.PullRequestState?.normalize(response.pr, { detail: true }) || null;
+    pullRequestView.selectedNumber = pullRequestView.detail?.number || pullRequestView.selectedNumber;
+    if (response.result) attachWorktreeResult(response.result, project.id, response.result.sessionId);
+    if (response.checksError) pullRequestView.error = response.checksError;
+  } catch (error) {
+    if (sequence === pullRequestView.detailSeq) pullRequestView.error = error?.message || String(error);
+  } finally {
+    if (sequence === pullRequestView.detailSeq) renderPullRequestView();
+  }
+}
+
+async function runPullRequestAction(action) {
+  const project = sessionProject();
+  const pr = pullRequestView.detail;
+  if (!project?.path || !pr || pullRequestView.busy) return;
+  const token = await bindWorktreeProject(project);
+  if (!token) return toast('项目绑定已失效');
+  const reference = pullRequestReference();
+  let invoke;
+  let payload = { projectBindingId: token, ...reference };
+  let question = '';
+  if (action === 'open') {
+    const response = await window.codex.openWorktreePr(payload);
+    return toast(response?.ok ? '已在浏览器打开 PR' : (response?.error || '无法打开 PR'));
+  }
+  if (action === 'edit') {
+    payload.title = document.querySelector('.pr-edit-title')?.value || '';
+    payload.body = document.querySelector('.pr-edit-body')?.value || '';
+    question = `确定更新 PR #${pr.number} 的标题和正文？`;
+    invoke = window.codex.editPullRequest;
+  } else if (action === 'comment') {
+    payload.body = document.querySelector('.pr-comment-input')?.value || '';
+    if (!payload.body.trim()) return toast('评论不能为空');
+    question = `确定向 PR #${pr.number} 发布这条评论？`;
+    invoke = window.codex.commentPullRequest;
+  } else if (action === 'close') {
+    question = `确定关闭 PR #${pr.number}？远端分支不会删除。`;
+    invoke = window.codex.closePullRequest;
+  } else if (action === 'reopen') {
+    question = `确定重新打开 PR #${pr.number}？`;
+    invoke = window.codex.reopenPullRequest;
+  } else if (action === 'ready') {
+    question = `确定把 Draft PR #${pr.number} 转为 Ready？`;
+    invoke = window.codex.readyPullRequest;
+  } else if (action === 'merge') {
+    payload.method = document.querySelector('.pr-merge-method')?.value || 'squash';
+    question = `确定使用 ${payload.method.toUpperCase()} 合并 PR #${pr.number}？远端分支不会删除。`;
+    invoke = window.codex.mergePullRequest;
+  }
+  if (typeof invoke !== 'function' || !(await appConfirm(question))) return;
+  pullRequestView.busy = true;
+  pullRequestView.error = '';
+  renderPullRequestView();
+  try {
+    const response = await invoke(payload);
+    if (!response?.ok) throw new Error(response?.error || 'PR 操作失败');
+    pullRequestView.detail = window.PullRequestState?.normalize(response.pr, { detail: true }) || pullRequestView.detail;
+    if (response.result) attachWorktreeResult(response.result, project.id, response.result.sessionId);
+    const index = pullRequestView.prs.findIndex((item) => item.number === pullRequestView.detail?.number);
+    if (index >= 0 && pullRequestView.detail) pullRequestView.prs[index] = { ...pullRequestView.prs[index], ...pullRequestView.detail, body: '' };
+    toast(action === 'comment' ? '评论已发布' : action === 'merge' ? 'PR 已合并' : 'PR 已更新');
+  } catch (error) {
+    pullRequestView.error = error?.message || String(error);
+    toast(pullRequestView.error);
+  } finally {
+    pullRequestView.busy = false;
+    renderPullRequestView();
+  }
+}
+
+function openPullRequestManager(ref) {
+  const project = sessionProject();
+  if (!project?.path || !ref?.pr?.number) return toast('PR 信息不可用');
+  resetPullRequestView(project);
+  pullRequestView.selectedNumber = Number(ref.pr.number);
+  pullRequestView.resultId = String(ref.id || '');
+  setView('prs');
+  loadPullRequestDetail(ref.pr.number, { resultId: ref.id });
+}
+
 function showWorkView(view) {
   document.getElementById('view-chat').classList.add('hidden');
   document.getElementById('view-work').classList.remove('hidden');
@@ -2304,8 +2744,8 @@ function showWorkView(view) {
     body.querySelectorAll('[data-site-chat]').forEach((btn) => { const s = SITES.find((x) => x.id === btn.dataset.siteChat); btn.addEventListener('click', () => ensureTaskAndAsk('站点 ' + s.name, '站点 ' + s.name + '（' + s.url + '）状态 ' + s.status + '，给出巡检清单。')); });
   }
   if (view === 'prs') {
-    body.innerHTML = '<div class="card-list">' + PRS.map((pr) => '<div class="work-card"><div class="work-card-title">🔀 #' + pr.id + ' ' + escapeHtml(pr.title) + '</div><div class="work-card-meta">' + escapeHtml(pr.repo) + ' · ' + escapeHtml(pr.author) + ' · <span class="badge ' + pr.status + '">' + pr.status + '</span></div><div class="work-card-actions"><button type="button" class="ghost-btn" data-pr-review="' + pr.id + '">让 Codex 审查</button></div></div>').join('') + '</div>';
-    body.querySelectorAll('[data-pr-review]').forEach((btn) => { const pr = PRS.find((x) => String(x.id) === btn.dataset.prReview); btn.addEventListener('click', () => ensureTaskAndAsk('PR #' + pr.id, '请审查 PR #' + pr.id + '「' + pr.title + '」')); });
+    renderPullRequestView();
+    loadPullRequests({ keepDetail: Boolean(pullRequestView.selectedNumber) });
   }
   renderLeftDynamic();
 }
@@ -2566,17 +3006,55 @@ function buildOutgoingText(raw) {
   }
   return text;
 }
+function activeProjectPathForMcp() {
+  return sessionProject(activeSession())?.path || '';
+}
+function handleMcpPromptsListCommand(command) {
+  const parts = String(command || '').trim().split(/\s+/);
+  const server = parts.length > 1 ? parts[1] : '';
+  const target = activeSession();
+  if (!window.codex?.listMcpPrompts) { toast('MCP prompts API 不可用'); return true; }
+  window.codex.listMcpPrompts({ server }).then((result) => {
+    if (!target) return;
+    if (!result?.ok) { toast(result?.error || '读取 prompts 失败'); return; }
+    const lines = (result.prompts || []).map((prompt) => `- ${prompt.server}/${prompt.name}${prompt.description ? `：${prompt.description}` : ''}`);
+    target.messages.push({ role: 'assistant', content: lines.length ? `MCP prompts：\n${lines.join('\n')}` : '没有可用的 MCP prompts。' });
+    target.updatedAt = Date.now();
+    saveState();
+    if (target.id === activeSessionId) renderMessages();
+  }).catch((error) => toast(error?.message || String(error)));
+  return true;
+}
+function handleMcpPromptGetCommand(command) {
+  const text = String(command || '').trim();
+  const match = /^\/mcp-prompt\s+(\S+)\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(text);
+  if (!match) { toast('用法：/mcp-prompt <server> <name> [JSON arguments]'); return true; }
+  let args = {};
+  if (match[3]) {
+    try { args = JSON.parse(match[3]); } catch { toast('arguments 必须是 JSON 对象'); return true; }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) { toast('arguments 必须是 JSON 对象'); return true; }
+  }
+  if (!window.codex?.getMcpPrompt) { toast('MCP prompts API 不可用'); return true; }
+  window.codex.getMcpPrompt({ server: match[1], name: match[2], arguments: args }).then((result) => {
+    if (!result?.ok) { toast(result?.error || '读取 prompt 失败'); return; }
+    const input = document.getElementById('chat-input');
+    if (input) { input.value = result.text || ''; input.focus(); input.dispatchEvent(new Event('input', { bubbles: true })); }
+    toast('Prompt 已填入输入框，可编辑后发送');
+  }).catch((error) => toast(error?.message || String(error)));
+  return true;
+}
 function handleSlashCommand(text) {
   const cmd = text.trim(); const lower = cmd.toLowerCase();
   if (lower === '/help') {
     activeSession().messages.push({
       role: 'assistant',
-      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name> /compact /export md|json /remember /memory /forget\n'
+      content: '命令：/help /clear /mode /new 标题 /ls /skills /skill <name> /compact /export md|json /remember /memory /forget /mcp-prompts /mcp-prompt\n'
         + '/compact：把更早的消息压缩成一条摘要，保留最近若干条原文（生成中不可用）\n'
         + '/export md｜/export json：导出当前会话，路径在保存对话框里选\n'
         + '/fetch <url>：抓取网页正文进会话（需先开启网页访问）；/usage：查看 token 用量\n'
         + '/remember <事实>：记入长期记忆（绑定项目时进项目级，否则用户级）\n'
         + '/memory：列出长期记忆；/forget <id>：删除一条\n'
+        + '/mcp-prompts [server]：列出 MCP prompts；/mcp-prompt <server> <name> [JSON arguments]：填入输入框\n'
         + '任务/项目右键：置顶、删除、绑定目录\n项目对话可读写真实文件（需绑定）',
     });
     saveState(); renderMessages(); return true;
@@ -2853,11 +3331,39 @@ async function runExportOnSession(session, format) {
 }
 /** In-memory MCP server list for settings UI (list is source of truth). */
 let mcpServerDrafts = [];
+let mcpSavedFingerprint = '';
+const mcpOAuthStatuses = new Map();
+const mcpOAuthFlowIds = new Map();
+const mcpOAuthErrors = new Map();
 
 function normalizeMcpTransport(t) {
   const x = String(t || '').toLowerCase();
   if (x === 'sse' || x === 'http' || x === 'stdio') return x;
   return 'stdio';
+}
+
+function cloneMcpOAuth(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const key of [
+    'clientId',
+    'resource',
+    'authorizationServer',
+    'authorizationEndpoint',
+    'tokenEndpoint',
+    'registrationEndpoint',
+    'revocationEndpoint',
+  ]) {
+    const value = String(raw[key] || '').trim();
+    if (value) out[key] = value;
+  }
+  if (lower === '/mcp-prompts' || lower.startsWith('/mcp-prompts ')) return handleMcpPromptsListCommand(cmd);
+  if (lower === '/mcp-prompt' || lower.startsWith('/mcp-prompt ')) return handleMcpPromptGetCommand(cmd);
+  if (Array.isArray(raw.scopes)) {
+    const scopes = raw.scopes.map((value) => String(value || '').trim()).filter(Boolean);
+    if (scopes.length) out.scopes = [...new Set(scopes)].slice(0, 32);
+  }
+  return out;
 }
 
 function cloneMcpServer(s) {
@@ -2868,6 +3374,10 @@ function cloneMcpServer(s) {
     enabled: s?.enabled === false ? false : true,
     command: String(s?.command || ''),
     url: String(s?.url || ''),
+    sessionRecovery: s?.sessionRecovery === true,
+    sampling: { enabled: s?.sampling?.enabled === true },
+    roots: Array.isArray(s?.roots) ? s.roots.map((root) => ({ rootId: String(root?.rootId || ''), label: String(root?.label || '') })).filter((root) => root.rootId && root.label) : [],
+    session: s?.session && typeof s.session === 'object' ? { state: String(s.session.state || 'disabled'), reusable: s.session.reusable === true, lastErrorCode: s.session.lastErrorCode ? String(s.session.lastErrorCode) : null } : undefined,
   };
   if (Array.isArray(s?.args)) out.args = s.args.map(String);
   if (s?.env && typeof s.env === 'object' && !Array.isArray(s.env)) out.env = { ...s.env };
@@ -2877,6 +3387,11 @@ function cloneMcpServer(s) {
   }
   if (s?.timeoutMs != null && Number.isFinite(Number(s.timeoutMs))) {
     out.timeoutMs = Number(s.timeoutMs);
+  }
+  if (transport !== 'stdio') {
+    out.allowPrivate = s?.allowPrivate === true;
+    out.auth = s?.auth === 'oauth' ? 'oauth' : 'none';
+    if (out.auth === 'oauth') out.oauth = cloneMcpOAuth(s?.oauth);
   }
   return out;
 }
@@ -2888,6 +3403,9 @@ function serializeMcpServerList() {
       name: String(s.name || '').trim(),
       transport,
       enabled: s.enabled !== false,
+      sessionRecovery: s.sessionRecovery === true,
+      sampling: { enabled: s.sampling?.enabled === true },
+      roots: Array.isArray(s.roots) ? s.roots.map((root) => ({ rootId: String(root?.rootId || ''), label: String(root?.label || '') })).filter((root) => root.rootId && root.label).slice(0, 8) : [],
     };
     if (transport === 'stdio') {
       base.command = String(s.command || '').trim();
@@ -2899,12 +3417,105 @@ function serializeMcpServerList() {
       if (s.headers && typeof s.headers === 'object' && !Array.isArray(s.headers)) {
         base.headers = { ...s.headers };
       }
+      base.allowPrivate = s.allowPrivate === true;
+      base.auth = s.auth === 'oauth' ? 'oauth' : 'none';
+      if (base.auth === 'oauth') base.oauth = cloneMcpOAuth(s.oauth);
     }
     if (s.timeoutMs != null && Number.isFinite(Number(s.timeoutMs))) {
       base.timeoutMs = Number(s.timeoutMs);
     }
     return base;
   });
+}
+
+function mcpConfigFingerprint(list) {
+  try { return JSON.stringify(Array.isArray(list) ? list : []); } catch { return ''; }
+}
+
+async function refreshMcpOAuthStatuses() {
+  if (!window.codex?.getMcpOAuthStatus) return;
+  try {
+    const result = await window.codex.getMcpOAuthStatus();
+    mcpOAuthStatuses.clear();
+    for (const status of result?.statuses || []) {
+      if (status?.name) mcpOAuthStatuses.set(status.name, status);
+    }
+    renderMcpServerList();
+  } catch {
+    // OAuth status is supplementary; settings remain usable when it is unavailable.
+  }
+}
+
+function mcpOAuthStatusText(status, flowId, errorCode) {
+  if (flowId) return '授权处理中';
+  if (status?.authorized) {
+    if (status.expiresAt && status.expiresAt <= Date.now()) return '已过期，可刷新';
+    return status.canRefresh ? '已授权 · 可刷新' : '已授权';
+  }
+  if (errorCode) return `授权失败 · ${errorCode}`;
+  if (status?.persistence === 'memory') return '未授权 · 仅内存存储可用';
+  return '未授权';
+}
+
+async function authorizeMcpServerRow(idx, resultEl) {
+  const draft = mcpServerDrafts[idx];
+  if (!draft || draft.auth !== 'oauth' || !window.codex?.startMcpOAuth) return;
+  const saved = await window.codex.getSettings();
+  const current = serializeMcpServerList()[idx];
+  const savedCfg = (saved?.mcpServers || []).find((item) => item.name === current?.name);
+  if (!savedCfg || mcpConfigFingerprint([savedCfg]) !== mcpConfigFingerprint([current])) {
+    if (resultEl) {
+      resultEl.className = 'mcp-test-result err';
+      resultEl.textContent = '请先保存当前 OAuth 配置，再开始授权';
+    }
+    return;
+  }
+  if (resultEl) {
+    resultEl.className = 'mcp-test-result';
+    resultEl.textContent = '正在打开系统浏览器授权…';
+  }
+  try {
+    const result = await window.codex.startMcpOAuth({ name: current.name });
+    if (result?.ok) {
+      mcpOAuthErrors.delete(current.name);
+      await refreshMcpOAuthStatuses();
+    } else if (resultEl) {
+      resultEl.className = 'mcp-test-result err';
+      resultEl.textContent = `授权失败：${result?.code || result?.error || '未知错误'}`;
+    }
+  } catch (error) {
+    if (resultEl) {
+      resultEl.className = 'mcp-test-result err';
+      resultEl.textContent = `授权失败：${error?.message || String(error)}`;
+    }
+  }
+}
+
+async function cancelMcpOAuthForRow(idx) {
+  const name = String(mcpServerDrafts[idx]?.name || '').trim();
+  const flowId = mcpOAuthFlowIds.get(name);
+  if (!flowId || !window.codex?.cancelMcpOAuth) return;
+  await window.codex.cancelMcpOAuth({ flowId });
+}
+
+async function logoutMcpOAuthForRow(idx, resultEl) {
+  const name = String(mcpServerDrafts[idx]?.name || '').trim();
+  if (!name || !window.codex?.logoutMcpOAuth) return;
+  try {
+    const result = await window.codex.logoutMcpOAuth({ name });
+    await refreshMcpOAuthStatuses();
+    if (resultEl) {
+      resultEl.className = result?.code ? 'mcp-test-result err' : 'mcp-test-result ok';
+      resultEl.textContent = result?.code
+        ? `已退出本地授权，远端撤销警告：${result.code}`
+        : '已退出授权';
+    }
+  } catch (error) {
+    if (resultEl) {
+      resultEl.className = 'mcp-test-result err';
+      resultEl.textContent = `退出授权失败：${error?.message || String(error)}`;
+    }
+  }
 }
 
 function setMcpServerDrafts(list) {
@@ -2987,6 +3598,15 @@ function renderMcpServerList() {
       });
     }
 
+    const resultEl = document.createElement('div');
+    resultEl.className = 'mcp-test-result';
+    const sessionEl = document.createElement('span');
+    sessionEl.className = 'mcp-session-status';
+    const sessionState = String(s.session?.state || (s.sessionRecovery ? 'idle' : 'disabled'));
+    sessionEl.textContent = `会话：${sessionState}${s.session?.lastErrorCode ? ` · ${s.session.lastErrorCode}` : ''}`;
+    sessionEl.title = s.session?.reusable ? '当前进程内可复用，空闲 5 分钟回收' : '每次 run 独立连接';
+    row.appendChild(sessionEl);
+
     const testBtn = document.createElement('button');
     testBtn.type = 'button';
     testBtn.className = 'btn-small mcp-test';
@@ -3002,9 +3622,6 @@ function renderMcpServerList() {
       renderMcpServerList();
     });
 
-    const resultEl = document.createElement('div');
-    resultEl.className = 'mcp-test-result';
-
     row.appendChild(enLabel);
     row.appendChild(name);
     row.appendChild(tr);
@@ -3012,6 +3629,179 @@ function renderMcpServerList() {
     row.appendChild(testBtn);
     row.appendChild(delBtn);
     row.appendChild(resultEl);
+
+    const d9Options = document.createElement('div');
+    d9Options.className = 'mcp-d9-options';
+    const recoveryLabel = document.createElement('label');
+    const recovery = document.createElement('input');
+    recovery.type = 'checkbox';
+    recovery.checked = s.sessionRecovery === true;
+    recovery.addEventListener('change', () => { mcpServerDrafts[idx].sessionRecovery = recovery.checked; });
+    recoveryLabel.appendChild(recovery);
+    recoveryLabel.appendChild(document.createTextNode('进程内恢复'));
+    recoveryLabel.title = '仅在当前应用进程内复用，空闲 5 分钟回收；默认关闭';
+    d9Options.appendChild(recoveryLabel);
+
+    const samplingLabel = document.createElement('label');
+    const sampling = document.createElement('input');
+    sampling.type = 'checkbox';
+    sampling.checked = s.sampling?.enabled === true;
+    sampling.addEventListener('change', () => { if (!mcpServerDrafts[idx].sampling) mcpServerDrafts[idx].sampling = {}; mcpServerDrafts[idx].sampling.enabled = sampling.checked; });
+    samplingLabel.appendChild(sampling);
+    samplingLabel.appendChild(document.createTextNode('允许 Sampling（每次询问）'));
+    samplingLabel.title = '服务端请求模型采样时始终需要审批，full-auto 也不会绕过';
+    d9Options.appendChild(samplingLabel);
+
+    const rootsBox = document.createElement('div');
+    rootsBox.className = 'mcp-roots-box';
+    const rootsTitle = document.createElement('span');
+    rootsTitle.textContent = 'Roots（仅标签）';
+    rootsBox.appendChild(rootsTitle);
+    const rootsList = document.createElement('span');
+    rootsList.className = 'mcp-roots-list';
+    rootsList.textContent = (s.roots || []).length ? s.roots.map((root) => root.label).join('、') : '未授权额外目录';
+    rootsBox.appendChild(rootsList);
+    const addRoot = document.createElement('button');
+    addRoot.type = 'button';
+    addRoot.className = 'btn-small';
+    addRoot.textContent = '选择目录';
+    addRoot.addEventListener('click', async () => {
+      if (!window.codex?.chooseMcpRoot) return;
+      const result = await window.codex.chooseMcpRoot({ name: mcpServerDrafts[idx].name });
+      if (result?.ok && result.settings?.mcpServers) {
+        const saved = result.settings.mcpServers.find((item) => item.name === mcpServerDrafts[idx].name);
+        if (saved) mcpServerDrafts[idx] = cloneMcpServer(saved);
+        renderMcpServerList();
+      } else if (!result?.canceled) toast(result?.error || '目录授权失败');
+    });
+    rootsBox.appendChild(addRoot);
+    (s.roots || []).forEach((root) => {
+      const removeRoot = document.createElement('button');
+      removeRoot.type = 'button';
+      removeRoot.className = 'btn-small';
+      removeRoot.textContent = `移除 ${root.label}`;
+      removeRoot.addEventListener('click', async () => {
+        const result = await window.codex.removeMcpRoot({ name: mcpServerDrafts[idx].name, rootId: root.rootId });
+        if (result?.ok && result.settings?.mcpServers) {
+          const saved = result.settings.mcpServers.find((item) => item.name === mcpServerDrafts[idx].name);
+          if (saved) mcpServerDrafts[idx] = cloneMcpServer(saved);
+          renderMcpServerList();
+        } else toast(result?.error || '移除目录失败');
+      });
+      rootsBox.appendChild(removeRoot);
+    });
+    d9Options.appendChild(rootsBox);
+    row.appendChild(d9Options);
+
+    if (transport !== 'stdio') {
+      const remoteOptions = document.createElement('div');
+      remoteOptions.className = 'mcp-remote-options';
+
+      const authLabel = document.createElement('label');
+      authLabel.textContent = '认证';
+      const authSelect = document.createElement('select');
+      authSelect.className = 'mcp-auth-mode';
+      for (const value of ['none', 'oauth']) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value === 'oauth' ? 'OAuth' : '无';
+        option.selected = (s.auth || 'none') === value;
+        authSelect.appendChild(option);
+      }
+      authSelect.addEventListener('change', () => {
+        mcpServerDrafts[idx].auth = authSelect.value === 'oauth' ? 'oauth' : 'none';
+        renderMcpServerList();
+      });
+      authLabel.appendChild(authSelect);
+      remoteOptions.appendChild(authLabel);
+
+      const privateLabel = document.createElement('label');
+      privateLabel.className = 'mcp-private-toggle';
+      const privateInput = document.createElement('input');
+      privateInput.type = 'checkbox';
+      privateInput.checked = s.allowPrivate === true;
+      privateInput.addEventListener('change', () => {
+        mcpServerDrafts[idx].allowPrivate = privateInput.checked;
+      });
+      privateLabel.appendChild(privateInput);
+      privateLabel.appendChild(document.createTextNode('允许私网地址'));
+      privateLabel.title = '仅 MCP transport 生效；OAuth endpoint 仍要求公共 HTTPS';
+      remoteOptions.appendChild(privateLabel);
+
+      const status = mcpOAuthStatuses.get(String(s.name || '').trim());
+      const flowId = mcpOAuthFlowIds.get(String(s.name || '').trim());
+      const statusEl = document.createElement('span');
+      statusEl.className = 'mcp-oauth-status';
+      statusEl.textContent = s.auth === 'oauth'
+        ? mcpOAuthStatusText(status, flowId, mcpOAuthErrors.get(String(s.name || '').trim()))
+        : '未使用 OAuth';
+      remoteOptions.appendChild(statusEl);
+
+      if (s.auth === 'oauth') {
+        const authorizeBtn = document.createElement('button');
+        authorizeBtn.type = 'button';
+        authorizeBtn.className = 'btn-small';
+        authorizeBtn.textContent = flowId ? '取消授权' : (status?.authorized ? '重新授权' : '授权');
+        authorizeBtn.disabled = !String(s.name || '').trim();
+        authorizeBtn.addEventListener('click', () => {
+          if (flowId) cancelMcpOAuthForRow(idx).catch(() => {});
+          else authorizeMcpServerRow(idx, resultEl).catch(() => {});
+        });
+        remoteOptions.appendChild(authorizeBtn);
+
+        if (status?.authorized && !flowId) {
+          const logoutBtn = document.createElement('button');
+          logoutBtn.type = 'button';
+          logoutBtn.className = 'btn-small';
+          logoutBtn.textContent = '退出授权';
+          logoutBtn.addEventListener('click', () => logoutMcpOAuthForRow(idx, resultEl));
+          remoteOptions.appendChild(logoutBtn);
+        }
+
+        const oauthEditor = document.createElement('div');
+        oauthEditor.className = 'mcp-oauth-editor';
+        const oauth = s.oauth || {};
+        const fields = [
+          ['clientId', '公开 clientId'],
+          ['resource', 'resource（可选）'],
+          ['authorizationServer', 'authorization server（可选）'],
+          ['authorizationEndpoint', 'authorization endpoint（可选）'],
+          ['tokenEndpoint', 'token endpoint（可选）'],
+          ['registrationEndpoint', 'registration endpoint（可选）'],
+          ['revocationEndpoint', 'revocation endpoint（可选）'],
+        ];
+        for (const [key, placeholder] of fields) {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.placeholder = placeholder;
+          input.value = oauth[key] || '';
+          input.dataset.oauthKey = key;
+          input.addEventListener('input', () => {
+            if (!mcpServerDrafts[idx].oauth) mcpServerDrafts[idx].oauth = {};
+            mcpServerDrafts[idx].oauth[key] = input.value.trim();
+          });
+          oauthEditor.appendChild(input);
+        }
+        const scopes = document.createElement('input');
+        scopes.type = 'text';
+        scopes.placeholder = 'scopes（空格分隔，可选）';
+        scopes.value = Array.isArray(oauth.scopes) ? oauth.scopes.join(' ') : '';
+        scopes.addEventListener('input', () => {
+          if (!mcpServerDrafts[idx].oauth) mcpServerDrafts[idx].oauth = {};
+          mcpServerDrafts[idx].oauth.scopes = scopes.value.split(/\s+/).filter(Boolean);
+        });
+        oauthEditor.appendChild(scopes);
+        row.appendChild(remoteOptions);
+        row.appendChild(oauthEditor);
+      } else {
+        row.appendChild(remoteOptions);
+      }
+
+      if (s.auth !== 'oauth') {
+        // Keep the row's control line visible without exposing OAuth fields.
+        remoteOptions.classList.add('is-none');
+      }
+    }
     root.appendChild(row);
   });
 }
@@ -3079,6 +3869,7 @@ function applyMcpImportJson() {
 
 async function openSettings() {
   const settings = await window.codex.getSettings();
+  mcpSavedFingerprint = mcpConfigFingerprint(settings.mcpServers);
   document.getElementById('set-mode').value = settings.mode || 'local';
   document.getElementById('set-base-url').value = settings.baseUrl || '';
   document.getElementById('set-model').value = settings.model || '';
@@ -3109,6 +3900,7 @@ async function openSettings() {
   const mcpEn = document.getElementById('set-mcp-enabled');
   if (mcpEn) mcpEn.checked = Boolean(settings.mcpEnabled);
   setMcpServerDrafts(Array.isArray(settings.mcpServers) ? settings.mcpServers : []);
+  await refreshMcpOAuthStatuses();
   hideMcpImportPanel();
   const ac = document.getElementById('set-auto-compact');
   if (ac) ac.checked = settings.autoCompact === true;
@@ -3392,7 +4184,10 @@ async function saveSettingsFromForm() {
     usageCurrency: (document.getElementById('set-usage-currency')?.value || '$').slice(0, 4),
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
-  await window.codex.saveSettings(partial);
+  const saved = await window.codex.saveSettings(partial);
+  mcpSavedFingerprint = mcpConfigFingerprint(saved?.mcpServers || mcpServers);
+  if (Array.isArray(saved?.mcpServers)) setMcpServerDrafts(saved.mcpServers);
+  await refreshMcpOAuthStatuses();
   usageDisplayEnabled = partial.usageEnabled !== false;
   currencySymbol = partial.usageCurrency || '$';
   defaultAgentModeSeed = partial.defaultAgentMode === 'plan' ? 'plan' : 'agent';
@@ -3530,12 +4325,26 @@ function bindEvents() {
     if (onAtCompleteKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
-  document.getElementById('btn-settings').addEventListener('click', () => openSettings().catch((e) => alert(e.message)));
+  bindAppDialog();
+  document.getElementById('btn-settings').addEventListener('click', () => openSettings().catch((e) => appAlert(e.message)));
+  document.getElementById('btn-window-minimize')?.addEventListener('click', () => {
+    window.codex?.minimizeWindow?.();
+  });
+  document.getElementById('btn-window-maximize')?.addEventListener('click', () => {
+    window.codex?.toggleMaximizeWindow?.();
+  });
+  document.getElementById('btn-window-close')?.addEventListener('click', () => {
+    window.codex?.closeWindow?.();
+  });
+  document.querySelector('.qq-titlebar')?.addEventListener('dblclick', (event) => {
+    if (event.target.closest('button')) return;
+    window.codex?.toggleMaximizeWindow?.();
+  });
   document.getElementById('btn-settings-cancel').addEventListener('click', closeSettings);
-  document.getElementById('btn-settings-save').addEventListener('click', () => saveSettingsFromForm().catch((e) => alert(e.message)));
+  document.getElementById('btn-settings-save').addEventListener('click', () => saveSettingsFromForm().catch((e) => appAlert(e.message)));
   document.getElementById('usage-bar')?.addEventListener('click', showUsageDetails);
   document.getElementById('btn-usage-clear')?.addEventListener('click', async () => {
-    if (!confirm('确定清空全部用量记录？此操作不可撤销。')) return;
+    if (!(await appConfirm('确定清空全部用量记录？此操作不可撤销。'))) return;
     const result = await window.codex.usageClear();
     if (!result?.ok) {
       toast(result?.error || '清空失败');
@@ -3560,6 +4369,27 @@ function bindEvents() {
   });
   document.getElementById('btn-mcp-import-apply')?.addEventListener('click', () => applyMcpImportJson());
   document.getElementById('btn-mcp-import-cancel')?.addEventListener('click', () => hideMcpImportPanel());
+  window.codex.onMcpOAuthEvent?.((event) => {
+    const name = String(event?.name || '').trim();
+    if (!name) return;
+    if (event.state === 'starting' || event.state === 'waiting' || event.state === 'exchanging') {
+      mcpOAuthFlowIds.set(name, event.flowId);
+      mcpOAuthErrors.delete(name);
+    } else {
+      mcpOAuthFlowIds.delete(name);
+      if (event.state === 'error') mcpOAuthErrors.set(name, event.error || 'MCP_OAUTH_TOKEN_FAILED');
+    }
+    if (!document.getElementById('settings-modal')?.classList.contains('hidden')) {
+      renderMcpServerList();
+    }
+  });
+  window.codex.onMcpSessionEvent?.((event) => {
+    if (!event?.server) return;
+    // Keep status lightweight and identifier-free; detailed state is refreshed
+    // when settings opens and never persisted into the chat transcript.
+    if (!document.getElementById('settings-modal')?.classList.contains('hidden')) renderMcpServerList();
+    if (event.state === 'reconnecting') toast(`MCP ${event.server} 正在重连…`);
+  });
   document.getElementById('settings-modal').addEventListener('click', (e) => { if (e.target.id === 'settings-modal') closeSettings(); });
   document.getElementById('btn-task-cancel').addEventListener('click', closeTaskModal);
   document.getElementById('btn-task-ok').addEventListener('click', createTaskFromModal);

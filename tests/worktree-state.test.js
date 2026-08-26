@@ -66,6 +66,9 @@ describe('D5 worktree marker state', () => {
   it('allows only the documented lifecycle transitions', () => {
     assert.equal(canTransition('creating', 'running'), true);
     assert.equal(canTransition('ready', 'applying'), true);
+    assert.equal(canTransition('ready', 'pr_preparing'), true);
+    assert.equal(canTransition('pr_pushing', 'pr_creating'), true);
+    assert.equal(canTransition('pr_creating', 'pr_cleanup_pending'), true);
     assert.equal(canTransition('collect_failed', 'collecting'), true);
     assert.equal(canTransition('ready', 'collecting'), false);
     assert.equal(canTransition('apply_uncertain', 'ready'), false);
@@ -76,7 +79,11 @@ describe('D5 worktree marker state', () => {
   });
 
   it('keeps summaries bounded and never exposes filesystem authority paths', () => {
-    const summary = publicSummary(marker());
+    const summary = publicSummary(marker({ pr: {
+      host: 'github.com', owner: 'acme', repo: 'widget', number: 7,
+      url: 'https://github.com/acme/widget/pull/7', state: 'open', headSha: 'd'.repeat(40),
+      checksSummary: { total: 2, passed: 1, skipped: 1 }, body: 'must not persist',
+    } }));
     assert.equal(summary.id, 'wt_ab12cd34');
     assert.equal(summary.updatedAt, 101);
     assert.equal('repoRoot' in summary, false);
@@ -85,12 +92,18 @@ describe('D5 worktree marker state', () => {
     assert.equal('patchSha256' in summary, false);
     assert.equal(summary.canApply, true);
     assert.equal(summary.canPreview, true);
+    assert.equal(summary.canCreatePr, true);
+    assert.equal(summary.pr.state, 'OPEN');
+    assert.equal(summary.pr.headSha, 'd'.repeat(40));
+    assert.deepEqual(summary.pr.checksSummary, { total: 2, passed: 1, pending: 0, failed: 0, skipped: 1, unknown: 0 });
+    assert.equal('body' in summary.pr, false);
   });
 
   it('maps action capabilities and counts only unresolved markers', () => {
     assert.deepEqual(capabilityFor('collect_failed'), {
       canApply: false, canDiscard: true, canRetryCollect: true,
       canCleanup: false, canOpen: true, canPreview: false,
+      canCreatePr: false, canRetryPr: false, canCleanupPr: false, canOpenPr: false,
     });
     assert.equal(capabilityFor('applied_cleanup_pending').canCleanup, true);
     assert.equal(capabilityFor('applied_cleanup_pending').canDiscard, false);
@@ -99,6 +112,7 @@ describe('D5 worktree marker state', () => {
       marker(),
       marker({ id: 'wt_bc12cd34', state: 'applied_cleanup_pending' }),
       marker({ id: 'wt_cd12cd34', state: 'discarded_cleanup_pending' }),
+      marker({ id: 'wt_de12cd34', state: 'pr_created' }),
       { bad: true },
     ]), 1);
     assert.equal(PENDING_LIMIT, 3);
