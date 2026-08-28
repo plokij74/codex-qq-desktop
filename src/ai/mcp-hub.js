@@ -4,12 +4,14 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { createMcpClient } = require('./mcp-client');
-const { createMcpSessionManager } = require('./mcp-session-manager');
+const { createMcpSessionManager, configFingerprint } = require('./mcp-session-manager');
 const { isHttpUrl } = require('./mcp-config');
 const { redactSensitive } = require('./network-security');
+const { supportsTaskRequest } = require('./mcp-protocol');
 
 const RESERVED_TOOL_NAMES = new Set([
   'mcp_resources_list', 'mcp_resource_read', 'mcp_prompts_list', 'mcp_prompt_get',
+  'mcp_tasks_list', 'mcp_task_get', 'mcp_task_result', 'mcp_task_cancel',
 ]);
 const RESULT_MAX = 32 * 1024;
 const PROMPT_NAME_MAX = 160;
@@ -152,6 +154,7 @@ function createMcpHub(opts = {}) {
     ? createMcpSessionManager({ createClient, onStatus: opts.onSessionStatus })
     : null;
   const manager = sessionManager || ownedManager;
+  const taskManager = opts.taskManager || null;
   const servers = new Map();
   const route = new Map();
   const resourcesByServer = new Map();
@@ -167,45 +170,86 @@ function createMcpHub(opts = {}) {
 
   async function acquireClient(cfg, context) {
     const serverName = String(cfg.name || '').trim();
+    const leaseRef = { current: null, runStopped: context.taskRecovery === true };
+    const releaseTaskConnection = async () => {
+      if (!leaseRef.runStopped) return;
+      if (taskManager?.hasConnectionHoldingTasks?.(serverName)) return;
+      await leaseRef.current?.release?.();
+    };
+    const attachTaskLeaseLifecycle = (acquired) => {
+      acquired.markRunStopped = () => { leaseRef.runStopped = true; };
+      acquired.releaseTaskConnection = releaseTaskConnection;
+      return acquired;
+    };
     const clientConfig = {
       ...cfg,
       transport: cfg.transport || 'stdio',
       cwd: cfg.cwd || context.cwd,
       allowPrivate: cfg.allowPrivate === true,
       authProvider: cfg.authProvider || context.authProvider,
+      tasksEnabled: cfg.tasks?.enabled === true,
+      elicitation: {
+        form: cfg.elicitation?.enabled !== false,
+        url: cfg.elicitation?.enabled !== false,
+      },
     };
     const notificationHandler = (method, params, message) => {
       if (method === 'notifications/prompts/list_changed') promptsByServer.delete(serverName);
+      if (method === 'notifications/tasks/status') taskManager?.notifyTaskStatus?.(serverName, params);
       context.notificationHandler?.(method, params, message);
     };
     if (manager) {
-      return manager.acquire(clientConfig, {
+      const acquired = await manager.acquire(clientConfig, {
         projectPath: context.projectPath,
+        taskRecovery: context.taskRecovery === true,
         rootsProvider: () => rootsForConfig(clientConfig, context),
         samplingHandler: cfg.sampling?.enabled === true && context.samplingEnabled !== false && context.samplingHandler
-          ? (params, signal) => context.samplingHandler(cfg.name, params, signal)
+          ? (params, signal) => context.samplingHandler(cfg.name, params, signal, releaseTaskConnection)
+          : undefined,
+        elicitationHandler: cfg.elicitation?.enabled !== false && context.elicitationHandler
+          ? (params, signal) => context.elicitationHandler(cfg.name, params, signal, releaseTaskConnection)
+          : undefined,
+        elicitationComplete: context.elicitationComplete
+          ? (params, message) => context.elicitationComplete(cfg.name, params, message)
+          : undefined,
+        taskHandler: context.taskHandler
+          ? (method, params, signal) => context.taskHandler(cfg.name, method, params, signal)
           : undefined,
         notificationHandler,
         onRootsChanged: context.onRootsChanged,
         onTransportError: context.onTransportError,
       });
+      leaseRef.current = acquired;
+      return attachTaskLeaseLifecycle(acquired);
     }
     const client = createClient({
       ...clientConfig,
       rootsProvider: () => rootsForConfig(clientConfig, context),
       ...(cfg.sampling?.enabled === true && context.samplingEnabled !== false && context.samplingHandler
-        ? { samplingHandler: (params, signal) => context.samplingHandler(cfg.name, params, signal) }
+        ? { samplingHandler: (params, signal) => context.samplingHandler(cfg.name, params, signal, releaseTaskConnection) }
+        : {}),
+      ...(cfg.elicitation?.enabled !== false && context.elicitationHandler
+        ? { elicitationHandler: (params, signal) => context.elicitationHandler(cfg.name, params, signal, releaseTaskConnection) }
+        : {}),
+      ...(context.elicitationComplete
+        ? { elicitationComplete: (params, message) => context.elicitationComplete(cfg.name, params, message) }
+        : {}),
+      ...(context.taskHandler
+        ? { taskHandler: (method, params, signal) => context.taskHandler(cfg.name, method, params, signal) }
         : {}),
       notificationHandler,
     });
     await client.start();
-    return { client, release: async () => client.close(), status: () => ({ server: cfg.name, state: 'connected', reusable: false, lastErrorCode: null }) };
+    const acquired = { client, release: async () => client.close(), status: () => ({ server: cfg.name, state: 'connected', reusable: false, lastErrorCode: null }) };
+    leaseRef.current = acquired;
+    return attachTaskLeaseLifecycle(acquired);
   }
 
   async function startAll(serverConfigs, context = {}) {
     await stopAll();
     runContext = context;
     const list = Array.isArray(serverConfigs) ? serverConfigs : [];
+    const configsByName = new Map(list.map((cfg) => [String(cfg?.name || '').trim(), cfg]));
     for (const cfg of list) {
       if (context.signal?.aborted) break;
       const name = String(cfg?.name || '').trim();
@@ -218,24 +262,68 @@ function createMcpHub(opts = {}) {
         lease = await acquireClient({ ...cfg, authProvider }, { ...context, authProvider, projectName: context.project?.name, projectPath: context.project?.path || context.cwd });
         const client = lease.client;
         const tools = await client.listTools();
+        const capabilities = client.getServerCapabilities?.() || {};
+        const protocolVersion = typeof client.getProtocolVersion === 'function' ? client.getProtocolVersion() : '2025-11-25';
+        const taskCallSupported = cfg.tasks?.enabled === true
+          && protocolVersion === '2025-11-25'
+          && supportsTaskRequest(capabilities, 'requests.tools.call');
         let resources = [];
         try { resources = typeof client.listResources === 'function' ? (await client.listResources()) || [] : []; } catch { resources = []; }
         let prompts = null;
         try { prompts = typeof client.listPrompts === 'function' ? (await client.listPrompts()) || [] : []; } catch { prompts = null; }
-        servers.set(name, { client, lease, tools: Array.isArray(tools) ? tools : [], cfg });
+        servers.set(name, {
+          client,
+          lease,
+          tools: Array.isArray(tools) ? tools : [],
+          cfg,
+          capabilities,
+          taskCallSupported,
+          runStopped: context.taskRecovery === true,
+          releaseTaskConnection: lease.releaseTaskConnection,
+        });
+        taskManager?.registerClient?.(name, client, {
+          recover: context.taskRecovery !== true,
+          serverConfigFingerprint: configFingerprint(cfg),
+          sessionId: context.sessionId,
+          projectPath: context.project?.path || context.cwd,
+          releaseConnection: lease.releaseTaskConnection,
+        });
         resourcesByServer.set(name, Array.isArray(resources) ? resources : []);
         if (prompts) promptsByServer.set(name, normalizePromptList(prompts));
         for (const tool of Array.isArray(tools) ? tools : []) {
+          const taskSupport = String(tool?.execution?.taskSupport || '').toLowerCase();
+          if (taskSupport === 'required' && !taskCallSupported) continue;
           let full = `mcp_${name}_${sanitizeToolPart(tool.name)}`;
           let n = 2;
           while (route.has(full) || RESERVED_TOOL_NAMES.has(full)) full = `mcp_${name}_${sanitizeToolPart(tool.name)}_${n++}`;
-          route.set(full, { serverName: name, toolName: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+          route.set(full, {
+            serverName: name,
+            toolName: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            taskSupport,
+            taskEnabled: taskCallSupported && (taskSupport === 'required' || taskSupport === 'optional'),
+          });
         }
         context.onStatus?.({ server: name, ok: true, session: lease.status?.() || null });
       } catch (error) {
         try { await lease?.release?.(); } catch { /* ignore */ }
         context.onStatus?.({ server: name, ok: false, error: sanitizeMcpError(error) });
       }
+    }
+    if (context.taskRecovery === true && taskManager?.restore && list.length) {
+      await taskManager.restore({
+        sessionId: context.sessionId,
+        projectPath: context.project?.path || context.cwd,
+        getClient: (serverName) => servers.get(serverName)?.client || null,
+        getConfigFingerprint: (serverName) => {
+          const entry = servers.get(serverName);
+          const cfg = entry?.cfg || configsByName.get(serverName);
+          return cfg ? configFingerprint(cfg) : '';
+        },
+        releaseConnection: (serverName) => servers.get(serverName)?.releaseTaskConnection?.(),
+      });
+      await Promise.all([...servers.values()].map((entry) => entry.releaseTaskConnection?.()));
     }
   }
 
@@ -247,6 +335,12 @@ function createMcpHub(opts = {}) {
     defs.push({ type: 'function', function: { name: 'mcp_resource_read', description: 'Read one MCP resource by server name and uri', parameters: { type: 'object', properties: { server: { type: 'string' }, uri: { type: 'string' } }, required: ['server', 'uri'] } } });
     defs.push({ type: 'function', function: { name: 'mcp_prompts_list', description: 'List MCP prompts from connected servers', parameters: { type: 'object', properties: { server: { type: 'string' } } } } });
     defs.push({ type: 'function', function: { name: 'mcp_prompt_get', description: 'Get one MCP prompt by server and name', parameters: { type: 'object', properties: { server: { type: 'string' }, name: { type: 'string' }, arguments: { type: 'object' } }, required: ['server', 'name'] } } });
+    if (taskManager) {
+      defs.push({ type: 'function', function: { name: 'mcp_tasks_list', description: 'List background MCP tasks', parameters: { type: 'object', properties: { server: { type: 'string' }, limit: { type: 'integer' } } } } });
+      defs.push({ type: 'function', function: { name: 'mcp_task_get', description: 'Get one background MCP task by local reference', parameters: { type: 'object', properties: { taskRef: { type: 'string' } }, required: ['taskRef'] } } });
+      defs.push({ type: 'function', function: { name: 'mcp_task_result', description: 'Read a completed background MCP task result', parameters: { type: 'object', properties: { taskRef: { type: 'string' } }, required: ['taskRef'] } } });
+      defs.push({ type: 'function', function: { name: 'mcp_task_cancel', description: 'Cancel a background MCP task', parameters: { type: 'object', properties: { taskRef: { type: 'string' } }, required: ['taskRef'] } } });
+    }
     return defs;
   }
 
@@ -300,19 +394,88 @@ function createMcpHub(opts = {}) {
   }
 
   async function call(fullName, args) {
+    const taskContext = {
+      sessionId: runContext.sessionId,
+      projectPath: runContext.project?.path || runContext.cwd,
+    };
     if (fullName === 'mcp_resources_list') return callResourcesList(args || {});
     if (fullName === 'mcp_resource_read') return callResourceRead(args || {});
     if (fullName === 'mcp_prompts_list') return listPrompts(args?.server || '');
     if (fullName === 'mcp_prompt_get') return getPrompt(args?.server, args?.name, args?.arguments);
+    if (fullName === 'mcp_tasks_list') return {
+      ok: true,
+      tasks: taskManager?.list?.({
+        server: args?.server,
+        limit: args?.limit,
+        sourceSessionId: taskContext.sessionId,
+        sourceProjectPath: taskContext.projectPath,
+      }) || [],
+    };
+    if (fullName === 'mcp_task_get') {
+      try {
+        const task = taskManager.getForContext
+          ? taskManager.getForContext(String(args?.taskRef || ''), taskContext)
+          : taskManager.get(String(args?.taskRef || ''));
+        return { ok: true, task };
+      } catch (error) { return { ok: false, code: error.code, error: error.message }; }
+    }
+    if (fullName === 'mcp_task_result') {
+      try {
+        const result = taskManager.resultForContext
+          ? await taskManager.resultForContext(String(args?.taskRef || ''), taskContext)
+          : await taskManager.result(String(args?.taskRef || ''));
+        return { ok: true, taskRef: String(args?.taskRef || ''), result: truncateText(result).text };
+      } catch (error) { return { ok: false, code: error.code, error: error.message }; }
+    }
+    if (fullName === 'mcp_task_cancel') {
+      try {
+        const task = taskManager.cancelForContext
+          ? await taskManager.cancelForContext(String(args?.taskRef || ''), taskContext)
+          : await taskManager.cancel(String(args?.taskRef || ''));
+        return { ok: true, task };
+      } catch (error) { return { ok: false, code: error.code, error: error.message }; }
+    }
     const meta = route.get(fullName);
     if (!meta) return { ok: false, error: '未知 mcp 工具: ' + fullName };
     const entry = servers.get(meta.serverName);
     if (!entry) return { ok: false, error: 'server 未连接: ' + meta.serverName };
-    try { const result = await entry.client.callTool(meta.toolName, args || {}); const out = truncateText(result); return { ok: true, result: out.text, truncated: out.truncated }; } catch (error) { return { ok: false, error: sanitizeMcpError(error) }; }
+    try {
+      const requestOptions = meta.taskEnabled
+        ? { task: { ttl: entry.cfg.tasks?.defaultTtlMs || taskManager.constants?.DEFAULT_TTL_MS || 60 * 60 * 1000 } }
+        : {};
+      const result = await entry.client.callTool(meta.toolName, args || {}, requestOptions);
+      if (meta.taskEnabled && result?.task) {
+        // The run's lease must remain usable until onRunEnd. If the Agent
+        // finishes first, stopAll marks the entry and the task completion
+        // releases the retained lease. Releasing immediately here used to
+        // close a non-recovery stdio client in the middle of the same run.
+        const created = taskManager.registerToolTask({
+          serverName: meta.serverName,
+          serverConfigFingerprint: configFingerprint(entry.cfg),
+          transport: entry.cfg.transport,
+          remoteTaskId: result.task.taskId,
+          createResult: result,
+          toolName: meta.toolName,
+          ttl: entry.cfg.tasks?.defaultTtlMs,
+          client: entry.client,
+          sourceSessionId: runContext.sessionId,
+          sourceProjectPath: runContext.project?.path || runContext.cwd,
+          releaseConnection: entry.releaseTaskConnection,
+        });
+        return { ok: true, task: created.task };
+      }
+      if (meta.taskSupport === 'required') return { ok: false, code: 'MCP_TASK_REQUIRED_UNSUPPORTED', error: 'MCP server did not create a task' };
+      const out = truncateText(result);
+      return { ok: true, result: out.text, truncated: out.truncated };
+    } catch (error) { return { ok: false, code: error?.code, error: sanitizeMcpError(error) }; }
   }
 
   async function stopAll() {
     for (const entry of servers.values()) {
+      entry.runStopped = true;
+      entry.lease?.markRunStopped?.();
+      if (taskManager?.hasConnectionHoldingTasks?.(entry.cfg.name)
+        || taskManager?.hasActiveTasks?.(entry.cfg.name)) continue;
       try { await entry.lease?.release?.(); } catch { try { await entry.client?.close?.(); } catch { /* ignore */ } }
     }
     servers.clear(); route.clear(); resourcesByServer.clear(); promptsByServer.clear();
@@ -320,7 +483,18 @@ function createMcpHub(opts = {}) {
   async function close() { await stopAll(); if (ownedManager) await ownedManager.closeAll(); }
   function sessionStatus(name) { return manager?.status?.(name) || [...servers.entries()].map(([server, entry]) => ({ server, state: 'connected', reusable: false, lastErrorCode: null })); }
 
-  return { startAll, getToolDefs, call, listPrompts, getPrompt, stopAll, close, sessionStatus, rootsForConfig };
+  return {
+    startAll,
+    getToolDefs,
+    call,
+    listPrompts,
+    getPrompt,
+    stopAll,
+    close,
+    sessionStatus,
+    rootsForConfig,
+    taskManager,
+  };
 }
 
 module.exports = { createMcpHub, sanitizeToolPart, truncateText, sanitizeMcpError, normalizePromptArgs, normalizePromptDescriptor, normalizePromptList, promptResultToText, rootsForConfig, RESULT_MAX };

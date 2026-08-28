@@ -13,6 +13,8 @@ const OAUTH_SCOPES_MAX = 32;
 const ROOTS_MAX = 8;
 const ROOT_ID_MAX = 160;
 const ROOT_LABEL_MAX = 128;
+const TASK_TTL_MIN = 60 * 1000;
+const TASK_TTL_MAX = 24 * 60 * 60 * 1000;
 
 function clampTimeoutMs(v) {
   const n = Number(v);
@@ -121,6 +123,21 @@ function sanitizeRootLabel(raw) {
   return label.slice(0, ROOT_LABEL_MAX);
 }
 
+function sanitizeMcpTasks(raw) {
+  return {
+    enabled: raw?.enabled === true,
+    defaultTtlMs: Math.max(TASK_TTL_MIN, Math.min(TASK_TTL_MAX,
+      Number.isFinite(Number(raw?.defaultTtlMs)) ? Math.floor(Number(raw.defaultTtlMs)) : 60 * 60 * 1000)),
+  };
+}
+
+function sanitizeMcpElicitation(raw) {
+  return {
+    enabled: raw?.enabled !== false,
+    allowPrivateUrl: raw?.allowPrivateUrl === true,
+  };
+}
+
 /**
  * Normalize roots without granting filesystem authority.  `allowPaths` is
  * used only when reading the already-saved main-process settings file; JSON
@@ -177,6 +194,8 @@ function sanitizeMcpServers(raw, { allowRootPaths = false } = {}) {
         name, transport: 'stdio', enabled, command, timeoutMs,
         sessionRecovery: item.sessionRecovery === true,
         sampling: { enabled: item.sampling?.enabled === true },
+        tasks: sanitizeMcpTasks(item.tasks),
+        elicitation: sanitizeMcpElicitation(item.elicitation),
         roots: sanitizeMcpRoots(item.roots, { allowPaths: allowRootPaths }),
       };
       if (Array.isArray(item.args)) entry.args = item.args.map(String);
@@ -202,6 +221,8 @@ function sanitizeMcpServers(raw, { allowRootPaths = false } = {}) {
       auth: item.auth === 'oauth' ? 'oauth' : 'none',
       sessionRecovery: item.sessionRecovery === true,
       sampling: { enabled: item.sampling?.enabled === true },
+      tasks: sanitizeMcpTasks(item.tasks),
+      elicitation: sanitizeMcpElicitation(item.elicitation),
       roots: sanitizeMcpRoots(item.roots, { allowPaths: allowRootPaths }),
     };
     const headers = entry.auth === 'oauth'
@@ -227,4 +248,8 @@ module.exports = {
   sanitizeMcpRoots,
   sanitizeRootLabel,
   ROOTS_MAX,
+  TASK_TTL_MIN,
+  TASK_TTL_MAX,
+  sanitizeMcpTasks,
+  sanitizeMcpElicitation,
 };

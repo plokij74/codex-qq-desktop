@@ -65,6 +65,39 @@ contextBridge.exposeInMainWorld('codex', {
     ipcRenderer.on('mcp:session:event', listener);
     return () => ipcRenderer.removeListener('mcp:session:event', listener);
   },
+  listMcpTasks: (payload = {}) => ipcRenderer.invoke('mcp:tasks:list', {
+    server: payload?.server ? String(payload.server) : '',
+    limit: payload?.limit,
+  }),
+  getMcpTask: (payload = {}) => ipcRenderer.invoke('mcp:tasks:get', { taskRef: String(payload?.taskRef || '') }),
+  getMcpTaskResult: (payload = {}) => ipcRenderer.invoke('mcp:tasks:result', { taskRef: String(payload?.taskRef || '') }),
+  prepareMcpTaskResult: (payload = {}) => ipcRenderer.invoke('mcp:tasks:result:prepare', {
+    taskRef: String(payload?.taskRef || ''),
+    targetSessionId: String(payload?.targetSessionId || ''),
+  }),
+  commitMcpTaskResult: (payload = {}) => ipcRenderer.invoke('mcp:tasks:result:commit', {
+    claimId: String(payload?.claimId || ''),
+    targetSessionId: String(payload?.targetSessionId || ''),
+  }),
+  cancelMcpTask: (payload = {}) => ipcRenderer.invoke('mcp:tasks:cancel', { taskRef: String(payload?.taskRef || '') }),
+  abandonMcpTask: (payload = {}) => ipcRenderer.invoke('mcp:tasks:abandon', { taskRef: String(payload?.taskRef || '') }),
+  onMcpTaskEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('mcp:task:event', listener);
+    return () => ipcRenderer.removeListener('mcp:task:event', listener);
+  },
+  respondMcpElicitation: (payload = {}) => ipcRenderer.invoke('mcp:elicitation:respond', {
+    elicitationId: String(payload?.elicitationId || ''),
+    action: String(payload?.action || ''),
+    content: payload?.content && typeof payload.content === 'object' && !Array.isArray(payload.content) ? payload.content : undefined,
+  }),
+  cancelMcpElicitation: (payload = {}) => ipcRenderer.invoke('mcp:elicitation:cancel', { elicitationId: String(payload?.elicitationId || '') }),
+  openMcpElicitationUrl: (payload = {}) => ipcRenderer.invoke('mcp:elicitation:open-url', { elicitationId: String(payload?.elicitationId || '') }),
+  onMcpElicitationEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('mcp:elicitation:event', listener);
+    return () => ipcRenderer.removeListener('mcp:elicitation:event', listener);
+  },
   compactSession: (payload) => ipcRenderer.invoke('session:compact', payload || {}),
   exportSession: (payload) => ipcRenderer.invoke('session:export', payload || {}),
   listMemory: (payload) => ipcRenderer.invoke('memory:list', payload || {}),

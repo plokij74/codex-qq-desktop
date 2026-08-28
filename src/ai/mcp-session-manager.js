@@ -35,6 +35,14 @@ function configFingerprint(config = {}) {
     oauth: config.oauth || {},
     sessionRecovery: config.sessionRecovery === true,
     sampling: { enabled: config.sampling?.enabled === true },
+    tasks: {
+      enabled: config.tasks?.enabled === true,
+      defaultTtlMs: Number(config.tasks?.defaultTtlMs) || 60 * 60 * 1000,
+    },
+    elicitation: {
+      enabled: config.elicitation?.enabled !== false,
+      allowPrivateUrl: config.elicitation?.allowPrivateUrl === true,
+    },
     roots: Array.isArray(config.roots)
       ? config.roots.map((root) => ({ rootId: root.rootId, label: root.label, path: root.path })).sort((a, b) => String(a.rootId).localeCompare(String(b.rootId)))
       : [],
@@ -254,10 +262,23 @@ function createMcpSessionManager(options = {}) {
         if (typeof current?.samplingHandler !== 'function') throw unavailableRequest();
         return current.samplingHandler(...args);
       },
+      elicitationHandler: (...args) => {
+        const current = activeContext();
+        if (typeof current?.elicitationHandler !== 'function') throw unavailableRequest();
+        return current.elicitationHandler(...args);
+      },
+      taskHandler: (method, params, signal) => {
+        const current = activeContext();
+        if (typeof current?.taskHandler !== 'function') throw unavailableRequest();
+        return current.taskHandler(method, params, signal);
+      },
       notificationHandler: (method, params, message) => {
         const current = activeContext();
         if (method === 'notifications/roots/list_changed') current?.onRootsChanged?.(serverName);
         current?.notificationHandler?.(method, params, message);
+      },
+      elicitationComplete: (params, message) => {
+        activeContext()?.elicitationComplete?.(params, message);
       },
       onTransportError: (error) => {
         const current = sessions.get(key);
@@ -341,7 +362,8 @@ function createMcpSessionManager(options = {}) {
 
   async function invalidateOtherProjects(projectPath, reason = 'project-changed') {
     const current = String(projectPath || '');
-    const matches = [...sessions.values()].filter((entry) => entry.projectIdentity !== current);
+    const matches = [...sessions.values()].filter((entry) => entry.projectIdentity !== current
+      && entry.context?.taskRecovery !== true);
     await Promise.all(matches.map((entry) => closeEntry(entry, reason)));
     return matches.length;
   }

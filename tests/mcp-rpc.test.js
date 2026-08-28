@@ -76,4 +76,30 @@ describe('mcp-rpc dispatcher', () => {
     assert.equal(inboundSignal.aborted, true);
     assert.equal(sent.find((message) => message.id === 12).error.data.code, 'MCP_CANCELLED');
   });
+
+  it('routes task requests and forwards task status notification parameters', async () => {
+    const sent = [];
+    const notifications = [];
+    const dispatcher = createMcpRpcDispatcher({
+      send: (message) => sent.push(message),
+      requestHandler: async (method, params) => {
+        assert.equal(method, 'tasks/get');
+        assert.deepEqual(params, { taskId: 'remote-1' });
+        return { taskId: 'remote-1', status: 'working' };
+      },
+      notificationHandler: (method, params) => notifications.push({ method, params }),
+    });
+    dispatcher.dispatch({ jsonrpc: '2.0', id: 21, method: 'tasks/get', params: { taskId: 'remote-1' } });
+    dispatcher.dispatch({
+      jsonrpc: '2.0',
+      method: 'notifications/tasks/status',
+      params: { taskId: 'remote-1', status: 'completed', statusMessage: 'ready' },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(sent.find((message) => message.id === 21).result, { taskId: 'remote-1', status: 'working' });
+    assert.deepEqual(notifications, [{
+      method: 'notifications/tasks/status',
+      params: { taskId: 'remote-1', status: 'completed', statusMessage: 'ready' },
+    }]);
+  });
 });

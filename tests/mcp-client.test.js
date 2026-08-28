@@ -30,6 +30,15 @@ describe('mcp frames', () => {
     assert.equal(msgs.length, 1);
     assert.deepEqual(msgs[0], body);
   });
+
+  it('encodes and reads newline JSON framing', () => {
+    const body = { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} };
+    const reader = createFrameReader();
+    const frame = require('../src/ai/mcp-client').encodeNewlineFrame(body);
+    assert.deepEqual(reader.push(frame.slice(0, 8)), []);
+    assert.deepEqual(reader.push(frame.slice(8)), [body]);
+    assert.equal(reader.getMode(), 'newline');
+  });
 });
 
 describe('createMcpClient', () => {
@@ -193,5 +202,60 @@ describe('createMcpClient', () => {
     const resources = await client.listResources();
     assert.deepEqual(resources, []);
     client.close();
+  });
+
+  it('falls back once from newline framing to a legacy Content-Length server', { timeout: 5000 }, async () => {
+    const child = new EventEmitter();
+    const stdout = new Readable({ read() {} });
+    const stderr = new Readable({ read() {} });
+    let content = Buffer.alloc(0);
+    let ignoredNewlineProbe = false;
+    let initializeCount = 0;
+    const sendLegacyResponse = (message) => {
+      const response = message.method === 'initialize'
+        ? {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'legacy' } },
+        }
+        : { jsonrpc: '2.0', id: message.id, result: { tools: [] } };
+      const body = Buffer.from(JSON.stringify(response), 'utf8');
+      stdout.push(Buffer.from(`Content-Length: ${body.length}\r\n\r\n`));
+      stdout.push(body);
+    };
+    child.stdin = new Writable({
+      write(chunk, _enc, cb) {
+        content = Buffer.concat([content, chunk]);
+        if (content[0] === 123 && content.includes(10)) {
+          ignoredNewlineProbe = true;
+          content = Buffer.alloc(0);
+          cb();
+          return;
+        }
+        const separator = content.indexOf(Buffer.from('\r\n\r\n'));
+        if (separator >= 0) {
+          const match = /Content-Length:\s*(\d+)/i.exec(content.slice(0, separator).toString('utf8'));
+          const length = Number(match?.[1]);
+          const start = separator + 4;
+          if (Number.isSafeInteger(length) && content.length >= start + length) {
+            const message = JSON.parse(content.slice(start, start + length).toString('utf8'));
+            content = content.slice(start + length);
+            if (message.method === 'initialize') initializeCount += 1;
+            sendLegacyResponse(message);
+          }
+        }
+        cb();
+      },
+    });
+    child.stdout = stdout;
+    child.stderr = stderr;
+    child.kill = () => child.emit('exit', 0, null);
+
+    const client = createMcpClient({ command: 'legacy-mcp', spawnFn: () => child });
+    await client.start();
+    assert.equal(ignoredNewlineProbe, true);
+    assert.equal(initializeCount, 1);
+    assert.equal(client.getProtocolVersion(), '2024-11-05');
+    await client.close();
   });
 });

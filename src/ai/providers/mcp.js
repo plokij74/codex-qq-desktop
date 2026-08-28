@@ -20,6 +20,7 @@ function createMcpProvider(options = {}) {
       if (!ctx.extensions) ctx.extensions = {};
       const hub = createMcpHub({
         sessionManager: options.sessionManager || ctx.extensions.mcpSessionManager,
+        taskManager: options.taskManager || ctx.extensions.mcpTaskManager,
         enableSessionRecoveryManager: true,
         onSessionStatus: (status) => ctx.onEvent?.({ type: AGENT_EVENTS.MCP_STATUS, ...status }),
       });
@@ -29,11 +30,15 @@ function createMcpProvider(options = {}) {
         signal: ctx.signal,
         oauthManager: options.oauthManager || ctx.extensions.mcpOAuthManager,
         project: ctx.project,
+        sessionId: ctx.sessionKey,
         onStatus: (st) => {
           ctx.onEvent?.({ type: AGENT_EVENTS.MCP_STATUS, ...st });
         },
         samplingEnabled: ctx.settings?.mode === 'api',
-        samplingHandler: (server, params, signal) => ctx.extensions?.mcpSampling?.(server, params, ctx, signal),
+        samplingHandler: (server, params, signal, releaseConnection) => ctx.extensions?.mcpSampling?.(server, params, ctx, signal, releaseConnection),
+        elicitationHandler: (server, params, signal, releaseConnection) => ctx.extensions?.mcpElicitation?.(server, params, signal, releaseConnection),
+        elicitationComplete: (server, params, message) => ctx.extensions?.mcpElicitationComplete?.(server, params, message),
+        taskHandler: (server, method, params, signal) => ctx.extensions?.mcpTaskHandler?.(server, method, params, signal),
         onRootsChanged: (server) => ctx.onEvent?.({ type: AGENT_EVENTS.MCP_STATUS, server, ok: true, rootsChanged: true }),
       });
     },

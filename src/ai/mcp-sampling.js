@@ -89,7 +89,7 @@ function createMcpSamplingController(options = {}) {
   let calls = 0;
   let outputTokens = 0;
 
-  async function createMessage(server, rawParams = {}, requestSignal) {
+  async function createMessage(server, rawParams = {}, requestSignal, callOptions = {}) {
     const cfg = options.serverConfig?.(server) || options.server || {};
     if (cfg.sampling?.enabled !== true && options.enabled !== true) throw samplingError(ERROR_CODES.DISABLED, 'MCP sampling disabled');
     if (settings.mode !== 'api' || !settings.baseUrl || !settings.model) throw samplingError(ERROR_CODES.UNAVAILABLE, 'MCP sampling requires API mode');
@@ -103,10 +103,11 @@ function createMcpSamplingController(options = {}) {
       .replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted]')
       .replace(/((?:token|secret|password|api[_-]?key|authorization)=)[^&\s]+/gi, '$1[redacted]')
       .slice(0, 1200);
-    const signalController = typeof AbortController !== 'undefined' && signal && requestSignal
+    const runSignal = callOptions.detached === true ? null : signal;
+    const signalController = typeof AbortController !== 'undefined' && runSignal && requestSignal
       ? new AbortController()
       : null;
-    const effectiveSignal = signalController?.signal || requestSignal || signal;
+    const effectiveSignal = signalController?.signal || requestSignal || runSignal;
     const abortForwarders = [];
     if (signalController) {
       const forward = (source) => {
@@ -116,7 +117,7 @@ function createMcpSamplingController(options = {}) {
         else source.addEventListener('abort', onAbort, { once: true });
         abortForwarders.push(() => source.removeEventListener('abort', onAbort));
       };
-      forward(signal);
+      forward(runSignal);
       forward(requestSignal);
     }
     const authorize = async (scope, summary, context) => {

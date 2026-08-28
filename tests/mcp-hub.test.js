@@ -3,6 +3,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { createMcpHub, sanitizeToolPart } = require('../src/ai/mcp-hub');
+const { createMcpTaskManager } = require('../src/ai/mcp-task-manager');
 const { createMcpProvider } = require('../src/ai/providers/mcp');
 const { createDefaultRegistry } = require('../src/ai/providers');
 
@@ -330,6 +331,76 @@ describe('createMcpHub', () => {
 
     await hub.startAll([{ name: 'server-cwd', command: 'node', cwd: '/server' }], { cwd: '/project' });
     assert.equal(acquired[1].cwd, '/server');
+    await hub.stopAll();
+  });
+  it('routes optional and required task-support tools only when server capability is declared', async () => {
+    const taskManager = createMcpTaskManager({ safeStorage: { isEncryptionAvailable: () => false } });
+    const calls = [];
+    const client = {
+      async start() {},
+      async close() {},
+      async listTools() {
+        return [
+          { name: 'required', execution: { taskSupport: 'required' }, inputSchema: { type: 'object' } },
+          { name: 'optional', execution: { taskSupport: 'optional' }, inputSchema: { type: 'object' } },
+          { name: 'sync', execution: { taskSupport: 'forbidden' }, inputSchema: { type: 'object' } },
+        ];
+      },
+      async listResources() { return []; },
+      async listPrompts() { return []; },
+      getServerCapabilities() { return { tasks: { requests: { tools: { call: {} } } } }; },
+      async callTool(name, args, options) { calls.push({ name, args, options }); return { task: { taskId: 'remote-optional', status: 'working' } }; },
+    };
+    const hub = createMcpHub({ taskManager, createClient: () => client });
+    await hub.startAll([{ name: 'demo', command: 'x', transport: 'stdio', tasks: { enabled: true } }], {});
+    const names = hub.getToolDefs().map((item) => item.function.name);
+    assert.ok(names.includes('mcp_demo_required'));
+    assert.ok(names.includes('mcp_demo_optional'));
+    assert.ok(names.includes('mcp_demo_sync'));
+    const result = await hub.call('mcp_demo_optional', {});
+    assert.equal(result.task.status, 'working');
+    assert.equal(calls[0].options.task.ttl > 0, true);
+    await hub.stopAll();
+    taskManager.close();
+  });
+
+  it('runs persisted task restoration only for the startup recovery hub', async () => {
+    let restoreCalls = 0;
+    let releaseCalls = 0;
+    const client = {
+      async start() {},
+      async close() {},
+      async listTools() { return []; },
+      async listResources() { return []; },
+      async listPrompts() { return []; },
+      getServerCapabilities() { return {}; },
+    };
+    const taskManager = {
+      async restore() { restoreCalls += 1; },
+      registerClient() {},
+      hasConnectionHoldingTasks() { return false; },
+      hasActiveTasks() { return false; },
+    };
+    const sessionManager = {
+      async acquire() {
+        return {
+          client,
+          async release() { releaseCalls += 1; },
+          status: () => ({ state: 'connected' }),
+        };
+      },
+      status() { return []; },
+    };
+    const hub = createMcpHub({ sessionManager, taskManager });
+    const config = [{ name: 'demo', command: 'node', tasks: { enabled: true } }];
+
+    await hub.startAll(config, { sessionId: 'ordinary-run' });
+    assert.equal(restoreCalls, 0);
+    await hub.stopAll();
+
+    await hub.startAll(config, { taskRecovery: true });
+    assert.equal(restoreCalls, 1);
+    assert.equal(releaseCalls, 2);
     await hub.stopAll();
   });
 });

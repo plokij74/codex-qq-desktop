@@ -46,6 +46,9 @@ const { createMcpOAuthManager } = require('./ai/mcp-oauth');
 const { createMcpSessionManager } = require('./ai/mcp-session-manager');
 const { createMcpHub } = require('./ai/mcp-hub');
 const { createMcpSamplingController } = require('./ai/mcp-sampling');
+const { createMcpTaskManager } = require('./ai/mcp-task-manager');
+const { createMcpElicitationController } = require('./ai/mcp-elicitation');
+const { configFingerprint } = require('./ai/mcp-session-manager');
 const {
   planCompact,
   serializeOlderTranscript,
@@ -128,6 +131,9 @@ let manualTerm = null;
 let worktreeMutation = false;
 let mcpOAuthManager = null;
 let mcpSessionManager = null;
+let mcpTaskManager = null;
+let mcpElicitationController = null;
+let mcpTaskRecoveryHub = null;
 let quitting = false;
 const oauthFlowOwners = new Map();
 const oauthPendingOwnersByName = new Map();
@@ -187,6 +193,64 @@ function getMcpSessionManager() {
     },
   });
   return mcpSessionManager;
+}
+
+function getMcpTaskManager() {
+  if (mcpTaskManager) return mcpTaskManager;
+  mcpTaskManager = createMcpTaskManager({
+    userDataPath: userDataPath(),
+    onEvent: (event) => {
+      for (const win of BrowserWindow.getAllWindows()) safeSend(win.webContents, 'mcp:task:event', event);
+    },
+  });
+  return mcpTaskManager;
+}
+
+function getMcpElicitationController() {
+  if (mcpElicitationController) return mcpElicitationController;
+  mcpElicitationController = createMcpElicitationController({
+    onEvent: (event) => {
+      for (const win of BrowserWindow.getAllWindows()) safeSend(win.webContents, 'mcp:elicitation:event', event);
+    },
+    openExternal: (url) => shell.openExternal(url),
+    allowPrivateUrlForServer: (name) => loadSettings(userDataPath()).mcpServers
+      .some((server) => server.name === String(name || '') && server.elicitation?.allowPrivateUrl === true),
+  });
+  return mcpElicitationController;
+}
+
+async function restoreMcpTasksAtStartup() {
+  const taskManager = getMcpTaskManager();
+  const active = taskManager.list().filter((task) => task.needsRecovery === true);
+  if (!active.length) return;
+  const settings = loadSettings(userDataPath());
+  const enabledByName = new Map(settings.mcpServers
+    .filter((server) => server.enabled !== false)
+    .map((server) => [server.name, server]));
+  const currentFingerprint = (serverName) => {
+    const server = enabledByName.get(serverName);
+    return server ? configFingerprint(server) : '';
+  };
+  const serverNames = new Set(taskManager.recoveryServerNames(currentFingerprint));
+  const servers = [...enabledByName.values()].filter((server) => serverNames.has(server.name));
+  if (!servers.length) {
+    await taskManager.restore({ getClient: () => null, getConfigFingerprint: currentFingerprint });
+    return;
+  }
+  const hub = createMcpHub({
+    sessionManager: getMcpSessionManager(),
+    taskManager,
+  });
+  try {
+    await hub.startAll(servers, {
+      taskRecovery: true,
+      // Startup recovery only monitors persisted tool tasks. It deliberately
+      // has no Agent, roots, sampling, or elicitation callback context.
+    });
+    mcpTaskRecoveryHub = hub;
+  } catch {
+    await hub.close().catch(() => {});
+  }
 }
 
 function cancelOAuthFlowsForSender(senderId) {
@@ -270,6 +334,14 @@ function publicMcpServer(server, status, senderId) {
     enabled: server?.enabled !== false,
     sessionRecovery: server?.sessionRecovery === true,
     sampling: { enabled: server?.sampling?.enabled === true },
+    tasks: {
+      enabled: server?.tasks?.enabled === true,
+      defaultTtlMs: Number(server?.tasks?.defaultTtlMs) || 60 * 60 * 1000,
+    },
+    elicitation: {
+      enabled: server?.elicitation?.enabled !== false,
+      allowPrivateUrl: server?.elicitation?.allowPrivateUrl === true,
+    },
     roots: Array.isArray(server?.roots) ? server.roots.map((root) => ({
       rootId: makePublicRootToken(senderId, server.name, root.rootId),
       label: root.label,
@@ -332,6 +404,7 @@ function toPublicSettings(s, senderId) {
     subagentEnabled: s.subagentEnabled !== false,
     mcpEnabled: Boolean(s.mcpEnabled),
     mcpServers: servers.map((server) => publicMcpServer(server, statuses.get(server.name), senderId)),
+    mcpTasksPersistence: getMcpTaskManager().persistence(),
     hooksEnabled: s.hooksEnabled !== false,
     exploreMaxParallel: (() => {
       const n = Number(s.exploreMaxParallel);
@@ -433,6 +506,7 @@ function createWindow() {
   });
   win.webContents.once('destroyed', () => worktreeIpc.dropSender(worktreeSenderId));
   win.webContents.once('destroyed', () => cancelOAuthFlowsForSender(worktreeSenderId));
+  win.webContents.once('destroyed', () => mcpElicitationController?.cancelOwner?.(worktreeSenderId));
   win.webContents.once('destroyed', () => {
     dropMcpRootTokens(worktreeSenderId);
     mcpProjectBySender.delete(worktreeSenderId);
@@ -455,6 +529,7 @@ if (!hasSingleInstanceLock) {
     Menu?.setApplicationMenu(null);
     getMcpOAuthManager();
     createWindow();
+    restoreMcpTasksAtStartup().catch(() => {});
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -472,6 +547,8 @@ app.on('before-quit', (event) => {
   Promise.all([
     Promise.resolve().then(() => mcpOAuthManager?.closeAll?.()),
     Promise.resolve().then(() => mcpSessionManager?.closeAll?.()),
+    Promise.resolve().then(() => mcpTaskManager?.close?.()),
+    Promise.resolve().then(() => mcpElicitationController?.cancelAll?.()),
   ]).catch(() => {}).finally(() => app.quit());
 });
 
@@ -587,10 +664,29 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
         }).filter(Boolean),
       };
     });
+    const incomingByName = new Map(nextPartial.mcpServers.map((server) => [server.name, server]));
+    const locked = [];
+    for (const current of currentSettings.mcpServers || []) {
+      if (getMcpTaskManager().canChangeServer(current.name)) continue;
+      const incoming = incomingByName.get(current.name);
+      if (!incoming || configFingerprint(current) !== configFingerprint(incoming)) {
+        locked.push({
+          server: current.name,
+          tasks: getMcpTaskManager().list({ server: current.name })
+            .filter((task) => task.canCancel || task.canAbandon),
+        });
+      }
+    }
+    if (locked.length) {
+      return { ok: false, code: 'MCP_TASKS_CONFIG_LOCKED', error: '该 MCP 服务器仍有后台任务，请先取消或遗弃任务引用', locked };
+    }
   }
   const saved = saveSettings(userDataPath(), nextPartial);
   if ('mcpServers' in nextPartial) {
-    await getMcpSessionManager().invalidate(null, 'config-changed');
+    await getMcpSessionManager().invalidate(
+      (entry) => getMcpTaskManager().canChangeServer(entry.serverName),
+      'config-changed',
+    );
   }
   return toPublicSettings(saved, event.sender.id);
 });
@@ -673,6 +769,9 @@ ipcMain.handle('mcp:roots:choose', async (event, payload = {}) => {
   const name = String(payload?.name || '').trim();
   const { settings, server } = savedMcpServer(name);
   if (!server) return { ok: false, code: 'MCP_SERVER_NOT_FOUND', error: 'MCP 服务器未保存' };
+  if (!getMcpTaskManager().canChangeServer(name)) {
+    return { ok: false, code: 'MCP_TASKS_CONFIG_LOCKED', error: '该 MCP 服务器仍有后台任务，请先取消或遗弃任务引用' };
+  }
   const currentRoots = Array.isArray(server.roots) ? server.roots : [];
   if (currentRoots.length >= 8) return { ok: false, code: 'MCP_ROOT_LIMIT', error: '每个 MCP 服务器最多授权 8 个目录' };
   const win = windowFromEvent(event);
@@ -713,6 +812,9 @@ ipcMain.handle('mcp:roots:remove', async (event, payload = {}) => {
   if (!persistedRootId) return { ok: false, code: 'MCP_ROOT_OWNER', error: '无权操作此目录授权' };
   const { settings, server } = savedMcpServer(name);
   if (!server) return { ok: false, code: 'MCP_SERVER_NOT_FOUND', error: 'MCP 服务器未保存' };
+  if (!getMcpTaskManager().canChangeServer(name)) {
+    return { ok: false, code: 'MCP_TASKS_CONFIG_LOCKED', error: '该 MCP 服务器仍有后台任务，请先取消或遗弃任务引用' };
+  }
   const roots = (server.roots || []).filter((root) => root.rootId !== persistedRootId);
   if (roots.length === (server.roots || []).length) return { ok: false, code: 'MCP_ROOT_NOT_FOUND', error: '目录授权不存在' };
   const saved = saveSettings(userDataPath(), { mcpServers: settings.mcpServers.map((item) => item.name === name ? { ...item, roots } : item) });
@@ -734,8 +836,84 @@ ipcMain.handle('mcp:session:status', async (_event, payload = {}) => {
 
 ipcMain.handle('mcp:session:reset', async (_event, payload = {}) => {
   const name = payload?.name ? String(payload.name).trim() : null;
+  if (!getMcpTaskManager().canChangeServer(name || undefined)) {
+    return { ok: false, code: 'MCP_TASKS_CONFIG_LOCKED', error: '该 MCP 服务器仍有后台任务，请先取消或遗弃任务引用' };
+  }
   await getMcpSessionManager().invalidate(name, 'manual-reset');
   return { ok: true };
+});
+
+function taskRefFromPayload(payload) {
+  const ref = String(payload?.taskRef || '').trim();
+  if (!/^mcp_task_[a-f0-9]{16,64}$/.test(ref)) {
+    const error = new Error('任务引用无效');
+    error.code = 'MCP_TASK_INVALID';
+    throw error;
+  }
+  return ref;
+}
+
+ipcMain.handle('mcp:tasks:list', async (_event, payload = {}) => {
+  const server = payload?.server ? String(payload.server).trim().slice(0, 96) : '';
+  const limit = Number(payload?.limit);
+  return { ok: true, persistence: getMcpTaskManager().persistence(), tasks: getMcpTaskManager().list({ server, limit }) };
+});
+
+ipcMain.handle('mcp:tasks:get', async (_event, payload = {}) => {
+  try { return { ok: true, task: getMcpTaskManager().get(taskRefFromPayload(payload)) }; }
+  catch (error) { return { ok: false, code: error.code || 'MCP_TASK_NOT_FOUND', error: error.message }; }
+});
+
+ipcMain.handle('mcp:tasks:result', async (_event, payload = {}) => {
+  try {
+    const result = await getMcpTaskManager().result(taskRefFromPayload(payload));
+    return { ok: true, result };
+  } catch (error) { return { ok: false, code: error.code || 'MCP_TASK_RESULT_UNAVAILABLE', error: error.message }; }
+});
+
+ipcMain.handle('mcp:tasks:result:prepare', async (_event, payload = {}) => {
+  try {
+    const targetSessionId = String(payload?.targetSessionId || '').trim().slice(0, 160);
+    if (!targetSessionId) return { ok: false, code: 'MCP_TASK_CLAIM_INVALID', error: '目标会话不能为空' };
+    return await getMcpTaskManager().prepareResultClaim(taskRefFromPayload(payload), targetSessionId);
+  } catch (error) { return { ok: false, code: error.code || 'MCP_TASK_CLAIM_INVALID', error: error.message }; }
+});
+
+ipcMain.handle('mcp:tasks:result:commit', async (_event, payload = {}) => {
+  try {
+    const claimId = String(payload?.claimId || '').trim();
+    if (!/^mcp_claim_[a-f0-9]{16,64}$/.test(claimId)) return { ok: false, code: 'MCP_TASK_CLAIM_INVALID', error: '认领凭证无效' };
+    return await getMcpTaskManager().commitResultClaim(claimId, String(payload?.targetSessionId || '').trim().slice(0, 160));
+  } catch (error) { return { ok: false, code: error.code || 'MCP_TASK_CLAIM_INVALID', error: error.message }; }
+});
+
+ipcMain.handle('mcp:tasks:cancel', async (_event, payload = {}) => {
+  try { return { ok: true, task: await getMcpTaskManager().cancel(taskRefFromPayload(payload)) }; }
+  catch (error) { return { ok: false, code: error.code || 'MCP_TASK_CANCEL_FAILED', error: error.message }; }
+});
+
+ipcMain.handle('mcp:tasks:abandon', async (_event, payload = {}) => {
+  try { return { ok: true, task: getMcpTaskManager().abandon(taskRefFromPayload(payload)) }; }
+  catch (error) { return { ok: false, code: error.code || 'MCP_TASK_NOT_FOUND', error: error.message }; }
+});
+
+ipcMain.handle('mcp:elicitation:respond', async (event, payload = {}) => {
+  try {
+    const id = String(payload?.elicitationId || '').trim();
+    const action = String(payload?.action || '').trim();
+    const content = payload?.content && typeof payload.content === 'object' && !Array.isArray(payload.content) ? payload.content : undefined;
+    return { ok: true, response: getMcpElicitationController().respond(id, action, content, event.sender.id) };
+  } catch (error) { return { ok: false, code: error.code || 'MCP_ELICITATION_SCHEMA_INVALID', error: error.message }; }
+});
+
+ipcMain.handle('mcp:elicitation:cancel', async (event, payload = {}) => {
+  try { return { ok: true, cancelled: getMcpElicitationController().cancel(String(payload?.elicitationId || ''), event.sender.id) }; }
+  catch (error) { return { ok: false, code: error.code || 'MCP_ELICITATION_CANCELLED', error: error.message }; }
+});
+
+ipcMain.handle('mcp:elicitation:open-url', async (event, payload = {}) => {
+  try { return await getMcpElicitationController().openUrl(String(payload?.elicitationId || ''), event.sender.id); }
+  catch (error) { return { ok: false, code: error.code || 'MCP_ELICITATION_OPEN_FAILED', error: error.message }; }
 });
 
 async function withPromptHub(senderId, payload, callback) {
@@ -818,6 +996,9 @@ ipcMain.handle('mcp:oauth:logout', async (_event, payload = {}) => {
   const settings = loadSettings(userDataPath());
   const cfg = settings.mcpServers.find((item) => item.name === name);
   if (!cfg || cfg.auth !== 'oauth') return { ok: false, code: 'MCP_OAUTH_METADATA_INVALID', error: 'OAuth MCP 配置不存在' };
+  if (!getMcpTaskManager().canChangeServer(name)) {
+    return { ok: false, code: 'MCP_TASKS_CONFIG_LOCKED', error: '该 MCP 服务器仍有后台任务，请先取消或遗弃任务引用' };
+  }
   try {
     const result = await getMcpOAuthManager().logout(name, cfg);
     await getMcpSessionManager().invalidate(name, 'oauth-logout');
@@ -1355,12 +1536,75 @@ async function startChatRun(event, payload = {}, opts = {}) {
       },
       onEvent: emit,
     });
+    const taskManager = getMcpTaskManager();
+    const elicitation = getMcpElicitationController();
+    const taskHandler = (server, method, params, requestSignal) => taskManager.handleTaskRequest(server, method, params, requestSignal);
+    const elicitationHandler = (server, params, requestSignal, releaseConnection) => {
+      const cfg = settings.mcpServers.find((item) => item.name === String(server || '').trim());
+      if (!cfg || cfg.elicitation?.enabled === false) {
+        const error = new Error('MCP elicitation disabled');
+        error.code = 'MCP_ELICITATION_DISABLED';
+        throw error;
+      }
+      const response = elicitation.create(server, params, sender.id);
+      const elicitationId = response?.elicitationId;
+      const cancelOnAbort = () => {
+        try { if (elicitationId) elicitation.cancel(elicitationId, sender.id); } catch { /* request may already be complete */ }
+      };
+      requestSignal?.addEventListener?.('abort', cancelOnAbort, { once: true });
+      const taskEnabled = cfg.tasks?.enabled === true && params?.task;
+      if (taskEnabled) {
+        const created = taskManager.receiverResult({
+          serverName: server,
+          transport: cfg.transport,
+          kind: 'elicitation',
+          remoteTaskId: params.task.taskId,
+          ttl: params.task.ttl,
+          sourceSessionId: sessionId,
+          sourceProjectPath: project?.path,
+          status: 'input_required',
+          execute: () => response,
+          cancelExecution: async () => cancelOnAbort(),
+          releaseConnection,
+        });
+        return created.task;
+      }
+      return response;
+    };
+    const samplingHandler = (server, params, requestSignal, releaseConnection) => {
+      const cfg = settings.mcpServers.find((item) => item.name === String(server || '').trim());
+      const taskEnabled = cfg?.tasks?.enabled === true && params?.task;
+      const response = samplingController.createMessage(server, params, requestSignal, { detached: taskEnabled });
+      if (taskEnabled) {
+        const created = taskManager.receiverResult({
+          serverName: server,
+          transport: cfg.transport,
+          kind: 'sampling',
+          remoteTaskId: params.task.taskId,
+          ttl: params.task.ttl,
+          sourceSessionId: sessionId,
+          sourceProjectPath: project?.path,
+          execute: () => response,
+          releaseConnection,
+        });
+        return created.task;
+      }
+      return response;
+    };
     const runExtensions = {
       userDataPath: userDataPath(),
       worktreeManager,
       mcpOAuthManager: getMcpOAuthManager(),
       mcpSessionManager: getMcpSessionManager(),
-      mcpSampling: (server, params, _ctx, requestSignal) => samplingController.createMessage(server, params, requestSignal),
+      mcpTaskManager: taskManager,
+      mcpTaskHandler: taskHandler,
+      mcpElicitation: elicitationHandler,
+      mcpElicitationComplete: (server, params) => {
+        const id = String(params?.elicitationId || '').trim();
+        if (!id) return false;
+        try { return elicitation.complete(id); } catch { return false; }
+      },
+      mcpSampling: (server, params, _ctx, requestSignal, releaseConnection) => samplingHandler(server, params, requestSignal, releaseConnection),
     };
     // Expand @refs only on the copy fed to the model (history keeps original).
     const modelMessages = messagesForModel(messages, project?.path || null);

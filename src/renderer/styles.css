@@ -455,6 +455,10 @@ html, body {
   font-family: inherit;
 }
 .field-hint { color: #6a87a3; }
+.mcp-elicitation-server { color: #2b679e; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+.mcp-elicitation-message { color: #345; line-height: 1.5; white-space: pre-wrap; user-select: text; }
+.mcp-url-box { border: 1px solid #b8cde0; background: #eef6fd; padding: 10px; margin: 10px 0; user-select: text; overflow-wrap: anywhere; }
+.mcp-url-box code { color: #24577f; }
 .hooks-summary {
   font-size: 12px;
   color: #333;
@@ -685,6 +689,15 @@ html, body {
 .work-card-title { font-weight: 700; color: #1f4f80; margin-bottom: 4px; }
 .work-card-meta { font-size: 12px; color: #567; margin-bottom: 8px; }
 .work-card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.mcp-task-list { display: flex; flex-direction: column; gap: 10px; }
+.mcp-task-card code { color: #567; user-select: text; }
+.work-card-error { color: #9a3c44; font-size: 12px; margin: 4px 0 8px; }
+.work-card-notice { color: #7a5b1c; font-size: 12px; margin: 4px 0 8px; }
+.work-empty { color: #6a87a3; padding: 18px 4px; }
+.mcp-inline-tasks { margin: 4px 0 10px 38px; max-width: 78%; }
+.mcp-inline-task { display: flex; justify-content: space-between; gap: 10px; border: 1px solid #bfd3e6; background: #f1f7fd; color: #345; padding: 5px 8px; margin-top: 4px; border-radius: 4px; font-size: 11px; }
+.mcp-inline-task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-inline-task-status { color: #2b679e; white-space: nowrap; }
 .badge {
   display: inline-block;
   padding: 0 6px;

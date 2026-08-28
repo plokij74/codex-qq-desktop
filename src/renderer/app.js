@@ -62,6 +62,11 @@ let defaultAgentModeSeed = 'agent';
 /** Active agent/stream run for the current send (event-driven UI). */
 let chatRun = null;
 
+// MCP task and elicitation state is deliberately ephemeral.  It is hydrated
+// from main on demand and is never included in saveState/session export.
+const mcpTaskState = new Map();
+let mcpElicitationModal = null;
+
 /** Manual / agent terminal panel state (shared output; multi-termId aware). */
 let termState = {
   /** @type {Map<string, { source: string, command: string }>} */
@@ -1374,7 +1379,7 @@ function renderMessages() {
     const who = msg.role === 'user' ? '我' : (msg.compact ? '会话摘要' : botName);
     const strip = msg.role === 'assistant' ? fileChangesStripHtml(msg.fileChanges) : '';
     return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+strip+renderMarkdownLite(msg.content)+'</div></div>';
-  }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '');
+  }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '') + renderInlineMcpTasks();
   renderWorktreeCards(list, session);
   bindFileChangesToggles(list);
   if (liveRun && chatRun.el) {
@@ -1889,6 +1894,147 @@ function finalizeChatRun(opts = {}) {
   chatRun = null;
   saveState();
   renderMessages();
+}
+
+function mcpTaskStatusText(status) {
+  return ({ working: '执行中', input_required: '等待输入', completed: '已完成', failed: '失败', cancelled: '已取消' })[status] || String(status || '未知');
+}
+
+function mcpTaskDispositionText(disposition) {
+  return ({ orphaned: '已孤立', abandoned: '已遗弃', claimed: '已认领' })[disposition] || '';
+}
+
+function renderInlineMcpTasks() {
+  const items = [...mcpTaskState.values()].slice(0, 6);
+  if (!items.length) return '';
+  return '<div class="mcp-inline-tasks">' + items.map((task) => '<div class="mcp-inline-task" data-task-ref="' + escapeHtml(task.taskRef) + '"><span class="mcp-inline-task-title">后台任务 · ' + escapeHtml(task.server || '') + (task.tool ? '/' + escapeHtml(task.tool) : '') + '</span><span class="mcp-inline-task-status">' + escapeHtml(mcpTaskStatusText(task.status)) + '</span></div>').join('') + '</div>';
+}
+
+function renderMcpTaskCenter() {
+  const body = document.getElementById('work-body');
+  if (!body) return;
+  const tasks = [...mcpTaskState.values()].sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
+  if (!tasks.length) {
+    body.innerHTML = '<div class="work-empty">暂无 MCP 后台任务</div>';
+    return;
+  }
+  body.innerHTML = '<div class="mcp-task-list">' + tasks.map((task) => {
+    const ref = escapeHtml(task.taskRef);
+    const title = escapeHtml([task.server, task.tool].filter(Boolean).join(' / ') || task.kind || 'MCP 任务');
+    const error = task.statusMessage ? '<div class="work-card-error">' + escapeHtml(task.statusMessage) + '</div>' : '';
+    const notices = [
+      task.localDisposition === 'orphaned'
+        ? '<div class="work-card-notice">远端状态可能已变化，确认结果后才能认领。</div>'
+        : '',
+      task.needsRecovery
+        ? '<div class="work-card-notice">正在等待恢复连接，当前状态不确定。</div>'
+        : '',
+      task.resultTruncated
+        ? '<div class="work-card-notice">保存的任务结果已截断。</div>'
+        : '',
+    ].join('');
+    const actions = (task.canCancel ? '<button type="button" class="ghost-btn" data-mcp-task-cancel="' + ref + '">取消</button>' : '')
+      + (task.canAbandon ? '<button type="button" class="ghost-btn" data-mcp-task-abandon="' + ref + '">遗弃引用</button>' : '')
+      + (task.status === 'completed' && task.canClaim ? '<button type="button" class="ghost-btn" data-mcp-task-view="' + ref + '">查看结果</button><button type="button" class="ghost-btn" data-mcp-task-claim="' + ref + '">认领到当前会话</button>' : '');
+    const disposition = mcpTaskDispositionText(task.localDisposition);
+    return '<div class="work-card mcp-task-card"><div class="work-card-title">' + title + '</div><div class="work-card-meta"><code>' + ref + '</code> · <span class="badge ' + escapeHtml(task.status || '') + '">' + escapeHtml(mcpTaskStatusText(task.status)) + '</span>' + (disposition ? ' · <span class="badge local-disposition">' + escapeHtml(disposition) + '</span>' : '') + ' · ' + escapeHtml(task.lastUpdatedAt || '') + '</div>' + error + notices + '<div class="work-card-actions">' + actions + '</div></div>';
+  }).join('') + '</div>';
+  body.querySelectorAll('[data-mcp-task-cancel]').forEach((button) => button.addEventListener('click', async () => {
+    if (!(await appConfirm('确定取消这个 MCP 后台任务？'))) return;
+    const result = await window.codex.cancelMcpTask({ taskRef: button.dataset.mcpTaskCancel });
+    if (!result?.ok) toast(result?.error || '取消失败');
+  }));
+  body.querySelectorAll('[data-mcp-task-abandon]').forEach((button) => button.addEventListener('click', async () => {
+    if (!(await appConfirm('遗弃只会停止本地监控，不会取消远端任务。继续？'))) return;
+    const result = await window.codex.abandonMcpTask({ taskRef: button.dataset.mcpTaskAbandon });
+    if (!result?.ok) toast(result?.error || '遗弃失败');
+  }));
+  body.querySelectorAll('[data-mcp-task-view]').forEach((button) => button.addEventListener('click', () => viewMcpTaskResult(button.dataset.mcpTaskView)));
+  body.querySelectorAll('[data-mcp-task-claim]').forEach((button) => button.addEventListener('click', () => claimMcpTask(button.dataset.mcpTaskClaim)));
+}
+
+async function loadMcpTasks() {
+  if (!window.codex?.listMcpTasks) return;
+  const response = await window.codex.listMcpTasks({ limit: 500 }).catch(() => null);
+  if (response?.ok && Array.isArray(response.tasks)) {
+    mcpTaskState.clear();
+    response.tasks.forEach((task) => mcpTaskState.set(task.taskRef, task));
+  }
+  if (currentView === 'scheduled') renderMcpTaskCenter();
+  renderMessages();
+}
+
+async function viewMcpTaskResult(taskRef) {
+  const response = await window.codex.getMcpTaskResult({ taskRef });
+  if (!response?.ok) return toast(response?.error || '任务结果不可用');
+  let text;
+  try { text = typeof response.result === 'string' ? response.result : JSON.stringify(response.result, null, 2); } catch { text = ''; }
+  const truncated = mcpTaskState.get(taskRef)?.resultTruncated === true;
+  toast((truncated ? '结果已截断：\n' : '') + (text.slice(0, 3000) || '任务没有可显示结果'), 6000);
+}
+
+async function claimMcpTask(taskRef) {
+  const target = activeSession();
+  if (!target?.id) return toast('当前没有可用会话');
+  const prepared = await window.codex.prepareMcpTaskResult({ taskRef, targetSessionId: target.id });
+  if (!prepared?.ok) return toast(prepared?.error || '无法准备认领');
+  let preview;
+  try { preview = typeof prepared.preview === 'string' ? prepared.preview : JSON.stringify(prepared.preview, null, 2); } catch { preview = ''; }
+  if (!(await appConfirm('确认将任务结果作为新消息发送到当前会话？\n\n' + String(preview || '').slice(0, 1200)))) return;
+  const committed = await window.codex.commitMcpTaskResult({ claimId: prepared.claimId, targetSessionId: target.id });
+  if (!committed?.ok) return toast(committed?.error || '认领失败');
+  let content;
+  try { content = typeof committed.result === 'string' ? committed.result : JSON.stringify(committed.result, null, 2); } catch { content = ''; }
+  target.messages.push({ role: 'assistant', content: 'MCP 后台任务结果：\n\n' + String(content || '').slice(0, 65536) });
+  target.updatedAt = Date.now();
+  saveState();
+  renderMessages();
+  toast('任务结果已发送到当前会话');
+}
+
+function closeMcpElicitationModal() {
+  if (mcpElicitationModal) mcpElicitationModal.remove();
+  mcpElicitationModal = null;
+}
+
+function showMcpElicitation(request) {
+  closeMcpElicitationModal();
+  const modal = document.createElement('div');
+  modal.className = 'modal mcp-elicitation-modal';
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-modal', 'true');
+  const fields = request.mode === 'form' ? (request.schema?.fields || []).map((field) => {
+    const required = request.schema?.required?.includes(field.name) ? ' required' : '';
+    const label = '<span>' + escapeHtml(field.title || field.name) + (required ? ' *' : '') + '</span>';
+    if (Array.isArray(field.enum)) return '<label class="field">' + label + '<select data-mcp-field="' + escapeHtml(field.name) + '"' + required + '>' + field.enum.map((value) => '<option value="' + escapeHtml(String(value)) + '"' + (Object.is(value, field.default) ? ' selected' : '') + '>' + escapeHtml(String(value)) + '</option>').join('') + '</select></label>';
+    if (field.type === 'boolean') return '<label class="switch-row"><input type="checkbox" data-mcp-field="' + escapeHtml(field.name) + '"' + (field.default === true ? ' checked' : '') + ' /><span>' + escapeHtml(field.title || field.name) + (required ? ' *' : '') + '</span></label>';
+    const type = field.type === 'number' || field.type === 'integer' ? 'number' : 'text';
+    const constraints = (field.minLength != null ? ' minlength="' + field.minLength + '"' : '') + (field.maxLength != null ? ' maxlength="' + field.maxLength + '"' : '') + (field.minimum != null ? ' min="' + field.minimum + '"' : '') + (field.maximum != null ? ' max="' + field.maximum + '"' : '');
+    const defaultValue = field.default === undefined ? '' : ' value="' + escapeHtml(String(field.default)) + '"';
+    return '<label class="field">' + label + '<input type="' + type + '" data-mcp-field="' + escapeHtml(field.name) + '"' + required + constraints + defaultValue + ' /><small class="field-hint">' + escapeHtml(field.description || '') + '</small></label>';
+  }).join('') : '<div class="mcp-url-box"><div class="field-hint">将使用系统浏览器打开：</div><code>' + escapeHtml(request.url || '') + '</code></div>';
+  modal.innerHTML = '<div class="modal-card"><div class="modal-title">' + escapeHtml(request.title || 'MCP 请求输入') + '</div><div class="mcp-elicitation-server">' + escapeHtml(request.server || '') + '</div><p class="mcp-elicitation-message">' + escapeHtml(request.message || '') + '</p>' + fields + '<div class="modal-actions"><button type="button" class="btn-secondary" data-mcp-elicit="cancel">取消</button>' + (request.mode === 'url' ? '<button type="button" class="btn-secondary" data-mcp-elicit="open">打开浏览器</button>' : '') + '<button type="button" class="btn-secondary" data-mcp-elicit="decline">拒绝</button><button type="button" class="btn-primary" data-mcp-elicit="accept">同意</button></div></div>';
+  document.body.appendChild(modal);
+  mcpElicitationModal = modal;
+  const send = async (action) => {
+    let content;
+    if (action === 'accept' && request.mode === 'form') {
+      content = {};
+      modal.querySelectorAll('[data-mcp-field]').forEach((input) => {
+        if (input.type === 'checkbox') content[input.dataset.mcpField] = input.checked;
+        else if (input.value !== '') content[input.dataset.mcpField] = input.type === 'number' ? Number(input.value) : input.value;
+      });
+    }
+    if (action === 'open') {
+      const opened = await window.codex.openMcpElicitationUrl({ elicitationId: request.elicitationId });
+      if (!opened?.ok) toast(opened?.error || '无法打开浏览器');
+      return;
+    }
+    const response = await window.codex.respondMcpElicitation({ elicitationId: request.elicitationId, action, content });
+    if (!response?.ok) return toast(response?.error || '响应失败');
+    closeMcpElicitationModal();
+  };
+  modal.querySelectorAll('[data-mcp-elicit]').forEach((button) => button.addEventListener('click', () => send(button.dataset.mcpElicit).catch((error) => toast(error?.message || '响应失败'))));
 }
 
 function handleWorktreeEvent(ev) {
@@ -2730,9 +2876,8 @@ function showWorkView(view) {
   document.getElementById('work-sub').textContent = '可点击条目执行操作';
   const body = document.getElementById('work-body');
   if (view === 'scheduled') {
-    body.innerHTML = '<div class="card-list">' + SCHEDULED.map((t) => '<div class="work-card"><div class="work-card-title">⏰ ' + escapeHtml(t.title) + '</div><div class="work-card-meta">' + escapeHtml(t.when) + ' · <span class="badge ' + t.status + '">' + t.status + '</span></div><div class="work-card-actions"><button type="button" class="ghost-btn" data-act="run" data-id="' + t.id + '">立即运行</button><button type="button" class="ghost-btn" data-act="chat" data-id="' + t.id + '">交给 Codex</button></div></div>').join('') + '</div>';
-    body.querySelectorAll('[data-act="run"]').forEach((btn) => btn.addEventListener('click', () => toast('已触发：' + (SCHEDULED.find((x) => x.id === btn.dataset.id)?.title || ''))));
-    body.querySelectorAll('[data-act="chat"]').forEach((btn) => { const item = SCHEDULED.find((x) => x.id === btn.dataset.id); btn.addEventListener('click', () => ensureTaskAndAsk(item?.title || '定时任务', '帮我检查定时任务：' + item?.title)); });
+    renderMcpTaskCenter();
+    loadMcpTasks().catch(() => {});
   }
   if (view === 'plugins') {
     body.innerHTML = '<div class="card-list">' + PLUGINS.map((p) => '<div class="work-card"><div class="work-card-title">🧩 ' + escapeHtml(p.name) + '</div><div class="work-card-meta">' + escapeHtml(p.desc) + '</div><label class="switch-row"><input type="checkbox" data-plugin="' + p.id + '" ' + (pluginState[p.id] ? 'checked' : '') + '/><span>' + (pluginState[p.id] ? '已启用' : '已禁用') + '</span></label></div>').join('') + '</div>';
@@ -3376,6 +3521,8 @@ function cloneMcpServer(s) {
     url: String(s?.url || ''),
     sessionRecovery: s?.sessionRecovery === true,
     sampling: { enabled: s?.sampling?.enabled === true },
+    tasks: { enabled: s?.tasks?.enabled === true, defaultTtlMs: Number(s?.tasks?.defaultTtlMs) || 3600000 },
+    elicitation: { enabled: s?.elicitation?.enabled !== false, allowPrivateUrl: s?.elicitation?.allowPrivateUrl === true },
     roots: Array.isArray(s?.roots) ? s.roots.map((root) => ({ rootId: String(root?.rootId || ''), label: String(root?.label || '') })).filter((root) => root.rootId && root.label) : [],
     session: s?.session && typeof s.session === 'object' ? { state: String(s.session.state || 'disabled'), reusable: s.session.reusable === true, lastErrorCode: s.session.lastErrorCode ? String(s.session.lastErrorCode) : null } : undefined,
   };
@@ -3405,6 +3552,8 @@ function serializeMcpServerList() {
       enabled: s.enabled !== false,
       sessionRecovery: s.sessionRecovery === true,
       sampling: { enabled: s.sampling?.enabled === true },
+      tasks: { enabled: s.tasks?.enabled === true, defaultTtlMs: Number(s.tasks?.defaultTtlMs) || 3600000 },
+      elicitation: { enabled: s.elicitation?.enabled !== false, allowPrivateUrl: s.elicitation?.allowPrivateUrl === true },
       roots: Array.isArray(s.roots) ? s.roots.map((root) => ({ rootId: String(root?.rootId || ''), label: String(root?.label || '') })).filter((root) => root.rootId && root.label).slice(0, 8) : [],
     };
     if (transport === 'stdio') {
@@ -3651,6 +3800,45 @@ function renderMcpServerList() {
     samplingLabel.appendChild(document.createTextNode('允许 Sampling（每次询问）'));
     samplingLabel.title = '服务端请求模型采样时始终需要审批，full-auto 也不会绕过';
     d9Options.appendChild(samplingLabel);
+
+    const tasksLabel = document.createElement('label');
+    const tasksInput = document.createElement('input');
+    tasksInput.type = 'checkbox';
+    tasksInput.checked = s.tasks?.enabled === true;
+    tasksInput.addEventListener('change', () => { if (!mcpServerDrafts[idx].tasks) mcpServerDrafts[idx].tasks = {}; mcpServerDrafts[idx].tasks.enabled = tasksInput.checked; });
+    tasksLabel.appendChild(tasksInput);
+    tasksLabel.appendChild(document.createTextNode('允许后台 Tasks'));
+    tasksLabel.title = '仅在服务端声明 task 能力且工具允许时生效，默认关闭';
+    d9Options.appendChild(tasksLabel);
+
+    const ttlLabel = document.createElement('label');
+    ttlLabel.appendChild(document.createTextNode('默认 TTL'));
+    const ttlInput = document.createElement('input');
+    ttlInput.type = 'number';
+    ttlInput.min = '60000';
+    ttlInput.max = '86400000';
+    ttlInput.step = '60000';
+    ttlInput.value = String(Number(s.tasks?.defaultTtlMs) || 3600000);
+    ttlInput.addEventListener('change', () => { if (!mcpServerDrafts[idx].tasks) mcpServerDrafts[idx].tasks = {}; mcpServerDrafts[idx].tasks.defaultTtlMs = Number(ttlInput.value) || 3600000; });
+    ttlLabel.appendChild(ttlInput);
+    d9Options.appendChild(ttlLabel);
+
+    const elicitationLabel = document.createElement('label');
+    const elicitationInput = document.createElement('input');
+    elicitationInput.type = 'checkbox';
+    elicitationInput.checked = s.elicitation?.enabled !== false;
+    elicitationInput.addEventListener('change', () => { if (!mcpServerDrafts[idx].elicitation) mcpServerDrafts[idx].elicitation = {}; mcpServerDrafts[idx].elicitation.enabled = elicitationInput.checked; });
+    elicitationLabel.appendChild(elicitationInput);
+    elicitationLabel.appendChild(document.createTextNode('允许 Elicitation'));
+    d9Options.appendChild(elicitationLabel);
+    const privateElicitationLabel = document.createElement('label');
+    const privateElicitationInput = document.createElement('input');
+    privateElicitationInput.type = 'checkbox';
+    privateElicitationInput.checked = s.elicitation?.allowPrivateUrl === true;
+    privateElicitationInput.addEventListener('change', () => { if (!mcpServerDrafts[idx].elicitation) mcpServerDrafts[idx].elicitation = {}; mcpServerDrafts[idx].elicitation.allowPrivateUrl = privateElicitationInput.checked; });
+    privateElicitationLabel.appendChild(privateElicitationInput);
+    privateElicitationLabel.appendChild(document.createTextNode('开发环境允许 Elicitation 私网 URL'));
+    d9Options.appendChild(privateElicitationLabel);
 
     const rootsBox = document.createElement('div');
     rootsBox.className = 'mcp-roots-box';
@@ -4185,6 +4373,14 @@ async function saveSettingsFromForm() {
   };
   const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
   const saved = await window.codex.saveSettings(partial);
+  if (saved?.ok === false) {
+    if (saved.code === 'MCP_TASKS_CONFIG_LOCKED') {
+      closeSettings();
+      showWorkView('scheduled');
+    }
+    toast(saved.error || '设置保存失败');
+    return;
+  }
   mcpSavedFingerprint = mcpConfigFingerprint(saved?.mcpServers || mcpServers);
   if (Array.isArray(saved?.mcpServers)) setMcpServerDrafts(saved.mcpServers);
   await refreshMcpOAuthStatuses();
@@ -4460,6 +4656,16 @@ function boot() {
       try { handleChatEvent(ev); } catch (e) { console.error('chat event handler', e); }
     });
   }
+  window.codex?.onMcpTaskEvent?.((event) => {
+    if (!event?.taskRef) return;
+    mcpTaskState.set(event.taskRef, event);
+    if (currentView === 'scheduled') renderMcpTaskCenter();
+    renderMessages();
+  });
+  window.codex?.onMcpElicitationEvent?.((event) => {
+    if (event?.elicitationId) showMcpElicitation(event);
+  });
+  loadMcpTasks().catch(() => {});
   setView('chat');
   for (const project of projects) if (project.path) reconcileWorktreeResults(project);
   updateAgentModeToggle();

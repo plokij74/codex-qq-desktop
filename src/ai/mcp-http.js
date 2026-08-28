@@ -6,8 +6,9 @@ const { URL } = require('url');
 const { checkUrl } = require('./url-guard');
 const { makeSafeLookup, redactSensitive } = require('./network-security');
 const { createMcpRpcDispatcher, rpcError } = require('./mcp-rpc');
+const { LATEST_PROTOCOL_VERSION, buildClientCapabilities, validateNegotiatedVersion } = require('./mcp-protocol');
 
-const PROTOCOL_VERSION = '2024-11-05';
+const PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION;
 const REQUEST_TIMEOUT_MS = 60_000;
 const BODY_MAX = 1024 * 1024;
 
@@ -107,16 +108,46 @@ function defaultRequestFn(url, opts = {}) {
     }, (res) => {
       const chunks = [];
       let bytes = 0;
+      const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
+      const streamMessages = contentType.includes('text/event-stream') && typeof opts.onMessage === 'function';
+      let pendingEvents = '';
+      const dispatchEvents = (flush = false) => {
+        if (!streamMessages) return;
+        pendingEvents = pendingEvents.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const events = pendingEvents.split('\n\n');
+        pendingEvents = flush ? '' : (events.pop() || '');
+        for (const event of events) {
+          for (const message of parseMessages(`${event}\n\n`, { 'content-type': 'text/event-stream' })) {
+            try { opts.onMessage(message); } catch { /* dispatcher owns handler errors */ }
+          }
+        }
+        if (flush && pendingEvents.trim()) {
+          for (const message of parseMessages(pendingEvents, { 'content-type': 'text/event-stream' })) {
+            try { opts.onMessage(message); } catch { /* dispatcher owns handler errors */ }
+          }
+        }
+      };
       res.on('data', (chunk) => {
         bytes += Buffer.byteLength(chunk);
-        if (bytes <= BODY_MAX) chunks.push(chunk);
+        if (bytes <= BODY_MAX) {
+          chunks.push(chunk);
+          if (streamMessages) {
+            pendingEvents += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk || '');
+            dispatchEvents(false);
+          }
+        }
         else req.destroy(new Error('MCP response too large'));
       });
-      res.on('end', () => resolve({
-        status: res.statusCode || 0,
-        headers: res.headers || {},
-        bodyText: Buffer.concat(chunks).toString('utf8'),
-      }));
+      res.on('end', () => {
+        dispatchEvents(true);
+        opts.signal?.removeEventListener?.('abort', onAbort);
+        resolve({
+          status: res.statusCode || 0,
+          headers: res.headers || {},
+          bodyText: Buffer.concat(chunks).toString('utf8'),
+          streamedMessages: streamMessages,
+        });
+      });
     });
     const onAbort = () => req.destroy(new Error('aborted'));
     if (opts.signal) {
@@ -131,13 +162,6 @@ function defaultRequestFn(url, opts = {}) {
   });
 }
 
-function capabilityOptions(opts) {
-  const capabilities = opts.capabilities && typeof opts.capabilities === 'object' ? { ...opts.capabilities } : {};
-  if (opts.rootsProvider || opts.getRoots) capabilities.roots = { listChanged: true };
-  if (opts.samplingHandler) capabilities.sampling = {};
-  return capabilities;
-}
-
 function createMcpHttpClient(opts = {}) {
   const url = String(opts.url || '').trim();
   const extraHeaders = opts.headers && typeof opts.headers === 'object' && !Array.isArray(opts.headers) ? { ...opts.headers } : {};
@@ -149,6 +173,7 @@ function createMcpHttpClient(opts = {}) {
   let started = false;
   let rpc = null;
   let serverCapabilities = {};
+  let negotiatedProtocolVersion = '';
   let sessionId = '';
   let reconnecting = null;
   let transportErrorReported = false;
@@ -166,6 +191,7 @@ function createMcpHttpClient(opts = {}) {
       ...mergeHeaders(extraHeaders, dynamicHeaders, Boolean(authProvider)),
     };
     if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+    if (negotiatedProtocolVersion) headers['MCP-Protocol-Version'] = negotiatedProtocolVersion;
     return headers;
   }
 
@@ -189,6 +215,7 @@ function createMcpHttpClient(opts = {}) {
           allowPrivate,
           lookup: opts.lookup,
           dnsLookup: opts.dnsLookup,
+          onMessage: expectResponse ? (inbound) => rpc?.dispatch(inbound) : undefined,
         });
         const headers = res?.headers || {};
         const returnedSession = Object.entries(headers).find(([key]) => String(key).toLowerCase() === 'mcp-session-id')?.[1];
@@ -205,7 +232,7 @@ function createMcpHttpClient(opts = {}) {
         if (Number(res?.status) === 401) throw httpStatusError(401, res?.bodyText);
         if (Number(res?.status) === 404 || Number(res?.status) === 410) throw httpStatusError(res.status, res.bodyText);
         if (Number(res?.status) >= 400) throw httpStatusError(res.status, res.bodyText);
-        if (expectResponse) {
+        if (expectResponse && res?.streamedMessages !== true) {
           for (const inbound of parseMessages(res?.bodyText, headers)) rpc?.dispatch(inbound);
         }
         return res;
@@ -236,6 +263,11 @@ function createMcpHttpClient(opts = {}) {
           return provider(params, signal);
         }
         if (method === 'sampling/createMessage' && typeof opts.samplingHandler === 'function') {
+          if (params?.task && (negotiatedProtocolVersion !== LATEST_PROTOCOL_VERSION || opts.tasksEnabled !== true)) {
+            const error = new Error('MCP Tasks require protocol 2025-11-25');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
           if (!serverCapabilities || typeof serverCapabilities.sampling !== 'object') {
             const error = new Error('MCP server did not declare sampling capability');
             error.code = 'MCP_METHOD_NOT_FOUND';
@@ -243,11 +275,31 @@ function createMcpHttpClient(opts = {}) {
           }
           return opts.samplingHandler(params, signal);
         }
+        if (method === 'elicitation/create' && typeof opts.elicitationHandler === 'function') {
+          if (negotiatedProtocolVersion !== LATEST_PROTOCOL_VERSION) {
+            const error = new Error('MCP Elicitation requires protocol 2025-11-25');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
+          return opts.elicitationHandler(params, signal);
+        }
+        if (['tasks/get', 'tasks/result', 'tasks/list', 'tasks/cancel'].includes(method)
+          && typeof opts.taskHandler === 'function') {
+          if (negotiatedProtocolVersion !== LATEST_PROTOCOL_VERSION || opts.tasksEnabled !== true) {
+            const error = new Error('MCP Tasks require protocol 2025-11-25');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
+          return opts.taskHandler(method, params, signal);
+        }
         const error = new Error(`MCP method not found: ${method}`);
         error.code = 'MCP_METHOD_NOT_FOUND';
         throw error;
       },
-      notificationHandler: opts.notificationHandler,
+      notificationHandler: (method, params, message) => {
+        if (method === 'notifications/elicitation/complete') opts.elicitationComplete?.(params, message);
+        opts.notificationHandler?.(method, params, message);
+      },
       onError: opts.onError,
     });
   }
@@ -262,9 +314,14 @@ function createMcpHttpClient(opts = {}) {
     try {
       const result = await rpc.request('initialize', {
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: capabilityOptions(opts),
+        capabilities: buildClientCapabilities({
+          ...opts,
+          elicitation: opts.elicitation || { form: true, url: true },
+          tasksEnabled: opts.tasksEnabled === true,
+        }),
         clientInfo: { name: 'codex-qq', version: '1.0.0' },
       }, { replayable: true });
+      negotiatedProtocolVersion = validateNegotiatedVersion(result?.protocolVersion);
       serverCapabilities = result?.capabilities && typeof result.capabilities === 'object' ? result.capabilities : {};
       await rpc.notify('notifications/initialized', {});
       started = true;
@@ -301,8 +358,17 @@ function createMcpHttpClient(opts = {}) {
     return Array.isArray(result?.tools) ? result.tools : (Array.isArray(result) ? result : []);
   }
   async function callTool(name, args, requestOptions = {}) {
-    return request('tools/call', { name: String(name || ''), arguments: args && typeof args === 'object' && !Array.isArray(args) ? args : {} }, { ...requestOptions, replayable: false });
+    const params = { name: String(name || ''), arguments: args && typeof args === 'object' && !Array.isArray(args) ? args : {} };
+    if (requestOptions.task && negotiatedProtocolVersion === LATEST_PROTOCOL_VERSION) params.task = {
+      ttl: Number.isFinite(Number(requestOptions.task.ttl)) ? Math.floor(Number(requestOptions.task.ttl)) : undefined,
+    };
+    if (params.task && params.task.ttl == null) delete params.task.ttl;
+    return request('tools/call', params, { ...requestOptions, replayable: false });
   }
+  function getTask(taskId, requestOptions = {}) { return request('tasks/get', { taskId: String(taskId || '') }, { ...requestOptions, replayable: false }); }
+  function getTaskResult(taskId, requestOptions = {}) { return request('tasks/result', { taskId: String(taskId || '') }, { ...requestOptions, replayable: false }); }
+  function listTasks(cursor, requestOptions = {}) { return request('tasks/list', cursor ? { cursor: String(cursor) } : {}, { ...requestOptions, replayable: true }); }
+  function cancelTask(taskId, requestOptions = {}) { return request('tasks/cancel', { taskId: String(taskId || '') }, { ...requestOptions, replayable: false }); }
   async function listResources() {
     try { const result = await request('resources/list', {}, { replayable: true }); return Array.isArray(result?.resources) ? result.resources : []; } catch { return []; }
   }
@@ -330,6 +396,11 @@ function createMcpHttpClient(opts = {}) {
     getPrompt,
     notifyRootsChanged,
     getServerCapabilities: () => ({ ...serverCapabilities }),
+    getProtocolVersion: () => negotiatedProtocolVersion || null,
+    getTask,
+    getTaskResult,
+    listTasks,
+    cancelTask,
     getSessionId: () => sessionId ? 'active' : null,
     close,
   };

@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   // MCP servers: sanitized on load/save via sanitizeMcpServers
   // shape: { name, transport?, command?, args?, env?, cwd?, url?, headers?, enabled?, timeoutMs? }[]
   mcpServers: [],
+  // Phase D.10: protocol tasks and server elicitation are opt-in per server.
   // Phase C.3 hooks
   hooksEnabled: true,
   // Phase C.4
@@ -162,6 +163,11 @@ function clampUsageSettings(s) {
   return s;
 }
 
+function clampMcpD10Settings(s) {
+  s.mcpServers = sanitizeMcpServers(s.mcpServers, { allowRootPaths: true });
+  return s;
+}
+
 function loadSettings(userDataPath) {
   const file = getSettingsPath(userDataPath);
   try {
@@ -176,7 +182,7 @@ function loadSettings(userDataPath) {
     clampCompactSettings(merged);
     clampMemorySettings(merged);
     clampWebSettings(merged);
-    return clampUsageSettings(merged);
+    return clampMcpD10Settings(clampUsageSettings(merged));
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -192,7 +198,7 @@ function saveSettings(userDataPath, partial) {
   clampUsageSettings(next);
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
-  return next;
+  return clampMcpD10Settings(next);
 }
 
 module.exports = {
@@ -205,6 +211,7 @@ module.exports = {
   clampMemorySettings,
   clampWebSettings,
   clampUsageSettings,
+  clampMcpD10Settings,
   sanitizePricing,
   normalizeDomainList,
 };

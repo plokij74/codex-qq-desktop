@@ -389,7 +389,7 @@ implement 并行、子内再 spawn、独立侧栏多 Agent 面板。worktree 生
 
 | 传输 | 要点 |
 |------|------|
-| **stdio** | Content-Length JSON-RPC；`spawn` + `shell: false` |
+| **stdio** | newline JSON-RPC；reader 兼容旧 `Content-Length`；`spawn` + `shell: false` |
 | **http** | Streamable HTTP **最小子集**：POST JSON-RPC；JSON 或 SSE 式响应；无会话恢复 |
 | **sse** | 最小 MCP-over-SSE；与 tools/resources 语义对齐 |
 
@@ -789,3 +789,49 @@ D9 在 D8 的 OAuth/SSRF 边界上增加 MCP 高级能力。所有新增能力�
 - 单次最多 2048 output tokens、60 秒；每 server 每 run 最多 3 次、累计最多 8192 tokens。usage 只记录 model 和 token/cost 摘要，不记录 prompt、response 或 server payload。
 
 prompt 内容、roots absolute path、session id、sampling body 和 sampling response 不写入 localStorage、session export、memory、usage、hooks 环境或普通 Agent event。
+
+## Phase D.10：MCP Elicitation 与后台 Tasks
+
+D10 使用 MCP `2025-11-25` 的 Elicitation 和 Tasks；遇到旧 server 时可回退到 `2024-11-05`，并自动关闭不兼容的 D10 能力。Tasks 必须按 server 显式开启，默认关闭。
+
+### 配置与能力
+
+设置页每个 MCP server 提供以下选项：
+
+| 设置 | 默认 | 说明 |
+|------|------|------|
+| 启用 Tasks | **关** | 只有 server 声明 task capability 且 tool 标记为 `required`/`optional` 时才发送后台任务调用 |
+| Task TTL | 1 小时 | 限制在 1 分钟至 24 小时；到期后本地停止轮询并标记失败 |
+| 允许 Elicitation | 开 | 允许 server 发起 form/url 人工确认；关闭后请求直接拒绝 |
+| 开发环境允许私网 URL | 关 | 还必须设置 `CODEX_DEV_MCP_PRIVATE_URLS=1`；生产环境不接受私网 Elicitation URL |
+
+Tasks 关闭或 server 不支持时，`optional` tool 保持同步调用，`required` tool 不会注册；不会伪装成可同步执行。Agent 收到的是本地 opaque `taskRef`，不会看到远端 task ID。
+
+### 任务中心
+
+侧栏“已安排”同时是 MCP 任务中心。后台任务不依赖当前聊天页，Agent 停止或切换页面后仍会由主进程轮询。
+
+- “取消”会向远端发送 `tasks/cancel`；远端失败时不会伪装成已取消。
+- “遗弃引用”只停止本地监控并释放连接，不取消远端工作。
+- 完成后可查看有界结果，或“认领到当前会话”。认领先展示预览并再次确认，确认后才作为新的 assistant 消息写入目标会话。
+- 修改或删除仍有未完成任务的 server 配置会返回 `MCP_TASKS_CONFIG_LOCKED`；先取消或遗弃相关任务。
+
+工具任务元数据和有界结果使用 Electron `safeStorage` 加密保存；加密不可用时退化为仅当前进程内存，不创建明文任务文件。sampling/Elicitation receiver task 及其正文不会持久化。
+
+### 重启恢复
+
+应用启动时只恢复已持久化的 tool task，并且只调用 `tasks/get` / `tasks/result`；不会恢复旧 Agent run，也不会重放可能有副作用的 `tools/call`。
+
+- server 配置存在且 fingerprint 相同时，启动连接只用于继续轮询，任务完成并取回结果后释放。
+- 原 session 或项目上下文已不可用时，任务标记为 `orphaned`，但配置仍匹配时可以继续监控；完成后必须由用户明确认领到一个当前会话。
+- server 被删除、停用或配置 fingerprint 改变时，旧任务标记为 `orphaned`，不会绑定或连接到新配置。
+- 匹配配置暂时连接失败时保留为待恢复状态，不重放工具调用；下次启动可再次尝试。
+
+### Elicitation 安全边界
+
+- form 只接受扁平的 string/number/integer/boolean 字段，拒绝嵌套对象、数组、未知 schema 关键字及 password/token/API key/支付等敏感字段。
+- form 的同意、拒绝和取消都由用户在前台弹窗中明确选择；提交内容会在 main 再次校验。
+- url 生产环境只接受公共 HTTPS，并拒绝凭据、fragment、私网/metadata 地址和敏感 query 参数。
+- URL 不预取、不嵌入、不读取返回内容。只有用户点击“打开浏览器”后，main 才通过系统浏览器打开内存中的已校验 URL。
+
+任务参数、Elicitation 表单输入、sampling 正文、远端 task ID 和 URL 不写入 renderer localStorage、会话导出、memory、usage 或普通聊天历史。

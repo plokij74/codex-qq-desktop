@@ -110,4 +110,17 @@ describe('mcp session manager', () => {
     assert.equal(await manager.invalidateOtherProjects('project-b'), 1);
     assert.equal(state.closes, 1);
   });
+
+  it('keeps a leased startup task recovery session across project switches', async () => {
+    const state = { closes: 0 };
+    const manager = createMcpSessionManager({
+      createClient: () => ({ async start() {}, async close() { state.closes += 1; } }),
+    });
+    const cfg = { name: 'tasks', transport: 'stdio', command: 'mock', sessionRecovery: false };
+    const lease = await manager.acquire(cfg, { taskRecovery: true });
+    assert.equal(await manager.invalidateOtherProjects('project-a'), 0);
+    assert.equal(state.closes, 0);
+    await lease.release();
+    assert.equal(state.closes, 1);
+  });
 });

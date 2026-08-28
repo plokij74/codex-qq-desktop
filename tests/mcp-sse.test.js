@@ -259,6 +259,75 @@ describe('createMcpSseClient', () => {
     await c.close();
   });
 
+  it('dispatches a nested elicitation request while a tool POST is still pending', { timeout: 5000 }, async () => {
+    let streamListener = null;
+    let nestedResponse = null;
+    const calls = [];
+    const openSseFn = async () => ({
+      bodyText: 'event: endpoint\ndata: https://example.com/message\n\n',
+      onMessage: (listener) => { streamListener = listener; return () => { streamListener = null; }; },
+      close() {},
+    });
+    const requestFn = async (_url, opts) => {
+      const message = JSON.parse(opts.body);
+      calls.push(message);
+      if (message.method === 'initialize') {
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          bodyText: JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo: { name: 'nested-sse' } } }),
+        };
+      }
+      if (message.method === 'notifications/initialized') return { status: 202, headers: {}, bodyText: '' };
+      if (message.method === 'tools/list') {
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          bodyText: JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [{ name: 'nested', inputSchema: { type: 'object', properties: {} } }] } }),
+        };
+      }
+      if (message.method === 'tools/call') {
+        setImmediate(() => streamListener?.({
+          jsonrpc: '2.0',
+          id: 90,
+          method: 'elicitation/create',
+          params: { message: 'SSE confirm', requestedSchema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] } },
+        }));
+        return new Promise((resolve) => {
+          const finish = () => resolve({
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+            bodyText: JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'sse nested done' }] } }),
+          });
+          const timer = setInterval(() => {
+            if (nestedResponse) { clearInterval(timer); finish(); }
+          }, 5);
+        });
+      }
+      if (message.id === 90 && !message.method) {
+        nestedResponse = message.result;
+        return { status: 202, headers: {}, bodyText: '' };
+      }
+      return { status: 202, headers: {}, bodyText: '' };
+    };
+    const client = createMcpSseClient({
+      url: 'https://example.com/sse',
+      openSseFn,
+      requestFn,
+      elicitationHandler: async () => ({ action: 'accept', content: { answer: 'ok' } }),
+    });
+    try {
+      await client.start();
+      await client.listTools();
+      const result = await client.callTool('nested', {});
+      assert.equal(result.content[0].text, 'sse nested done');
+      assert.deepEqual(nestedResponse, { action: 'accept', content: { answer: 'ok' } });
+      assert.ok(calls.some((message) => message.method === 'elicitation/create' || message.id === 90));
+    } finally {
+      await client.close();
+    }
+  });
+
   it('reports a remote stream close but not an intentional client close', async () => {
     let closeListener = null;
     let transportErrors = 0;

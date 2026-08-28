@@ -2,6 +2,7 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
 const { createMcpHttpClient } = require('../src/ai/mcp-http');
 const { createMcpClient } = require('../src/ai/mcp-client');
 
@@ -299,6 +300,73 @@ describe('createMcpHttpClient', () => {
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(inboundResponses[0].result.roots, [{ name: 'project', uri: 'file:///project' }]);
     await c.close();
+  });
+
+  it('dispatches a nested elicitation request before the HTTP response ends', { timeout: 5000 }, async () => {
+    let pendingToolResponse = null;
+    let nestedResponse = null;
+    let elicitationComplete = 0;
+    const server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        const message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (message.method === 'initialize') {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo: { name: 'nested-http' } },
+          }));
+          return;
+        }
+        if (message.method === 'notifications/initialized') {
+          res.statusCode = 202;
+          res.end();
+          return;
+        }
+        if (message.method === 'tools/list') {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [{ name: 'nested', inputSchema: { type: 'object', properties: {} } }] } }));
+          return;
+        }
+        if (message.method === 'tools/call') {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          pendingToolResponse = { id: message.id, res };
+          res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id: 900, method: 'elicitation/create', params: { message: 'Confirm', requestedSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } })}\n\n`);
+          return;
+        }
+        if (message.id === 900 && !message.method) {
+          nestedResponse = message.result;
+          res.statusCode = 202;
+          res.end();
+          pendingToolResponse.res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/elicitation/complete', params: { elicitationId: 'remote-only' } })}\n\n`);
+          pendingToolResponse.res.end(`data: ${JSON.stringify({ jsonrpc: '2.0', id: pendingToolResponse.id, result: { content: [{ type: 'text', text: 'nested done' }] } })}\n\n`);
+          return;
+        }
+        res.statusCode = 202;
+        res.end();
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const client = createMcpHttpClient({
+      url: `http://127.0.0.1:${port}/mcp`,
+      allowPrivate: true,
+      timeoutMs: 2000,
+      elicitationHandler: async () => ({ action: 'accept', content: { name: 'ok' } }),
+      elicitationComplete: () => { elicitationComplete += 1; },
+    });
+    try {
+      await client.start();
+      const result = await client.callTool('nested', {});
+      assert.equal(result.content[0].text, 'nested done');
+      assert.deepEqual(nestedResponse, { action: 'accept', content: { name: 'ok' } });
+      assert.equal(elicitationComplete, 1);
+    } finally {
+      await client.close();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });
 

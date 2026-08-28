@@ -12,6 +12,7 @@ const {
 } = require('./mcp-http');
 const { makeSafeLookup, sameOrigin, redactSensitive } = require('./network-security');
 const { createMcpRpcDispatcher } = require('./mcp-rpc');
+const { LATEST_PROTOCOL_VERSION, buildClientCapabilities, validateNegotiatedVersion } = require('./mcp-protocol');
 
 const BODY_MAX = 1024 * 1024;
 
@@ -161,13 +162,6 @@ function defaultOpenSseFn(url, opts = {}) {
   });
 }
 
-function capabilityOptions(opts) {
-  const capabilities = opts.capabilities && typeof opts.capabilities === 'object' ? { ...opts.capabilities } : {};
-  if (opts.rootsProvider || opts.getRoots) capabilities.roots = { listChanged: true };
-  if (opts.samplingHandler) capabilities.sampling = {};
-  return capabilities;
-}
-
 function createMcpSseClient(opts = {}) {
   const url = String(opts.url || '').trim();
   const sseUrl = String(opts.sseUrl || opts.url || '').trim();
@@ -184,6 +178,7 @@ function createMcpSseClient(opts = {}) {
   let sseUnsubscribe = null;
   let rpc = null;
   let serverCapabilities = {};
+  let negotiatedProtocolVersion = '';
   let reconnecting = null;
   let sseErrorUnsubscribe = null;
   let sseCloseUnsubscribe = null;
@@ -198,7 +193,9 @@ function createMcpSseClient(opts = {}) {
   }
 
   function baseHeaders(dynamicHeaders) {
-    return { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json', ...mergeHeaders(extraHeaders, dynamicHeaders, Boolean(authProvider)) };
+    const headers = { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json', ...mergeHeaders(extraHeaders, dynamicHeaders, Boolean(authProvider)) };
+    if (negotiatedProtocolVersion) headers['MCP-Protocol-Version'] = negotiatedProtocolVersion;
+    return headers;
   }
 
   async function rawPost(message, { expectResponse = true } = {}) {
@@ -216,7 +213,7 @@ function createMcpSseClient(opts = {}) {
       const timer = setTimeout(() => controller?.abort?.(), timeoutMs);
       try {
         const dynamicHeaders = authProvider?.getHeaders ? await authProvider.getHeaders() : {};
-        const res = await requestFn(messageUrl, { method: 'POST', headers: baseHeaders(dynamicHeaders), body: serialized, signal: controller?.signal, allowPrivate, lookup: opts.lookup, dnsLookup: opts.dnsLookup });
+        const res = await requestFn(messageUrl, { method: 'POST', headers: baseHeaders(dynamicHeaders), body: serialized, signal: controller?.signal, allowPrivate, lookup: opts.lookup, dnsLookup: opts.dnsLookup, onMessage: expectResponse ? (inbound) => rpc?.dispatch(inbound) : undefined });
         if (Number(res?.status) === 401 && !retried) {
           if (!authProvider?.refresh) throw httpStatusError(401, res?.bodyText);
           retried = true;
@@ -226,7 +223,7 @@ function createMcpSseClient(opts = {}) {
         if (Number(res?.status) === 401) throw httpStatusError(401, res?.bodyText);
         if (Number(res?.status) === 404 || Number(res?.status) === 410) throw httpStatusError(res.status, res.bodyText);
         if (Number(res?.status) >= 400) throw httpStatusError(res.status, res.bodyText);
-        if (expectResponse) for (const inbound of parseMessages(res?.bodyText, res?.headers || {})) rpc?.dispatch(inbound);
+        if (expectResponse && res?.streamedMessages !== true) for (const inbound of parseMessages(res?.bodyText, res?.headers || {})) rpc?.dispatch(inbound);
         return res;
       } catch (error) {
         if (closed) throw new Error('MCP client closed');
@@ -248,6 +245,11 @@ function createMcpSseClient(opts = {}) {
           return provider(params, signal);
         }
         if (method === 'sampling/createMessage' && typeof opts.samplingHandler === 'function') {
+          if (params?.task && (negotiatedProtocolVersion !== LATEST_PROTOCOL_VERSION || opts.tasksEnabled !== true)) {
+            const error = new Error('MCP Tasks require protocol 2025-11-25');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
           if (!serverCapabilities || typeof serverCapabilities.sampling !== 'object') {
             const error = new Error('MCP server did not declare sampling capability');
             error.code = 'MCP_METHOD_NOT_FOUND';
@@ -255,9 +257,29 @@ function createMcpSseClient(opts = {}) {
           }
           return opts.samplingHandler(params, signal);
         }
+        if (method === 'elicitation/create' && typeof opts.elicitationHandler === 'function') {
+          if (negotiatedProtocolVersion !== LATEST_PROTOCOL_VERSION) {
+            const error = new Error('MCP Elicitation requires protocol 2025-11-25');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
+          return opts.elicitationHandler(params, signal);
+        }
+        if (['tasks/get', 'tasks/result', 'tasks/list', 'tasks/cancel'].includes(method)
+          && typeof opts.taskHandler === 'function') {
+          if (negotiatedProtocolVersion !== LATEST_PROTOCOL_VERSION || opts.tasksEnabled !== true) {
+            const error = new Error('MCP Tasks require protocol 2025-11-25');
+            error.code = 'MCP_METHOD_NOT_FOUND';
+            throw error;
+          }
+          return opts.taskHandler(method, params, signal);
+        }
         const error = new Error(`MCP method not found: ${method}`); error.code = 'MCP_METHOD_NOT_FOUND'; throw error;
       },
-      notificationHandler: opts.notificationHandler,
+      notificationHandler: (method, params, message) => {
+        if (method === 'notifications/elicitation/complete') opts.elicitationComplete?.(params, message);
+        opts.notificationHandler?.(method, params, message);
+      },
       onError: opts.onError,
     });
   }
@@ -303,7 +325,16 @@ function createMcpSseClient(opts = {}) {
     transportErrorReported = false;
     try {
       bindSse(await openStream());
-      const result = await rpc.request('initialize', { protocolVersion: PROTOCOL_VERSION, capabilities: capabilityOptions(opts), clientInfo: { name: 'codex-qq', version: '1.0.0' } }, { replayable: true });
+      const result = await rpc.request('initialize', {
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: buildClientCapabilities({
+          ...opts,
+          elicitation: opts.elicitation || { form: true, url: true },
+          tasksEnabled: opts.tasksEnabled === true,
+        }),
+        clientInfo: { name: 'codex-qq', version: '1.0.0' },
+      }, { replayable: true });
+      negotiatedProtocolVersion = validateNegotiatedVersion(result?.protocolVersion);
       serverCapabilities = result?.capabilities && typeof result.capabilities === 'object' ? result.capabilities : {};
       await rpc.notify('notifications/initialized', {});
       started = true;
@@ -338,7 +369,18 @@ function createMcpSseClient(opts = {}) {
   function request(method, params, requestOptions) { if (closed) return Promise.reject(new Error('MCP client closed')); if (!rpc || !started) return Promise.reject(new Error('MCP client not started')); return rpc.request(method, params, requestOptions); }
   function notify(method, params) { if (closed) return Promise.reject(new Error('MCP client closed')); if (!rpc || !started) return Promise.reject(new Error('MCP client not started')); return rpc.notify(method, params); }
   async function listTools() { const result = await request('tools/list', {}, { replayable: true }); return Array.isArray(result?.tools) ? result.tools : (Array.isArray(result) ? result : []); }
-  async function callTool(name, args, requestOptions = {}) { return request('tools/call', { name: String(name || ''), arguments: args && typeof args === 'object' && !Array.isArray(args) ? args : {} }, { ...requestOptions, replayable: false }); }
+  async function callTool(name, args, requestOptions = {}) {
+    const params = { name: String(name || ''), arguments: args && typeof args === 'object' && !Array.isArray(args) ? args : {} };
+    if (requestOptions.task && negotiatedProtocolVersion === LATEST_PROTOCOL_VERSION) params.task = {
+      ttl: Number.isFinite(Number(requestOptions.task.ttl)) ? Math.floor(Number(requestOptions.task.ttl)) : undefined,
+    };
+    if (params.task && params.task.ttl == null) delete params.task.ttl;
+    return request('tools/call', params, { ...requestOptions, replayable: false });
+  }
+  function getTask(taskId, requestOptions = {}) { return request('tasks/get', { taskId: String(taskId || '') }, { ...requestOptions, replayable: false }); }
+  function getTaskResult(taskId, requestOptions = {}) { return request('tasks/result', { taskId: String(taskId || '') }, { ...requestOptions, replayable: false }); }
+  function listTasks(cursor, requestOptions = {}) { return request('tasks/list', cursor ? { cursor: String(cursor) } : {}, { ...requestOptions, replayable: true }); }
+  function cancelTask(taskId, requestOptions = {}) { return request('tasks/cancel', { taskId: String(taskId || '') }, { ...requestOptions, replayable: false }); }
   async function listResources() { try { const result = await request('resources/list', {}, { replayable: true }); return Array.isArray(result?.resources) ? result.resources : []; } catch { return []; } }
   async function readResource(uri, requestOptions = {}) { return request('resources/read', { uri: String(uri || '') }, { ...requestOptions, replayable: false }); }
   async function listPrompts() { const result = await request('prompts/list', {}, { replayable: true }); return Array.isArray(result?.prompts) ? result.prompts : []; }
@@ -346,7 +388,7 @@ function createMcpSseClient(opts = {}) {
   async function notifyRootsChanged() { return notify('notifications/roots/list_changed', {}); }
   async function close() { closed = true; started = false; try { sseUnsubscribe?.(); } catch { /* ignore */ } try { sseErrorUnsubscribe?.(); } catch { /* ignore */ } try { sseCloseUnsubscribe?.(); } catch { /* ignore */ } try { sseHandle?.close?.(); } catch { /* ignore */ } sseHandle = null; try { rpc?.close(); } catch { /* ignore */ } }
 
-  return { start, reconnect, request, notify, listTools, callTool, listResources, readResource, listPrompts, getPrompt, notifyRootsChanged, getServerCapabilities: () => ({ ...serverCapabilities }), close };
+  return { start, reconnect, request, notify, listTools, callTool, getTask, getTaskResult, listTasks, cancelTask, listResources, readResource, listPrompts, getPrompt, notifyRootsChanged, getServerCapabilities: () => ({ ...serverCapabilities }), getProtocolVersion: () => negotiatedProtocolVersion || null, close };
 }
 
 module.exports = { createMcpSseClient, parseEndpointEvent, resolveEndpointUrl, defaultOpenSseFn, PROTOCOL_VERSION, REQUEST_TIMEOUT_MS, BODY_MAX };
