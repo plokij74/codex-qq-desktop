@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, safeStorage } = require('electron');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
@@ -71,6 +71,8 @@ const { fetchUrl } = require('./ai/web-fetch');
 const { aggregate } = require('./ai/usage');
 const { createWorktreeManager } = require('./ai/worktree');
 const { createWorktreeIpcHandlers } = require('./ai/worktree-ipc');
+const { createEngineeringIpcHandlers } = require('./ai/engineering-ipc');
+const { projectKey } = require('./ai/project-index');
 const {
   usageFilePath,
   appendRecord,
@@ -134,6 +136,7 @@ let mcpSessionManager = null;
 let mcpTaskManager = null;
 let mcpElicitationController = null;
 let mcpTaskRecoveryHub = null;
+let engineeringIpc = null;
 let quitting = false;
 const oauthFlowOwners = new Map();
 const oauthPendingOwnersByName = new Map();
@@ -156,6 +159,51 @@ const worktreeIpc = createWorktreeIpcHandlers({
   },
   openExternal: async (url) => shell.openExternal(url),
 });
+
+function getEngineeringIpc() {
+  if (engineeringIpc) return engineeringIpc;
+  engineeringIpc = createEngineeringIpcHandlers({
+    resolveBinding: (event, payload) => worktreeIpc.resolveBinding(event, payload),
+    userDataPath: userDataPath(),
+    safeStorage,
+    runTerminal,
+    indexStorePathFor: (projectPath) => path.join(userDataPath(), `engineering-index-${crypto.createHash('sha256').update(path.resolve(projectPath)).digest('hex').slice(0, 16)}.json`),
+    isIndexEnabled: () => loadSettings(userDataPath()).codeIndexEnabled !== false,
+    getProfiles: (projectPath) => {
+      const key = projectKey(projectPath);
+      return (loadSettings(userDataPath()).verificationProfiles || [])
+        .filter((profile) => profile.projectKey === key);
+    },
+    setProfiles: (projectPath, profiles) => {
+      const settings = loadSettings(userDataPath());
+      const key = projectKey(projectPath);
+      const retained = (settings.verificationProfiles || [])
+        .filter((profile) => profile.projectKey !== key);
+      saveSettings(userDataPath(), {
+        verificationProfiles: [
+          ...retained,
+          ...profiles.map((profile) => ({ ...profile, projectKey: key })),
+        ],
+      });
+    },
+    getSettings: () => loadSettings(userDataPath()),
+    createPermissionGate: (event, settings) => createPermissionGate({
+      permissionMode: PERMISSION_MODES.has(settings.permissionMode) ? settings.permissionMode : 'confirm-writes',
+      terminalEnabled: settings.terminalEnabled === true,
+      terminalRequireConfirm: true,
+      onApprovalNeeded: async (approval) => {
+        safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.APPROVAL_NEEDED, source: 'verification', runId: null, ...approval });
+      },
+    }),
+    onEvent: (event, ownerIds = []) => {
+      const owners = new Set(ownerIds);
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (owners.has(win.webContents.id)) safeSend(win.webContents, 'engineering:event', event);
+      }
+    },
+  });
+  return engineeringIpc;
+}
 
 function userDataPath() {
   return app.getPath('userData');
@@ -431,6 +479,13 @@ function toPublicSettings(s, senderId) {
     usageMaxRecords: clampInt(s.usageMaxRecords, 500, 50000, 5000),
     usagePricing: sanitizePricing(s.usagePricing),
     usageCurrency: String(s.usageCurrency ?? '$').slice(0, 4) || '$',
+    codeIndexEnabled: s.codeIndexEnabled !== false,
+    // Generic settings expose only bounded summaries. Commands are available
+    // solely through a sender-owned project binding in engineering IPC.
+    verificationProfiles: (Array.isArray(s.verificationProfiles) ? s.verificationProfiles : []).slice(0, 100).map((p) => ({
+      id: String(p.id || ''), name: String(p.name || ''), kind: String(p.kind || 'custom'),
+      enabled: p.enabled !== false,
+    })),
   };
 }
 
@@ -502,9 +557,13 @@ function createWindow() {
   });
   const worktreeSenderId = win.webContents.id;
   win.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
-    if (isMainFrame !== false) worktreeIpc.dropSender(worktreeSenderId);
+    if (isMainFrame !== false) {
+      worktreeIpc.dropSender(worktreeSenderId);
+      engineeringIpc?.dropSender?.(worktreeSenderId);
+    }
   });
   win.webContents.once('destroyed', () => worktreeIpc.dropSender(worktreeSenderId));
+  win.webContents.once('destroyed', () => engineeringIpc?.dropSender?.(worktreeSenderId));
   win.webContents.once('destroyed', () => cancelOAuthFlowsForSender(worktreeSenderId));
   win.webContents.once('destroyed', () => mcpElicitationController?.cancelOwner?.(worktreeSenderId));
   win.webContents.once('destroyed', () => {
@@ -528,6 +587,9 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(() => {
     Menu?.setApplicationMenu(null);
     getMcpOAuthManager();
+    // Decrypt the verification stores now so an interrupted job is recorded as
+    // such before any window asks for it. This never re-runs a command.
+    try { getEngineeringIpc().restoreAtStartup(); } catch {}
     createWindow();
     restoreMcpTasksAtStartup().catch(() => {});
     app.on('activate', () => {
@@ -549,6 +611,7 @@ app.on('before-quit', (event) => {
     Promise.resolve().then(() => mcpSessionManager?.closeAll?.()),
     Promise.resolve().then(() => mcpTaskManager?.close?.()),
     Promise.resolve().then(() => mcpElicitationController?.cancelAll?.()),
+    Promise.resolve().then(() => engineeringIpc?.close?.()),
   ]).catch(() => {}).finally(() => app.quit());
 });
 
@@ -598,6 +661,7 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
     'memoryCandidateEnabled',
     'webEnabled',
     'usageEnabled',
+    'codeIndexEnabled',
   ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
@@ -635,6 +699,11 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
   }
   if ('verifyCommand' in nextPartial) {
     nextPartial.verifyCommand = String(nextPartial.verifyCommand ?? '');
+  }
+  if ('verificationProfiles' in nextPartial) {
+    // Commands can be saved only after resolving a sender-owned project
+    // binding through engineering:verification:profile:*.
+    delete nextPartial.verificationProfiles;
   }
   if ('mcpServers' in nextPartial) {
     const incoming = sanitizeMcpServers(nextPartial.mcpServers);
@@ -1156,7 +1225,14 @@ ipcMain.handle('memory:update', async (_e, payload = {}) => memoryUpdate({
 // Phase D.5 worktree results. Only bind accepts a project path; every later
 // call routes through the sender-scoped opaque binding token.
 ipcMain.handle('worktree:bind', async (event, payload = {}) => worktreeIpc.bind(event, payload));
-ipcMain.handle('worktree:unbind', async (event, payload = {}) => worktreeIpc.unbind(event, payload));
+ipcMain.handle('worktree:unbind', async (event, payload = {}) => {
+  const binding = worktreeIpc.resolveBinding(event, payload);
+  const result = worktreeIpc.unbind(event, payload);
+  if (result?.ok && binding?.projectPath && !worktreeIpc.hasProjectBinding(event, binding.projectPath)) {
+    engineeringIpc?.dropProject(event, binding.projectPath);
+  }
+  return result;
+});
 ipcMain.handle('worktree:list', async (event, payload = {}) => worktreeIpc.list(event, payload));
 ipcMain.handle('worktree:get', async (event, payload = {}) => worktreeIpc.get(event, payload));
 ipcMain.handle('worktree:apply', async (event, payload = {}) => worktreeIpc.apply(event, payload));
@@ -1177,6 +1253,25 @@ ipcMain.handle('worktree:pr:reopen', async (event, payload = {}) => worktreeIpc.
 ipcMain.handle('worktree:pr:ready', async (event, payload = {}) => worktreeIpc.readyPr(event, payload));
 ipcMain.handle('worktree:pr:merge', async (event, payload = {}) => worktreeIpc.mergePr(event, payload));
 ipcMain.handle('worktree:pr:open', async (event, payload = {}) => worktreeIpc.openPr(event, payload));
+
+// Phase D.11 engineering center. All project access is resolved through the
+// sender-owned worktree binding; renderer payloads never carry a path/command.
+ipcMain.handle('engineering:index:ensure', async (event, payload = {}) => getEngineeringIpc().ensure(event, payload));
+ipcMain.handle('engineering:index:status', async (event, payload = {}) => getEngineeringIpc().status(event, payload));
+ipcMain.handle('engineering:index:rebuild', async (event, payload = {}) => getEngineeringIpc().rebuild(event, payload));
+ipcMain.handle('engineering:index:clear', async (event, payload = {}) => getEngineeringIpc().clear(event, payload));
+ipcMain.handle('engineering:index:search', async (event, payload = {}) => getEngineeringIpc().search(event, payload));
+ipcMain.handle('engineering:index:location', async (event, payload = {}) => getEngineeringIpc().location(event, payload));
+ipcMain.handle('engineering:verification:profiles', async (event, payload = {}) => getEngineeringIpc().profiles(event, payload));
+ipcMain.handle('engineering:verification:profile:save', async (event, payload = {}) => getEngineeringIpc().saveProfile(event, payload));
+ipcMain.handle('engineering:verification:profile:delete', async (event, payload = {}) => getEngineeringIpc().deleteProfile(event, payload));
+ipcMain.handle('engineering:verification:run', async (event, payload = {}) => getEngineeringIpc().run(event, payload));
+ipcMain.handle('engineering:verification:list', async (event, payload = {}) => getEngineeringIpc().list(event, payload));
+ipcMain.handle('engineering:verification:get', async (event, payload = {}) => getEngineeringIpc().get(event, payload));
+ipcMain.handle('engineering:verification:result', async (event, payload = {}) => getEngineeringIpc().result(event, payload));
+ipcMain.handle('engineering:verification:cancel', async (event, payload = {}) => getEngineeringIpc().cancel(event, payload));
+ipcMain.handle('engineering:verification:rerun', async (event, payload = {}) => getEngineeringIpc().rerun(event, payload));
+ipcMain.handle('engineering:verification:revoke-grant', async (event, payload = {}) => getEngineeringIpc().revokeGrant(event, payload));
 
 ipcMain.handle('dialog:selectDirectory', async () => {
   const win = BrowserWindow.getFocusedWindow();
@@ -1246,6 +1341,9 @@ ipcMain.handle('chat:approve', async (event, payload = {}) => {
   const candidates = [
     activeRun ? { gate: activeRun.gate, sender: activeRun.sender, runId: activeRun.runId } : null,
     manualTerm ? { gate: manualTerm.gate, sender: manualTerm.sender, runId: activeRun?.runId ?? null } : null,
+    // Background D11 verification approvals are owned by the invoking
+    // renderer sender and are resolved without attaching them to chat history.
+    getEngineeringIpc() ? { gate: { resolveApproval: (id, d) => getEngineeringIpc().resolveApproval(event, id, d) }, sender: event.sender, runId: null } : null,
   ].filter(Boolean);
 
   if (!candidates.length) {
@@ -1477,11 +1575,17 @@ async function startChatRun(event, payload = {}, opts = {}) {
     webRequireConfirm: settings.webRequireConfirm !== false,
     agentMode,
     onApprovalNeeded: async (approvalPayload) => {
-      safeSend(sender, 'chat:event', {
+      const approvalEvent = {
         type: AGENT_EVENTS.APPROVAL_NEEDED,
         runId,
         ...approvalPayload,
-      });
+      };
+      // Agent verification_start shares the chat gate for authorization,
+      // but its approval belongs to the ephemeral engineering panel. Keep
+      // ordinary chat approvals source-less so they remain on chatRun.
+      if (approvalPayload.tool === 'verification_start') approvalEvent.source = 'verification';
+      else if (approvalPayload.source) approvalEvent.source = approvalPayload.source;
+      safeSend(sender, 'chat:event', approvalEvent);
     },
   });
 
@@ -1514,6 +1618,13 @@ async function startChatRun(event, payload = {}, opts = {}) {
     const project = payload.project && payload.project.path
       ? { name: payload.project.name || path.basename(payload.project.path), path: payload.project.path }
       : null;
+    const senderBinding = payload.projectBindingId
+      ? worktreeIpc.resolveBinding(event, { projectBindingId: String(payload.projectBindingId) })
+      : null;
+    const engineeringRoot = senderBinding?.projectPath
+      && canonicalDirectory(project?.path) === senderBinding.projectPath
+      ? senderBinding.projectPath
+      : '';
     mcpProjectBySender.set(sender.id, project ? (canonicalDirectory(project.path) || '') : '');
     // A retained MCP session is scoped to the bound project. Drop sessions
     // from older project bindings before a new run can serve roots or
@@ -1605,6 +1716,29 @@ async function startChatRun(event, payload = {}, opts = {}) {
         try { return elicitation.complete(id); } catch { return false; }
       },
       mcpSampling: (server, params, _ctx, requestSignal, releaseConnection) => samplingHandler(server, params, requestSignal, releaseConnection),
+      engineering: {
+        indexStatus: (root) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().indexStatus(engineeringRoot)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        indexSearch: (root, query) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().indexSearch(engineeringRoot, query)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        verificationProfiles: (root) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().verificationProfiles(engineeringRoot)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        verificationStart: (root, profileId, ctx) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().verificationStart(engineeringRoot, profileId, {
+          ...ctx,
+          ownerId: event.sender.id,
+        })
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        verificationGet: (root, jobRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().verificationGet(engineeringRoot, jobRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        verificationResult: (root, jobRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().verificationResult(engineeringRoot, jobRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+      },
     };
     // Expand @refs only on the copy fed to the model (history keeps original).
     const modelMessages = messagesForModel(messages, project?.path || null);

@@ -130,4 +130,39 @@ contextBridge.exposeInMainWorld('codex', {
   readyPullRequest: (payload) => ipcRenderer.invoke('worktree:pr:ready', payload || {}),
   mergePullRequest: (payload) => ipcRenderer.invoke('worktree:pr:merge', payload || {}),
   openWorktreePr: (payload) => ipcRenderer.invoke('worktree:pr:open', payload || {}),
+  engineeringIndexEnsure: (payload = {}) => ipcRenderer.invoke('engineering:index:ensure', { projectBindingId: String(payload?.projectBindingId || '') }),
+  engineeringIndexStatus: (payload = {}) => ipcRenderer.invoke('engineering:index:status', { projectBindingId: String(payload?.projectBindingId || '') }),
+  engineeringIndexRebuild: (payload = {}) => ipcRenderer.invoke('engineering:index:rebuild', { projectBindingId: String(payload?.projectBindingId || '') }),
+  engineeringIndexClear: (payload = {}) => ipcRenderer.invoke('engineering:index:clear', { projectBindingId: String(payload?.projectBindingId || '') }),
+  engineeringIndexSearch: (payload = {}) => ipcRenderer.invoke('engineering:index:search', { projectBindingId: String(payload?.projectBindingId || ''), mode: ['definitions', 'references', 'text'].includes(payload?.mode) ? payload.mode : 'text', query: String(payload?.query || '').slice(0, 256), pathGlob: payload?.pathGlob ? String(payload.pathGlob).slice(0, 256) : undefined, language: payload?.language ? String(payload.language).slice(0, 40) : undefined, maxResults: payload?.maxResults }),
+  engineeringIndexLocation: (payload = {}) => ipcRenderer.invoke('engineering:index:location', { projectBindingId: String(payload?.projectBindingId || ''), path: String(payload?.path || '').replace(/\\/g, '/').slice(0, 500), line: payload?.line, column: payload?.column, context: payload?.context }),
+  listVerificationProfiles: (payload = {}) => ipcRenderer.invoke('engineering:verification:profiles', { projectBindingId: String(payload?.projectBindingId || '') }),
+  saveVerificationProfile: (payload = {}) => ipcRenderer.invoke('engineering:verification:profile:save', {
+    projectBindingId: String(payload?.projectBindingId || ''),
+    profile: {
+      id: String(payload?.profile?.id || ''),
+      name: String(payload?.profile?.name || ''),
+      kind: String(payload?.profile?.kind || ''),
+      command: String(payload?.profile?.command || ''),
+      cwd: String(payload?.profile?.cwd || '.'),
+      timeoutMs: payload?.profile?.timeoutMs,
+      enabled: payload?.profile?.enabled !== false,
+    },
+  }),
+  deleteVerificationProfile: (payload = {}) => ipcRenderer.invoke('engineering:verification:profile:delete', {
+    projectBindingId: String(payload?.projectBindingId || ''),
+    profileId: String(payload?.profileId || ''),
+  }),
+  runVerification: (payload = {}) => ipcRenderer.invoke('engineering:verification:run', { projectBindingId: String(payload?.projectBindingId || ''), profileId: String(payload?.profileId || ''), sessionId: String(payload?.sessionId || '') }),
+  listVerificationJobs: (payload = {}) => ipcRenderer.invoke('engineering:verification:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),
+  getVerificationJob: (payload = {}) => ipcRenderer.invoke('engineering:verification:get', { projectBindingId: String(payload?.projectBindingId || ''), jobRef: String(payload?.jobRef || '') }),
+  getVerificationResult: (payload = {}) => ipcRenderer.invoke('engineering:verification:result', { projectBindingId: String(payload?.projectBindingId || ''), jobRef: String(payload?.jobRef || '') }),
+  cancelVerification: (payload = {}) => ipcRenderer.invoke('engineering:verification:cancel', { projectBindingId: String(payload?.projectBindingId || ''), jobRef: String(payload?.jobRef || '') }),
+  rerunVerification: (payload = {}) => ipcRenderer.invoke('engineering:verification:rerun', { projectBindingId: String(payload?.projectBindingId || ''), jobRef: String(payload?.jobRef || '') }),
+  revokeVerificationGrant: (payload = {}) => ipcRenderer.invoke('engineering:verification:revoke-grant', { projectBindingId: String(payload?.projectBindingId || ''), profileId: String(payload?.profileId || '') }),
+  onEngineeringEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('engineering:event', listener);
+    return () => ipcRenderer.removeListener('engineering:event', listener);
+  },
 });

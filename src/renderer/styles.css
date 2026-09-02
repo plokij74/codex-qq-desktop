@@ -694,6 +694,35 @@ html, body {
 .work-card-error { color: #9a3c44; font-size: 12px; margin: 4px 0 8px; }
 .work-card-notice { color: #7a5b1c; font-size: 12px; margin: 4px 0 8px; }
 .work-empty { color: #6a87a3; padding: 18px 4px; }
+.engineering-section { border-bottom: 1px solid #bfd1df; padding: 8px 0 12px; margin-bottom: 10px; }
+.engineering-search { display: flex; gap: 6px; margin: 8px 0; }
+.engineering-search input, .engineering-search select { min-width: 0; height: 26px; border: 1px solid #9db8d4; border-radius: 3px; background: #fff; color: #234; }
+.engineering-search input { flex: 1; padding: 2px 6px; }
+.engineering-result, .engineering-profile, .engineering-job { border: 1px solid #c4d5e3; background: #f8fbfe; padding: 6px 8px; margin-top: 4px; font-size: 12px; }
+.engineering-result code, .engineering-job code { color: #245d8e; }
+.engineering-result div { color: #567; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.engineering-result { display: block; width: 100%; text-align: left; color: inherit; cursor: pointer; }
+.engineering-result:hover { background: #e8f3fc; border-color: #7ea8c9; }
+.engineering-profile, .engineering-job { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.engineering-profile-main { min-width: 0; flex: 1; }
+.engineering-profile-main strong { color: #234d78; margin-right: 5px; }
+.engineering-profile-meta { color: #567; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.engineering-profile-meta code { color: #245d8e; }
+.engineering-candidate { background: #fffdf3; border-color: #d8c88e; }
+.engineering-candidate-title { margin-top: 10px; }
+.engineering-job-detail { border: 1px solid #9db8d4; background: #f3f8fd; padding: 8px; margin-top: 8px; font-size: 12px; }
+.engineering-job-detail.hidden { display: none; }
+.engineering-detail-title { color: #1f4f80; font-weight: 700; margin-bottom: 6px; }
+.engineering-detail-actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.engineering-diagnostics { display: grid; gap: 4px; margin: 6px 0; }
+.engineering-diagnostic { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; border: 1px solid #c4d5e3; background: #fff; color: #345; padding: 5px 6px; cursor: pointer; font-size: 11px; }
+.engineering-diagnostic:hover { background: #e8f3fc; }
+.engineering-diagnostic span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.engineering-job-detail details { margin-top: 6px; }
+.engineering-job-detail pre { max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: #fff; border: 1px solid #c4d5e3; padding: 6px; margin: 4px 0 0; }
+.badge.disabled { color: #789; background: #edf1f5; }
+.badge.ready, .badge.passed { color: #27683c; }
+.badge.failed, .badge.error, .badge.timed_out { color: #8a2e2e; }
 .mcp-inline-tasks { margin: 4px 0 10px 38px; max-width: 78%; }
 .mcp-inline-task { display: flex; justify-content: space-between; gap: 10px; border: 1px solid #bfd3e6; background: #f1f7fd; color: #345; padding: 5px 8px; margin-top: 4px; border-radius: 4px; font-size: 11px; }
 .mcp-inline-task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

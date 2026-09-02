@@ -26,6 +26,11 @@ const AGENT_EVENTS = {
   HOOK_START: 'hook-start',
   HOOK_END: 'hook-end',
   USAGE: 'usage',
+  // D11 engineering job events deliberately have no entry here. They travel on
+  // their own IPC channel ('engineering:event') straight to the engineering
+  // center, never through the chat event stream, so they cannot reach session
+  // history or usage. Adding a constant here would invite wiring them into the
+  // chat pipeline that this separation exists to avoid.
 };
 
 module.exports = { AGENT_EVENTS };

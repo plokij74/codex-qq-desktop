@@ -157,10 +157,10 @@ function walkFiles(projectRoot, opts = {}) {
     if (!(ignoreRules && isIgnored(rel, ignoreRules))) {
       if (opts.onFile) opts.onFile(rel, startFull, st0);
     }
-    return;
+    return true;
   }
 
-  walk(startFull);
+  return walk(startFull);
 }
 
 /**
@@ -272,6 +272,7 @@ function globFiles(projectRoot, opts = {}) {
 module.exports = {
   grepFiles,
   globFiles,
+  walkFiles,
   // exported for tests / reuse if needed
   SKIP_DIRS,
   matchGlob,

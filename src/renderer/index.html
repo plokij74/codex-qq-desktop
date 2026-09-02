@@ -25,7 +25,7 @@
 
     <nav class="qq-toolbar" id="main-toolbar">
       <button type="button" class="tb-btn" data-view="new-task">新建任务</button>
-      <button type="button" class="tb-btn" data-view="scheduled">已安排</button>
+      <button type="button" class="tb-btn" data-view="scheduled">工程中心</button>
       <button type="button" class="tb-btn" data-view="plugins">插件</button>
       <button type="button" class="tb-btn" data-view="sites">站点</button>
       <button type="button" class="tb-btn" data-view="prs">拉取请求</button>
@@ -38,7 +38,7 @@
           <div class="left-header">🐧 Codex</div>
           <ul class="nav-list" id="left-nav">
             <li class="nav-item" data-view="new-task">新建任务</li>
-            <li class="nav-item" data-view="scheduled">已安排</li>
+            <li class="nav-item" data-view="scheduled">工程中心</li>
             <li class="nav-item" data-view="plugins">插件</li>
             <li class="nav-item" data-view="sites">站点</li>
             <li class="nav-item" data-view="prs">拉取请求</li>
@@ -217,6 +217,7 @@
         <label class="field"><span>最大 Agent 轮数</span><input id="set-agent-turns" type="number" min="0" max="50" value="8" title="0 表示不限制轮数" /></label>
         <label class="switch-row"><input type="checkbox" id="set-terminal-enabled" /> <span>允许终端命令（默认关）</span></label>
         <label class="switch-row"><input type="checkbox" id="set-terminal-confirm" checked /> <span>全自动时终端仍需确认</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-code-index-enabled" checked /> <span>启用代码索引（词法近似定位）</span></label>
         <label class="field">
           <span>新建会话默认模式</span>
           <select id="set-default-agent-mode">

@@ -10,7 +10,20 @@ const EXPLORE_READONLY = new Set([
   'git_diff',
 ]);
 
-/** Tools allowed for implement subagents: explore set + write_file / search_replace. */
+// D11 read-only engineering tools are kept separate so older consumers that
+// compare the original explore allowlist remain source-compatible.
+const ENGINEERING_READONLY = new Set([
+  'code_index_status', 'code_index_search', 'verification_profiles',
+  'verification_get', 'verification_result',
+]);
+
+/**
+ * Tools allowed for implement subagents: explore set + write_file /
+ * search_replace. Engineering reads are deliberately excluded: an implement
+ * child runs inside a temporary worktree, so its project path is not the bound
+ * project and an index or profile lookup there would answer about the wrong
+ * tree. The isolated gate rejects these names as well.
+ */
 const IMPLEMENT_TOOLS = new Set([
   ...EXPLORE_READONLY,
   'write_file',
@@ -39,9 +52,12 @@ function createBuiltinProvider(deps) {
       if (!ctx?.settings?.terminalEnabled) {
         defs = defs.filter((t) => t.function.name !== 'run_terminal');
       }
+      if (ctx?.settings?.codeIndexEnabled === false) {
+        defs = defs.filter((t) => !String(t.function.name || '').startsWith('code_index_'));
+      }
       if (Number(ctx?.subagentDepth) >= 1 || ctx?.exploreReadonly) {
         const kind = ctx?.subagentKind === 'implement' ? 'implement' : 'explore';
-        const allow = kind === 'implement' ? IMPLEMENT_TOOLS : EXPLORE_READONLY;
+        const allow = kind === 'implement' ? IMPLEMENT_TOOLS : new Set([...EXPLORE_READONLY, ...ENGINEERING_READONLY]);
         defs = defs.filter((t) => allow.has(t.function.name));
       }
       return defs;
@@ -50,7 +66,7 @@ function createBuiltinProvider(deps) {
       // Defense in depth: same allowlist as getTools when subagent / explore-readonly.
       if (Number(ctx?.subagentDepth) >= 1 || ctx?.exploreReadonly) {
         const kind = ctx?.subagentKind === 'implement' ? 'implement' : 'explore';
-        const allow = kind === 'implement' ? IMPLEMENT_TOOLS : EXPLORE_READONLY;
+        const allow = kind === 'implement' ? IMPLEMENT_TOOLS : new Set([...EXPLORE_READONLY, ...ENGINEERING_READONLY]);
         if (!allow.has(name)) {
           return JSON.stringify({ ok: false, error: '未知工具: ' + name });
         }
@@ -64,4 +80,5 @@ module.exports = {
   createBuiltinProvider,
   EXPLORE_READONLY,
   IMPLEMENT_TOOLS,
+  ENGINEERING_READONLY,
 };

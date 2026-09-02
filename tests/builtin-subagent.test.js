@@ -107,4 +107,54 @@ describe('builtin subagent tool filter', () => {
     assert.equal(called, 'read_file');
     assert.equal(JSON.parse(raw).ok, true);
   });
+
+  it('allows engineering reads to explore but never verification_start', async () => {
+    const defs = [
+      'code_index_status', 'code_index_search', 'verification_profiles',
+      'verification_get', 'verification_result', 'verification_start',
+    ].map((name) => ({ type: 'function', function: { name } }));
+    const p = createBuiltinProvider({
+      getToolDefs: () => defs,
+      executeTool: async (name) => JSON.stringify({ ok: true, name }),
+    });
+    const explore = p.getTools({ subagentDepth: 1, subagentKind: 'explore', settings: { terminalEnabled: true } });
+    assert.deepEqual(names(explore), [
+      'code_index_search', 'code_index_status', 'verification_get',
+      'verification_profiles', 'verification_result',
+    ]);
+    const denied = JSON.parse(await p.execute('verification_start', { profileId: 'vfy_12345678' }, {
+      subagentDepth: 1, subagentKind: 'explore', settings: { terminalEnabled: true },
+    }));
+    assert.equal(denied.ok, false);
+    const implement = p.getTools({ subagentDepth: 1, subagentKind: 'implement', settings: { terminalEnabled: true } });
+    assert.ok(!implement.some((tool) => tool.function.name === 'verification_start'));
+  });
+
+  it('keeps engineering tools out of implement subagents that run in an isolated worktree', async () => {
+    // An implement child's project.path is the temporary worktree, so an index
+    // or profile lookup would target the worktree instead of the bound project
+    // and the isolated gate denies these names anyway.
+    const defs = [
+      'read_file', 'write_file', 'code_index_status', 'code_index_search',
+      'verification_profiles', 'verification_get', 'verification_result',
+    ].map((name) => ({ type: 'function', function: { name } }));
+    const p = createBuiltinProvider({
+      getToolDefs: () => defs,
+      executeTool: async (name) => JSON.stringify({ ok: true, name }),
+    });
+    const ctx = { subagentDepth: 1, subagentKind: 'implement', settings: { terminalEnabled: true } };
+    assert.deepEqual(names(p.getTools(ctx)), ['read_file', 'write_file']);
+    for (const name of ['code_index_status', 'code_index_search', 'verification_profiles', 'verification_get', 'verification_result']) {
+      assert.equal(JSON.parse(await p.execute(name, {}, ctx)).ok, false, `${name} 必须被拒绝`);
+    }
+  });
+
+  it('strips code index tools when the index switch is off', () => {
+    const defs = ['read_file', 'code_index_status', 'code_index_search', 'verification_profiles']
+      .map((name) => ({ type: 'function', function: { name } }));
+    const p = createBuiltinProvider({ getToolDefs: () => defs, executeTool: async () => '{}' });
+    const off = names(p.getTools({ settings: { codeIndexEnabled: false } }));
+    assert.deepEqual(off, ['read_file', 'verification_profiles']);
+    assert.ok(names(p.getTools({ settings: {} })).includes('code_index_search'));
+  });
 });

@@ -96,6 +96,15 @@ describe('agent-mode', () => {
     assert.ok(r.text.length <= PLAN_MARKDOWN_MAX + 80);
   });
 
+  it('plan mode hides verification_start while keeping bounded verification reads', () => {
+    const defs = ['code_index_status', 'code_index_search', 'verification_profiles', 'verification_get', 'verification_result', 'verification_start']
+      .map((name) => ({ type: 'function', function: { name } }));
+    const names = filterToolsForMode(defs, 'plan').map((tool) => tool.function.name);
+    assert.ok(names.includes('code_index_status'));
+    assert.ok(names.includes('verification_result'));
+    assert.ok(!names.includes('verification_start'));
+  });
+
   it('uses a memory-only Agent for unbound API chats only when memory is enabled', () => {
     assert.equal(shouldUseAgent({
       settings: { mode: 'api', agentEnabled: true, apiKey: 'k', memoryEnabled: true },

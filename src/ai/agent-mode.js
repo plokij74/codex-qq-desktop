@@ -8,6 +8,7 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'delete_path',
   'git_commit',
   'run_terminal',
+  'verification_start',
   'spawn_explore',
   'spawn_explores',
   'spawn_implement',

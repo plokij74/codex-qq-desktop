@@ -53,6 +53,18 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     return binding || null;
   }
 
+  function hasProjectBinding(event, projectPath) {
+    const owner = senderId(event);
+    if (owner == null || !projectPath) return false;
+    let canonical;
+    try { canonical = fs.realpathSync.native(projectPath); } catch { canonical = path.resolve(projectPath); }
+    const target = process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+    return [...(bindingsBySender.get(owner)?.values() || [])].some((binding) => {
+      const current = process.platform === 'win32' ? String(binding.projectPath).toLowerCase() : binding.projectPath;
+      return current === target;
+    });
+  }
+
   function unbind(event, payload = {}) {
     const owner = senderId(event);
     const token = String(payload.projectBindingId || '');
@@ -151,6 +163,14 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
 
   return {
     bind,
+    // Main-owned consumers (engineering index/verification) may reuse the
+    // same sender-scoped binding without exposing the canonical path to the
+    // renderer. This returns a copy so callers cannot mutate the record.
+    resolveBinding: (event, payload = {}) => {
+      const binding = resolveBinding(event, payload);
+      return binding ? { ...binding } : null;
+    },
+    hasProjectBinding,
     unbind,
     list,
     get,

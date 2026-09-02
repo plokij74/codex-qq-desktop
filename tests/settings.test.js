@@ -279,4 +279,102 @@ describe('settings', () => {
     );
     assert.equal(loadSettings(dir).memoryCandidateEnabled, true);
   });
+
+  it('D11 defaults the code index on and normalizes hand-edited switch values', () => {
+    assert.equal(DEFAULT_SETTINGS.codeIndexEnabled, true);
+    assert.deepEqual(DEFAULT_SETTINGS.verificationProfiles, []);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d11-settings-'));
+    assert.equal(loadSettings(dir).codeIndexEnabled, true);
+    saveSettings(dir, { codeIndexEnabled: false });
+    assert.equal(loadSettings(dir).codeIndexEnabled, false);
+    // Only an explicit false disables the index; junk must not read as "off".
+    for (const junk of ['no', 0, 'false', null]) {
+      fs.writeFileSync(getSettingsPath(dir), JSON.stringify({ codeIndexEnabled: junk }), 'utf8');
+      assert.equal(loadSettings(dir).codeIndexEnabled, true, `${JSON.stringify(junk)} 应视为开启`);
+    }
+  });
+
+  it('D11 round-trips a project-scoped verification profile through save and load', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d11-settings-'));
+    const projectKey = 'a'.repeat(32);
+    saveSettings(dir, {
+      verificationProfiles: [{
+        id: 'vfy_1234567890abcdef', name: 'Unit tests', kind: 'test',
+        command: 'npm test', cwd: 'packages/app', timeoutMs: 120000,
+        enabled: true, projectKey,
+      }],
+    });
+    const [profile] = loadSettings(dir).verificationProfiles;
+    // A dropped projectKey here silently loses every saved profile on reload.
+    assert.ok(profile, 'profile 必须在重新加载后仍存在');
+    assert.equal(profile.projectKey, projectKey);
+    assert.equal(profile.id, 'vfy_1234567890abcdef');
+    assert.equal(profile.command, 'npm test');
+    assert.equal(profile.cwd, 'packages/app');
+    assert.equal(profile.timeoutMs, 120000);
+    assert.equal(profile.kind, 'test');
+    assert.equal(profile.enabled, true);
+  });
+
+  it('D11 rejects unscoped or malformed verification profiles', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d11-settings-'));
+    const projectKey = 'b'.repeat(32);
+    const base = { name: 'X', kind: 'test', command: 'npm test', cwd: '.', timeoutMs: 60000, enabled: true, projectKey };
+    saveSettings(dir, {
+      verificationProfiles: [
+        { ...base, projectKey: undefined },        // unscoped: available to every project
+        { ...base, projectKey: 'short' },          // not a canonical project key
+        { ...base, name: '' },                     // no name
+        { ...base, command: '' },                  // no command
+        { ...base, command: 'npm test\nrm -rf /' },// newline injection
+        { ...base, command: 'npm\u0000test' },     // NUL
+        { ...base, cwd: '/etc' },                  // absolute cwd
+        { ...base, cwd: 'C:/Windows' },            // absolute Windows cwd
+        { ...base, cwd: '../outside' },            // escapes the project
+      ],
+    });
+    assert.deepEqual(loadSettings(dir).verificationProfiles, []);
+  });
+
+  it('D11 clamps profile fields and caps profiles per project', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d11-settings-'));
+    const projectKey = 'c'.repeat(32);
+    saveSettings(dir, {
+      verificationProfiles: [
+        { name: 'fast', kind: 'nonsense', command: 'a', cwd: './sub/', timeoutMs: 10, enabled: true, projectKey },
+        { name: 'slow', kind: 'lint', command: 'b', cwd: '.', timeoutMs: 99999999, projectKey },
+        { name: 'weird', kind: 'build', command: 'c', cwd: '.', timeoutMs: 'x', projectKey },
+      ],
+    });
+    const list = loadSettings(dir).verificationProfiles;
+    assert.equal(list[0].kind, 'custom');
+    assert.equal(list[0].timeoutMs, 5000);
+    assert.equal(list[0].cwd, 'sub');
+    assert.match(list[0].id, /^vfy_[a-f0-9]{16}$/);
+    assert.equal(list[1].timeoutMs, 15 * 60 * 1000);
+    assert.equal(list[1].enabled, true);
+    assert.equal(list[2].timeoutMs, 60000);
+
+    saveSettings(dir, {
+      verificationProfiles: Array.from({ length: 15 }, (_unused, i) => ({
+        id: `vfy_${String(i).padStart(16, '0')}`, name: `p${i}`, kind: 'test',
+        command: 'npm test', cwd: '.', timeoutMs: 60000, enabled: true, projectKey,
+      })),
+    });
+    assert.equal(loadSettings(dir).verificationProfiles.length, 12);
+  });
+
+  it('D11 leaves a pre-D11 settings file and its soft verifyCommand untouched', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d11-settings-'));
+    fs.writeFileSync(
+      getSettingsPath(dir),
+      JSON.stringify({ mode: 'api', model: 'legacy-model', verifyCommand: 'npm run legacy' }),
+      'utf8'
+    );
+    const s = loadSettings(dir);
+    assert.equal(s.verifyCommand, 'npm run legacy');
+    assert.equal(s.codeIndexEnabled, true);
+    assert.deepEqual(s.verificationProfiles, []);
+    assert.equal(s.model, 'legacy-model');
+  });
 });

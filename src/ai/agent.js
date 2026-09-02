@@ -168,6 +168,64 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'code_index_status',
+      description: 'Show the bounded lexical code index status for the current project.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'code_index_search',
+      description: 'Search lexical definitions, references or text in the current project.',
+      parameters: {
+        type: 'object',
+        properties: {
+          mode: { type: 'string', enum: ['definitions', 'references', 'text'] },
+          query: { type: 'string' },
+          pathGlob: { type: 'string' },
+          language: { type: 'string' },
+          maxResults: { type: 'integer' },
+        },
+        required: ['mode', 'query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verification_profiles',
+      description: 'List saved verification profiles for the current project.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verification_start',
+      description: 'Start a saved verification profile. Only profileId is accepted.',
+      parameters: { type: 'object', properties: { profileId: { type: 'string' } }, required: ['profileId'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verification_get',
+      description: 'Read a bounded verification job status by opaque jobRef.',
+      parameters: { type: 'object', properties: { jobRef: { type: 'string' } }, required: ['jobRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verification_result',
+      description: 'Read bounded logs and diagnostics for an opaque verification job.',
+      parameters: { type: 'object', properties: { jobRef: { type: 'string' } }, required: ['jobRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'git_status',
       description: 'Show git working tree status (branch + changed files).',
       parameters: { type: 'object', properties: { short: { type: 'boolean' } } },
@@ -237,8 +295,10 @@ const TOOL_NAMES = TOOL_DEFS.map((t) => t.function.name).join(', ');
  */
 function buildExploreSubagentPrompt(project) {
   const parts = [
-    '你是只读调研子 Agent（explore）。只能使用 list_dir / read_file / grep / glob / git_status / git_diff。',
-    '禁止写文件、删除、终端、git_commit、submit_plan、spawn_explore、spawn_explores、spawn_implement、skills。',
+    '你是只读调研子 Agent（explore）。只能使用 list_dir / read_file / grep / glob / git_status / git_diff，'
+      + '以及只读工程工具 code_index_status / code_index_search / verification_profiles / verification_get / verification_result。',
+    '禁止写文件、删除、终端、git_commit、verification_start、submit_plan、spawn_explore、spawn_explores、spawn_implement、skills。',
+    'code_index_search 是词法近似定位，不是语义解析；据此下结论前必须用 read_file 核对。',
     '围绕用户给出的 goal 做代码库调研，完成后用中文给出简洁结论（关键路径、发现、不确定点）。',
     '不要编造文件内容；先搜/读再总结。路径一律相对项目根。',
   ];
@@ -587,6 +647,8 @@ function toolDetail(name, args) {
       String(args.markdown || '').slice(0, 1500),
     ].filter(Boolean).join('\n').slice(0, 2000);
   }
+  if (name === 'verification_start') return `profile=${String(args.profileId || '').slice(0, 80)}`;
+  if (name === 'verification_get' || name === 'verification_result') return `job=${String(args.jobRef || '').slice(0, 80)}`;
   try {
     return JSON.stringify(args).slice(0, 2000);
   } catch {
@@ -608,6 +670,11 @@ function summarizeToolResult(name, parsed) {
   if (name === 'git_diff') return parsed.truncated ? 'diff (truncated)' : 'diff';
   if (name === 'git_commit') return parsed.summary || parsed.commit || 'committed';
   if (name === 'submit_plan') return parsed.planId ? `plan ${parsed.planId}` : 'plan submitted';
+  if (name === 'code_index_status') return parsed.state ? `index ${parsed.state}` : 'index status';
+  if (name === 'code_index_search') return `matches=${(parsed.results && parsed.results.length) || 0}`;
+  if (name === 'verification_profiles') return `profiles=${(parsed.profiles && parsed.profiles.length) || 0}`;
+  if (name === 'verification_start') return parsed.jobRef ? `job ${parsed.jobRef}` : (parsed.error || 'verification');
+  if (name === 'verification_get' || name === 'verification_result') return parsed.status || parsed.job?.status || 'verification';
   if (name === 'spawn_explore') {
     if (parsed.ok === false) return parsed.error || 'explore failed';
     return parsed.summary ? String(parsed.summary).slice(0, 120) : `turns=${parsed.turns ?? '?'}`;
@@ -839,6 +906,38 @@ async function executeTool(name, args, ctx) {
     if (name === 'delete_path') {
       const d = deletePath(root, rel);
       return JSON.stringify({ ok: true, path: d.path });
+    }
+    if (name === 'code_index_status' || name === 'code_index_search') {
+      const engineering = ctx.extensions?.engineering;
+      if (!engineering) return JSON.stringify({ ok: false, error: '代码索引不可用' });
+      const result = name === 'code_index_status'
+        ? await engineering.indexStatus(root)
+        : await engineering.indexSearch(root, {
+          mode: ['definitions', 'references', 'text'].includes(args.mode) ? args.mode : 'text',
+          query: String(args.query || '').slice(0, 256), pathGlob: args.pathGlob, language: args.language, maxResults: args.maxResults,
+        });
+      return JSON.stringify(result);
+    }
+    if (name === 'verification_profiles') {
+      const engineering = ctx.extensions?.engineering;
+      if (!engineering) return JSON.stringify({ ok: false, error: '验证管理器不可用' });
+      return JSON.stringify(await engineering.verificationProfiles(root));
+    }
+    if (name === 'verification_get' || name === 'verification_result') {
+      const engineering = ctx.extensions?.engineering;
+      const jobRef = String(args.jobRef || '');
+      if (!engineering || !/^vfy_job_[a-f0-9]{24}$/.test(jobRef)) return JSON.stringify({ ok: false, error: '作业引用无效' });
+      const result = name === 'verification_get'
+        ? await engineering.verificationGet(root, jobRef)
+        : await engineering.verificationResult(root, jobRef);
+      return JSON.stringify(result);
+    }
+    if (name === 'verification_start') {
+      const engineering = ctx.extensions?.engineering;
+      const profileId = String(args.profileId || '');
+      if (!engineering || !/^vfy_[a-f0-9]{8,64}$/.test(profileId)) return JSON.stringify({ ok: false, error: 'profileId 无效' });
+      const result = await engineering.verificationStart(root, profileId, ctx);
+      return JSON.stringify(result);
     }
     if (name === 'run_terminal') {
       if (!settings.terminalEnabled) {
@@ -1617,6 +1716,10 @@ async function runAgentLoop({
               authDiff,
               authScope,
             }) {
+              // verification_start is authorized inside the main-owned
+              // manager so a persisted project+profile fingerprint grant can
+              // suppress repeat prompts without weakening other terminal use.
+              if (name === 'verification_start') return { allowed: true };
               try {
                 const auth = await authorizeTool({
                   gate: effectiveGate,
@@ -1636,6 +1739,7 @@ async function runAgentLoop({
                 return {
                   allowed: !!auth.allowed,
                   reason: auth.reason,
+                  decision: auth.decision,
                 };
               } catch (err) {
                 if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
@@ -1663,7 +1767,6 @@ async function runAgentLoop({
                 });
               authAllowed = gate1.allowed;
               authReason = gate1.reason;
-
               if (!authAllowed) {
                 resultStr = JSON.stringify({ ok: false, error: authReason || '未授权' });
                 hookFlags.deniedByGate = true;

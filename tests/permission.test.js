@@ -251,6 +251,27 @@ describe('permission', () => {
     assert.equal(called, false);
   });
 
+  it('verification_start always asks for first approval even in full-auto', async () => {
+    let called = 0;
+    const gate = createPermissionGate({
+      permissionMode: 'full-auto',
+      terminalEnabled: true,
+      terminalRequireConfirm: false,
+      onApprovalNeeded: async (payload) => {
+        called += 1;
+        gate.resolveApproval(payload.approvalId, 'allow');
+      },
+    });
+    const result = await gate.authorize({
+      tool: 'verification_start',
+      risk: 'terminal',
+      summary: 'run saved tests',
+      sessionKey: 'verification-session',
+    });
+    assert.equal(result.allowed, true);
+    assert.equal(called, 1);
+  });
+
   it('resolveApproval deny returns allowed false with Chinese reason', async () => {
     let pendingId;
     const gate = createPermissionGate({

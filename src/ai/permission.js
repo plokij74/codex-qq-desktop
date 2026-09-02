@@ -6,6 +6,8 @@ const READ_TOOLS = new Set([
   'submit_plan',
   'list_skills', 'use_skill', 'spawn_explore', 'spawn_explores',
   'recall',
+  'code_index_status', 'code_index_search', 'verification_profiles',
+  'verification_get', 'verification_result',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit', 'spawn_implement', 'run_skill',
@@ -30,6 +32,7 @@ function riskForTool(toolName) {
   if (name === 'web_fetch') return 'network';
   if (name === 'delete_path') return 'delete';
   if (name === 'run_terminal') return 'terminal';
+  if (name === 'verification_start') return 'terminal';
   return 'write';
 }
 
@@ -174,6 +177,11 @@ function createPermissionGate({
     tool, risk, summary, detail, path, scope, sessionKey, signal, diff, source, server, context,
     agentMode: callAgentMode,
   } = {}) {
+    const allowedWithDecision = (decision) => {
+      const result = { allowed: true };
+      if (decision) Object.defineProperty(result, 'decision', { value: decision, enumerable: false });
+      return result;
+    };
     const effectiveRisk = risk || riskForTool(tool);
     const mode = normalizeAgentMode(
       callAgentMode != null ? callAgentMode : gateAgentMode,
@@ -205,9 +213,9 @@ function createPermissionGate({
       );
       if (decision.decision === 'allow_session') {
         rememberSession(sessionKey, allowKey);
-        return { allowed: true };
+        return allowedWithDecision('allow_session');
       }
-      if (decision.decision === 'allow') return { allowed: true };
+      if (decision.decision === 'allow') return allowedWithDecision('allow');
       return { allowed: false, reason: '用户拒绝' };
     }
 
@@ -230,9 +238,9 @@ function createPermissionGate({
       );
       if (decision.decision === 'allow_session') {
         rememberSession(sessionKey, allowKey);
-        return { allowed: true };
+        return allowedWithDecision('allow_session');
       }
-      if (decision.decision === 'allow') return { allowed: true };
+      if (decision.decision === 'allow') return allowedWithDecision('allow');
       return { allowed: false, reason: '用户拒绝' };
     }
 
@@ -244,6 +252,19 @@ function createPermissionGate({
         allowed: false,
         reason: '当前为只读模式，不允许写/删/终端操作',
       };
+    }
+
+    // A saved verification profile is executable authority. Full-auto may
+    // not bypass its first or changed-fingerprint approval; the verification
+    // manager owns the persistent project+profile grant.
+    if (tool === 'verification_start') {
+      const decision = await waitForApproval(
+        { tool, risk: effectiveRisk, summary, detail, path, diff },
+        signal,
+      );
+      if (decision.decision === 'allow_session') return allowedWithDecision('allow_session');
+      if (decision.decision === 'allow') return allowedWithDecision('allow');
+      return { allowed: false, reason: '用户拒绝' };
     }
 
     if (permissionMode === 'full-auto') {
@@ -270,10 +291,10 @@ function createPermissionGate({
 
     if (decisionResult.decision === 'allow_session') {
       rememberSession(sessionKey, effectiveRisk);
-      return { allowed: true };
+      return allowedWithDecision('allow_session');
     }
     if (decisionResult.decision === 'allow') {
-      return { allowed: true };
+      return allowedWithDecision('allow');
     }
     return { allowed: false, reason: '用户拒绝' };
   }

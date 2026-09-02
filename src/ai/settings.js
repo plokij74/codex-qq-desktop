@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { sanitizeMcpServers } = require('./mcp-config');
+const crypto = require('crypto');
 
 const DEFAULT_SETTINGS = {
   mode: 'local',
@@ -56,6 +57,9 @@ const DEFAULT_SETTINGS = {
   usageMaxRecords: 5000, // clamp 500..50000
   usagePricing: [], // { modelPrefix, inputPerM, outputPerM }[]，上限 20 行
   usageCurrency: '$',
+  // Phase D.11 engineering
+  codeIndexEnabled: true,
+  verificationProfiles: [],
 };
 
 function getSettingsPath(userDataPath) {
@@ -168,6 +172,54 @@ function clampMcpD10Settings(s) {
   return s;
 }
 
+const VERIFICATION_PROFILE_LIMIT = 12;
+const VERIFICATION_PROFILE_PROJECT_LIMIT = 100;
+const VERIFICATION_KINDS = new Set(['test', 'build', 'typecheck', 'lint', 'custom']);
+function normalizeVerificationProfile(raw, options = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const name = String(raw.name ?? '').trim().slice(0, 120);
+  const command = String(raw.command ?? '').trim().slice(0, 1000);
+  const cwdRaw = String(raw.cwd ?? '.').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '') || '.';
+  if (!name || !command || /[\u0000\r\n]/.test(command) || cwdRaw.startsWith('/') || /^[A-Za-z]:/.test(cwdRaw) || cwdRaw.split('/').includes('..')) return null;
+  const n = Number(raw.timeoutMs);
+  const timeoutMs = Number.isFinite(n) ? Math.max(5000, Math.min(15 * 60 * 1000, Math.floor(n))) : 60000;
+  const id = /^vfy_[a-f0-9]{8,64}$/.test(String(raw.id || '')) ? String(raw.id) : `vfy_${crypto.randomBytes(8).toString('hex')}`;
+  const suppliedProjectKey = options.projectKey ?? raw.projectKey;
+  const projectKey = /^[a-f0-9]{32}$/.test(String(suppliedProjectKey || '')) ? String(suppliedProjectKey) : '';
+  return {
+    id,
+    name,
+    kind: VERIFICATION_KINDS.has(raw.kind) ? raw.kind : 'custom',
+    command,
+    cwd: cwdRaw,
+    timeoutMs,
+    enabled: raw.enabled !== false,
+    ...(projectKey ? { projectKey } : {}),
+  };
+}
+function clampVerificationSettings(s) {
+  s.codeIndexEnabled = s.codeIndexEnabled !== false;
+  const list = Array.isArray(s.verificationProfiles) ? s.verificationProfiles : [];
+  const seen = new Set(); const counts = new Map(); const projects = new Set(); const out = [];
+  for (const item of list) {
+    const p = normalizeVerificationProfile(item);
+    // D11 profiles are project-scoped. Older hand-edited, unscoped entries
+    // are ignored instead of becoming commands available to every project.
+    if (!p?.projectKey) continue;
+    const identity = `${p.projectKey}:${p.id}`;
+    if (seen.has(identity)) continue;
+    if (!projects.has(p.projectKey) && projects.size >= VERIFICATION_PROFILE_PROJECT_LIMIT) continue;
+    const count = counts.get(p.projectKey) || 0;
+    if (count >= VERIFICATION_PROFILE_LIMIT) continue;
+    projects.add(p.projectKey);
+    counts.set(p.projectKey, count + 1);
+    seen.add(identity);
+    out.push(p);
+  }
+  s.verificationProfiles = out;
+  return s;
+}
+
 function loadSettings(userDataPath) {
   const file = getSettingsPath(userDataPath);
   try {
@@ -182,6 +234,7 @@ function loadSettings(userDataPath) {
     clampCompactSettings(merged);
     clampMemorySettings(merged);
     clampWebSettings(merged);
+    clampVerificationSettings(merged);
     return clampMcpD10Settings(clampUsageSettings(merged));
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -196,6 +249,7 @@ function saveSettings(userDataPath, partial) {
   clampMemorySettings(next);
   clampWebSettings(next);
   clampUsageSettings(next);
+  clampVerificationSettings(next);
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
   return clampMcpD10Settings(next);
@@ -212,6 +266,10 @@ module.exports = {
   clampWebSettings,
   clampUsageSettings,
   clampMcpD10Settings,
+  normalizeVerificationProfile,
+  clampVerificationSettings,
+  VERIFICATION_PROFILE_LIMIT,
+  VERIFICATION_PROFILE_PROJECT_LIMIT,
   sanitizePricing,
   normalizeDomainList,
 };
