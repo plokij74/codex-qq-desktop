@@ -147,6 +147,7 @@ const mcpProjectBySender = new Map();
 const worktreeManager = createWorktreeManager();
 const worktreeIpc = createWorktreeIpcHandlers({
   manager: worktreeManager,
+  checkWorkflowGate: (event, payload) => getEngineeringIpc().workflowGateCheck(event, payload),
   isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
   withMutation: async (fn) => {
     if (activeRun || manualTerm || worktreeMutation) return { ok: false, code: 'BUSY', error: '有对话或终端正在进行，请稍后重试' };
@@ -1272,6 +1273,16 @@ ipcMain.handle('engineering:verification:result', async (event, payload = {}) =>
 ipcMain.handle('engineering:verification:cancel', async (event, payload = {}) => getEngineeringIpc().cancel(event, payload));
 ipcMain.handle('engineering:verification:rerun', async (event, payload = {}) => getEngineeringIpc().rerun(event, payload));
 ipcMain.handle('engineering:verification:revoke-grant', async (event, payload = {}) => getEngineeringIpc().revokeGrant(event, payload));
+ipcMain.handle('engineering:workflow:list', async (event, payload = {}) => getEngineeringIpc().workflows(event, payload));
+ipcMain.handle('engineering:workflow:get', async (event, payload = {}) => getEngineeringIpc().workflowGet(event, payload));
+ipcMain.handle('engineering:workflow:save', async (event, payload = {}) => getEngineeringIpc().workflowSave(event, payload));
+ipcMain.handle('engineering:workflow:delete', async (event, payload = {}) => getEngineeringIpc().workflowDelete(event, payload));
+ipcMain.handle('engineering:workflow:run', async (event, payload = {}) => getEngineeringIpc().workflowRun(event, payload));
+ipcMain.handle('engineering:workflow:runs', async (event, payload = {}) => getEngineeringIpc().workflowRuns(event, payload));
+ipcMain.handle('engineering:workflow:result', async (event, payload = {}) => getEngineeringIpc().workflowResult(event, payload));
+ipcMain.handle('engineering:workflow:cancel', async (event, payload = {}) => getEngineeringIpc().workflowCancel(event, payload));
+ipcMain.handle('engineering:workflow:rerun', async (event, payload = {}) => getEngineeringIpc().workflowRerun(event, payload));
+ipcMain.handle('engineering:workflow:gate-check', async (event, payload = {}) => getEngineeringIpc().workflowGateCheck(event, payload));
 
 ipcMain.handle('dialog:selectDirectory', async () => {
   const win = BrowserWindow.getFocusedWindow();
@@ -1737,6 +1748,21 @@ async function startChatRun(event, payload = {}, opts = {}) {
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
         verificationResult: (root, jobRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
           ? getEngineeringIpc().verificationResult(engineeringRoot, jobRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        engineeringWorkflows: (root) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().engineeringWorkflows(engineeringRoot)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        workflowStart: (root, workflowId, ctx) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().workflowStart(engineeringRoot, workflowId, { ...ctx, ownerId: event.sender.id, agentRunId: runId })
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        workflowGetRun: (root, workflowRunRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().workflowGetRun(engineeringRoot, workflowRunRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        workflowResultForAgent: (root, workflowRunRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().workflowResultForAgent(engineeringRoot, workflowRunRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        workflowCancelForAgent: (root, workflowRunRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().workflowCancelForAgent(engineeringRoot, workflowRunRef, { agentRunId: runId })
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
       },
     };

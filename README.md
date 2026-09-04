@@ -835,3 +835,20 @@ Tasks 关闭或 server 不支持时，`optional` tool 保持同步调用，`requ
 - URL 不预取、不嵌入、不读取返回内容。只有用户点击“打开浏览器”后，main 才通过系统浏览器打开内存中的已校验 URL。
 
 任务参数、Elicitation 表单输入、sampling 正文、远端 task ID 和 URL 不写入 renderer localStorage、会话导出、memory、usage 或普通聊天历史。
+
+## Phase D.11：工程索引与后台验证
+
+D11 在当前项目内提供轻量代码索引和脱离聊天 run 的验证中心：支持定义/引用/文本搜索、点击定位、保存验证 profile、后台执行、诊断解析、取消、重跑、stale 检测和重启后的 interrupted 恢复。索引只保存相对路径和 fingerprint；验证命令只能来自用户保存的 profile。索引查询和验证结果均有界并按项目隔离，绝不写入聊天历史、会话导出、记忆或 usage。
+
+D11 不提供验证依赖图、定时触发、远程 CI 或自动修复；这些能力在 D12 以更严格的门禁合同单独设计。
+
+## Phase D.12：工程工作流编排与本地门禁
+
+D12 把 D11 profile 组合成受控 DAG 工作流。用户可以显式运行 `typecheck -> test -> build` 等流程，查看节点依赖、并行状态、诊断、取消、超时、stale、配置变化和完整重跑；工作流在应用重启后不会自动重新执行命令。
+
+工作流节点只能引用当前项目已保存的验证 profile，不接受任意命令、cwd 或环境变量。D12 另提供可选的本地门禁：D5 worktree 应用、D6 Draft PR 创建和 D7 PR 合并可以要求同一项目、同一配置和同一工作区 fingerprint 下的已通过 workflow run。门禁只检查条件，不自动修复、提交、push 或合并；未选择 workflow 时旧流程保持不变。
+
+设计规格与实施拆解：
+
+- `docs/superpowers/specs/2026-09-04-phase-d12-engineering-workflows-design.md`
+- `docs/superpowers/plans/2026-09-04-phase-d12-engineering-workflows.md`

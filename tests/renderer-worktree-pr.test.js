@@ -46,4 +46,17 @@ describe('D6 renderer Draft PR integration', () => {
     assert.match(app, /strictMergeReady/);
     assert.match(css, /\.pr-workspace/);
   });
+
+  it('lets users explicitly bind a passed workflow run to apply, Draft PR, and merge', () => {
+    const app = source('src/renderer/app.js');
+    const css = source('src/renderer/styles.css');
+    assert.match(app, /workflowGatePayload\(project, 'apply'/);
+    assert.match(app, /workflowGatePayload\(project, 'create_pr'/);
+    assert.match(app, /workflowGatePayload\(project, 'merge'/);
+    assert.match(app, /workflowRunRef:\s*run\.workflowRunRef/);
+    assert.match(app, /expectedFingerprint:\s*run\.endWorkspaceFingerprint/);
+    assert.match(app, /不使用工作流门禁/);
+    assert.match(app, /前往工程中心/);
+    assert.match(css, /\.workflow-gate-control/);
+  });
 });

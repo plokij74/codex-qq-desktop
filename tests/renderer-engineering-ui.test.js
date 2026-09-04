@@ -84,10 +84,26 @@ describe('D11 renderer engineering center contract', () => {
 
   it('refreshes index status as well as jobs on background engineering events', () => {
     const start = app.indexOf('onEngineeringEvent');
-    const handler = app.slice(start, start + 400);
+    const handler = app.slice(start, start + 1200);
     assert.ok(start >= 0);
     assert.match(handler, /loadEngineeringJobs/);
     assert.match(handler, /refreshEngineeringIndexStatus/);
+  });
+
+  it('provides a structured D12 DAG editor and drill-down workflow results', () => {
+    const start = app.indexOf('async function editEngineeringWorkflow');
+    const editor = app.slice(start, app.indexOf('function openProjectChat', start));
+    assert.ok(start >= 0);
+    assert.match(editor, /data-workflow-node-profile/);
+    assert.match(editor, /data-workflow-dependency/);
+    assert.match(editor, /data-workflow-node-continue/);
+    assert.match(editor, /data-workflow-fail-fast/);
+    assert.match(editor, /data-workflow-parallel/);
+    assert.match(editor, /data-workflow-timeout/);
+    assert.match(app, /data-workflow-copy/);
+    assert.match(app, /workflow\.runnable/);
+    assert.match(app, /仅当前进程/);
+    assert.match(app, /showEngineeringJobResult\(token, button\.dataset\.workflowJob, 'engineering-workflow-detail'\)/);
   });
 
   it('drops the phantom verification profile textarea wiring from settings', () => {

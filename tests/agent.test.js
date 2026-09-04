@@ -186,6 +186,38 @@ describe('agent tools', () => {
     assert.ok(commit.function.parameters.properties.paths);
   });
 
+  it('exposes opaque workflow tools and forwards only workflow identifiers', async () => {
+    const names = TOOL_DEFS.map((tool) => tool.function.name);
+    for (const name of ['engineering_workflows', 'workflow_start', 'workflow_get', 'workflow_result', 'workflow_cancel']) {
+      assert.ok(names.includes(name));
+    }
+    const calls = [];
+    const ctx = {
+      project: { name: 'workflow', path: process.cwd() },
+      extensions: {
+        engineering: {
+          engineeringWorkflows: async (root) => { calls.push(['list', root]); return { ok: true, workflows: [] }; },
+          workflowStart: async (root, workflowId) => { calls.push(['start', root, workflowId]); return { ok: true, workflowRunRef: 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa' }; },
+          workflowGetRun: async (root, ref) => { calls.push(['get', root, ref]); return { ok: true, run: { status: 'running' } }; },
+          workflowResultForAgent: async (root, ref) => { calls.push(['result', root, ref]); return { ok: true, run: { status: 'passed' } }; },
+          workflowCancelForAgent: async (root, ref) => { calls.push(['cancel', root, ref]); return { ok: true, run: { status: 'cancelled' } }; },
+        },
+      },
+    };
+    assert.equal(JSON.parse(await executeToolFixed('engineering_workflows', {}, ctx)).ok, true);
+    assert.equal(JSON.parse(await executeToolFixed('workflow_start', { workflowId: 'wf_aaaaaaaaaaaaaaaa', command: 'ignored' }, ctx)).ok, true);
+    assert.equal(JSON.parse(await executeToolFixed('workflow_get', { workflowRunRef: 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa' }, ctx)).ok, true);
+    assert.equal(JSON.parse(await executeToolFixed('workflow_result', { workflowRunRef: 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa' }, ctx)).ok, true);
+    assert.equal(JSON.parse(await executeToolFixed('workflow_cancel', { workflowRunRef: 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa' }, ctx)).ok, true);
+    assert.deepEqual(calls.map((call) => [call[0], call[2]]), [
+      ['list', undefined],
+      ['start', 'wf_aaaaaaaaaaaaaaaa'],
+      ['get', 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa'],
+      ['result', 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa'],
+      ['cancel', 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa'],
+    ]);
+  });
+
   it('executeToolFixed git_status / git_diff / git_commit in temp repo', {
     skip: !gitAvailable,
   }, async () => {

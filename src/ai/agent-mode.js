@@ -9,6 +9,8 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'git_commit',
   'run_terminal',
   'verification_start',
+  'workflow_start',
+  'workflow_cancel',
   'spawn_explore',
   'spawn_explores',
   'spawn_implement',

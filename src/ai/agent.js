@@ -248,6 +248,46 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'engineering_workflows',
+      description: 'List enabled engineering workflows for the current project.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'workflow_start',
+      description: 'Start a saved engineering workflow by opaque workflowId. Does not accept commands or profile content.',
+      parameters: { type: 'object', properties: { workflowId: { type: 'string' } }, required: ['workflowId'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'workflow_get',
+      description: 'Read a bounded engineering workflow run by opaque workflowRunRef.',
+      parameters: { type: 'object', properties: { workflowRunRef: { type: 'string' } }, required: ['workflowRunRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'workflow_result',
+      description: 'Read bounded node summaries and diagnostics counts for an opaque workflowRunRef.',
+      parameters: { type: 'object', properties: { workflowRunRef: { type: 'string' } }, required: ['workflowRunRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'workflow_cancel',
+      description: 'Cancel a workflow run started for the current project by opaque workflowRunRef.',
+      parameters: { type: 'object', properties: { workflowRunRef: { type: 'string' } }, required: ['workflowRunRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'git_commit',
       description: 'Stage optional paths and create a git commit. Does not push. Does not git add -A unless paths listed.',
       parameters: {
@@ -649,6 +689,8 @@ function toolDetail(name, args) {
   }
   if (name === 'verification_start') return `profile=${String(args.profileId || '').slice(0, 80)}`;
   if (name === 'verification_get' || name === 'verification_result') return `job=${String(args.jobRef || '').slice(0, 80)}`;
+  if (name === 'workflow_start') return `workflow=${String(args.workflowId || '').slice(0, 80)}`;
+  if (name === 'workflow_get' || name === 'workflow_result' || name === 'workflow_cancel') return `run=${String(args.workflowRunRef || '').slice(0, 80)}`;
   try {
     return JSON.stringify(args).slice(0, 2000);
   } catch {
@@ -675,6 +717,9 @@ function summarizeToolResult(name, parsed) {
   if (name === 'verification_profiles') return `profiles=${(parsed.profiles && parsed.profiles.length) || 0}`;
   if (name === 'verification_start') return parsed.jobRef ? `job ${parsed.jobRef}` : (parsed.error || 'verification');
   if (name === 'verification_get' || name === 'verification_result') return parsed.status || parsed.job?.status || 'verification';
+  if (name === 'engineering_workflows') return `workflows=${(parsed.workflows && parsed.workflows.length) || 0}`;
+  if (name === 'workflow_start') return parsed.workflowRunRef ? `run ${parsed.workflowRunRef}` : (parsed.error || 'workflow');
+  if (name === 'workflow_get' || name === 'workflow_result' || name === 'workflow_cancel') return parsed.status || parsed.run?.status || 'workflow';
   if (name === 'spawn_explore') {
     if (parsed.ok === false) return parsed.error || 'explore failed';
     return parsed.summary ? String(parsed.summary).slice(0, 120) : `turns=${parsed.turns ?? '?'}`;
@@ -938,6 +983,32 @@ async function executeTool(name, args, ctx) {
       if (!engineering || !/^vfy_[a-f0-9]{8,64}$/.test(profileId)) return JSON.stringify({ ok: false, error: 'profileId 无效' });
       const result = await engineering.verificationStart(root, profileId, ctx);
       return JSON.stringify(result);
+    }
+    if (name === 'engineering_workflows') {
+      const engineering = ctx.extensions?.engineering;
+      if (!engineering?.engineeringWorkflows) return JSON.stringify({ ok: false, error: 'workflow 管理器不可用' });
+      return JSON.stringify(await engineering.engineeringWorkflows(root));
+    }
+    if (name === 'workflow_get' || name === 'workflow_result') {
+      const engineering = ctx.extensions?.engineering;
+      const ref = String(args.workflowRunRef || '');
+      if (!engineering || !/^wf_run_[a-f0-9]{24}$/.test(ref)) return JSON.stringify({ ok: false, error: 'workflow run 引用无效' });
+      const result = name === 'workflow_get'
+        ? await engineering.workflowGetRun(root, ref)
+        : await engineering.workflowResultForAgent(root, ref);
+      return JSON.stringify(result);
+    }
+    if (name === 'workflow_start') {
+      const engineering = ctx.extensions?.engineering;
+      const workflowId = String(args.workflowId || '');
+      if (!engineering?.workflowStart || !/^wf_[a-f0-9]{16,64}$/.test(workflowId)) return JSON.stringify({ ok: false, error: 'workflowId 无效' });
+      return JSON.stringify(await engineering.workflowStart(root, workflowId, ctx));
+    }
+    if (name === 'workflow_cancel') {
+      const engineering = ctx.extensions?.engineering;
+      const ref = String(args.workflowRunRef || '');
+      if (!engineering?.workflowCancelForAgent || !/^wf_run_[a-f0-9]{24}$/.test(ref)) return JSON.stringify({ ok: false, error: 'workflow run 引用无效' });
+      return JSON.stringify(await engineering.workflowCancelForAgent(root, ref));
     }
     if (name === 'run_terminal') {
       if (!settings.terminalEnabled) {
@@ -1719,7 +1790,7 @@ async function runAgentLoop({
               // verification_start is authorized inside the main-owned
               // manager so a persisted project+profile fingerprint grant can
               // suppress repeat prompts without weakening other terminal use.
-              if (name === 'verification_start') return { allowed: true };
+              if (name === 'verification_start' || name === 'workflow_start') return { allowed: true };
               try {
                 const auth = await authorizeTool({
                   gate: effectiveGate,

@@ -45,6 +45,9 @@ const worktreePreviews = new Map();
 const worktreeActionBusy = new Set();
 const worktreeReconcileSeq = new Map();
 const worktreePrEditors = new Set();
+const workflowGateRunsByProject = new Map();
+const workflowGateSelections = new Map();
+const workflowGateLoadSeq = new Map();
 const pullRequestView = {
   projectId: '', filter: 'open', repo: null, prs: [], truncated: false,
   selectedNumber: 0, resultId: '', detail: null, loading: false, busy: false,
@@ -77,6 +80,7 @@ let termState = {
 // Verification approvals arrive on the chat IPC channel for compatibility,
 // but remain separate from chatRun so they can never become chat history.
 let engineeringPendingApproval = null;
+let engineeringWorkflowEditor = null;
 
 function anyTermRunning() {
   return termState.runs.size > 0;
@@ -649,6 +653,102 @@ async function bindWorktreeProject(project, force = false) {
   return token;
 }
 
+function workflowGateSelectionKey(project, action, scope) {
+  return `${String(project?.id || '')}:${String(action || '')}:${String(scope || '')}`;
+}
+
+function workflowGateRuns(project) {
+  return workflowGateRunsByProject.get(String(project?.id || '')) || [];
+}
+
+function setWorkflowGateRuns(project, rawRuns) {
+  const projectId = String(project?.id || '');
+  if (!projectId) return [];
+  const runs = (Array.isArray(rawRuns) ? rawRuns : [])
+    .filter((run) => run?.status === 'passed' && run.workflowRunRef && run.endWorkspaceFingerprint)
+    .slice(0, 50);
+  workflowGateRunsByProject.set(projectId, runs);
+  const valid = new Set(runs.map((run) => run.workflowRunRef));
+  for (const [key, ref] of workflowGateSelections) {
+    if (key.startsWith(`${projectId}:`) && !valid.has(ref)) workflowGateSelections.delete(key);
+  }
+  return runs;
+}
+
+async function loadWorkflowGateRuns(project, token = '') {
+  if (!project?.id || !window.codex?.listEngineeringWorkflowRuns) return [];
+  const binding = token || worktreeBindings.get(project.id) || '';
+  if (!binding) return [];
+  const sequence = (workflowGateLoadSeq.get(project.id) || 0) + 1;
+  workflowGateLoadSeq.set(project.id, sequence);
+  const response = await window.codex.listEngineeringWorkflowRuns({ projectBindingId: binding, limit: 50 }).catch(() => null);
+  if (workflowGateLoadSeq.get(project.id) !== sequence || !response?.ok) return workflowGateRuns(project);
+  return setWorkflowGateRuns(project, response.runs);
+}
+
+function workflowGatePayload(project, action, scope) {
+  const selected = workflowGateSelections.get(workflowGateSelectionKey(project, action, scope));
+  const run = workflowGateRuns(project).find((item) => item.workflowRunRef === selected);
+  return run ? {
+    workflowRunRef: run.workflowRunRef,
+    expectedFingerprint: run.endWorkspaceFingerprint,
+  } : {};
+}
+
+function workflowGateRunLabel(run) {
+  const time = run.completedAt || run.finishedAt || '';
+  return `${run.workflowName || run.workflowId || '工作流'} · ${run.passedCount || 0}/${run.nodeCount || 0}${time ? ` · ${time}` : ''}`;
+}
+
+function appendWorkflowGateSelector(container, project, action, scope, disabled = false) {
+  if (!container || !project?.id) return;
+  const runs = workflowGateRuns(project);
+  const key = workflowGateSelectionKey(project, action, scope);
+  const current = workflowGateSelections.get(key) || '';
+  const wrap = document.createElement('div');
+  wrap.className = 'workflow-gate-control';
+  const label = document.createElement('label');
+  label.textContent = '本地门禁';
+  const select = document.createElement('select');
+  select.disabled = disabled;
+  select.setAttribute('aria-label', '选择已通过的工作流运行');
+  const optional = document.createElement('option');
+  optional.value = '';
+  optional.textContent = '不使用工作流门禁';
+  select.appendChild(optional);
+  for (const run of runs) {
+    const option = document.createElement('option');
+    option.value = run.workflowRunRef;
+    option.textContent = workflowGateRunLabel(run);
+    option.selected = run.workflowRunRef === current;
+    select.appendChild(option);
+  }
+  select.addEventListener('change', () => {
+    if (select.value) workflowGateSelections.set(key, select.value);
+    else workflowGateSelections.delete(key);
+  });
+  label.appendChild(select);
+  wrap.appendChild(label);
+  if (!runs.length) {
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'ghost-btn';
+    open.textContent = '前往工程中心';
+    open.disabled = disabled;
+    open.addEventListener('click', () => setView('scheduled'));
+    wrap.appendChild(open);
+  }
+  container.appendChild(wrap);
+}
+
+function workflowGateSelectHtml(project, action, scope, disabled = false) {
+  const runs = workflowGateRuns(project);
+  const key = workflowGateSelectionKey(project, action, scope);
+  const current = workflowGateSelections.get(key) || '';
+  const options = [`<option value="">不使用工作流门禁</option>`, ...runs.map((run) => `<option value="${escapeHtml(run.workflowRunRef)}"${run.workflowRunRef === current ? ' selected' : ''}>${escapeHtml(workflowGateRunLabel(run))}</option>`)].join('');
+  return `<div class="workflow-gate-control"><label>本地门禁<select data-workflow-gate-select="${escapeHtml(key)}" aria-label="选择已通过的工作流运行" ${disabled ? 'disabled' : ''}>${options}</select></label>${runs.length ? '' : `<button type="button" class="ghost-btn" data-workflow-gate-open ${disabled ? 'disabled' : ''}>前往工程中心</button>`}</div>`;
+}
+
 async function reconcileWorktreeResults(project) {
   if (!project?.id || !project.path || !window.codex?.bindWorktreeProject) return;
   const sequence = (worktreeReconcileSeq.get(project.id) || 0) + 1;
@@ -665,6 +765,7 @@ async function reconcileWorktreeResults(project) {
     if (!listed?.ok) return;
     if (worktreeReconcileSeq.get(project.id) !== sequence) return;
     replaceProjectWorktreeResults(project.id, listed.results);
+    await loadWorkflowGateRuns(project, token);
     if (activeSession()?.projectId === project.id) renderMessages();
   } catch {
     // Recovery is best effort; the next project open/event retries reconciliation.
@@ -1235,6 +1336,7 @@ async function worktreeAction(session, ref, action) {
   const card = document.querySelector(`.worktree-result-card[data-result-id="${ref.id}"]`);
   const prTitle = card?.querySelector('.worktree-pr-title')?.value || ref.prDraftTitle || defaultWorktreePrTitle(ref);
   const prBody = card?.querySelector('.worktree-pr-body')?.value || ref.prDraftBody || defaultWorktreePrBody(ref);
+  const gateScope = `worktree:${ref.id}`;
   worktreeActionBusy.add(ref.id);
   renderMessages();
   try {
@@ -1256,7 +1358,7 @@ async function worktreeAction(session, ref, action) {
       }
     } else if (action === 'createPr') {
       const method = ref.canRetryPr ? window.codex.retryWorktreePr : window.codex.createWorktreePr;
-      response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true });
+      response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true, ...workflowGatePayload(project, 'create_pr', gateScope) });
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId, prDraftTitle: prTitle, prDraftBody: prBody });
       if (response?.ok && response.created) worktreePrEditors.delete(ref.id);
     } else if (action === 'cleanupPr') {
@@ -1268,7 +1370,7 @@ async function worktreeAction(session, ref, action) {
       response = await window.codex.getPullRequest({ projectBindingId: token, resultId: ref.id });
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
     } else if (action === 'apply') {
-      response = await window.codex.applyWorktreeResult({ projectBindingId: token, resultId: ref.id });
+      response = await window.codex.applyWorktreeResult({ projectBindingId: token, resultId: ref.id, ...workflowGatePayload(project, 'apply', gateScope) });
       if (response?.ok && response.applied && !response.cleanupWarning) {
         session.pendingWorktreeResults = window.WorktreeResultState.remove(session.pendingWorktreeResults, ref.id);
         worktreePreviews.delete(ref.id);
@@ -1380,8 +1482,11 @@ function renderWorktreeCards(root, session) {
       titleInput.addEventListener('input', saveDraft); bodyInput.addEventListener('input', saveDraft);
       const submit = document.createElement('button'); submit.type = 'button'; submit.className = 'btn-primary'; submit.textContent = ref.canRetryPr ? '重试创建 Draft PR' : '确认创建 Draft PR'; submit.disabled = busy || mutationBlocked;
       submit.addEventListener('click', () => worktreeAction(session, ref, 'createPr'));
-      form.append(titleInput, bodyInput, submit); card.appendChild(form);
+      form.append(titleInput, bodyInput);
+      appendWorkflowGateSelector(form, sessionProject(session), 'create_pr', `worktree:${ref.id}`, busy || mutationBlocked);
+      form.appendChild(submit); card.appendChild(form);
     }
+    if (ref.canApply) appendWorkflowGateSelector(card, sessionProject(session), 'apply', `worktree:${ref.id}`, busy || mutationBlocked);
     const actions = document.createElement('div'); actions.className = 'worktree-result-actions';
     const addButton = (label, action, enabled = true, primary = false, mutation = false) => {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.disabled = busy || !enabled || (mutation && mutationBlocked); if (primary) button.className = 'btn-primary'; else button.className = 'btn-secondary';
@@ -2021,7 +2126,7 @@ const INDEX_STATE_LABELS = {
 };
 const JOB_STATUS_LABELS = {
   queued: '排队中', running: '运行中', passed: '通过', failed: '失败', timed_out: '超时',
-  cancelled: '已取消', interrupted: '已中断', stale: '结果过期', error: '错误',
+  cancelled: '已取消', interrupted: '已中断', stale: '结果过期', configuration_changed: '配置已变化', skipped: '已跳过', error: '错误',
 };
 
 function engineeringIndexStateText(state) {
@@ -2066,8 +2171,8 @@ async function copyEngineeringSummary(token, jobRef) {
   }
 }
 
-async function showEngineeringJobResult(token, jobRef) {
-  const detail = document.getElementById('engineering-job-detail');
+async function showEngineeringJobResult(token, jobRef, detailId = 'engineering-job-detail') {
+  const detail = document.getElementById(detailId);
   if (!detail) return;
   const response = await window.codex.getVerificationResult({ projectBindingId: token, jobRef }).catch(() => null);
   if (!response?.ok || !response.job) {
@@ -2193,7 +2298,7 @@ async function renderEngineeringCenter() {
   const terminalNotice = settings && !settings.terminalEnabled
     ? '<div class="work-card-notice">验证作业需要在设置中开启「允许终端命令」后才能启动。</div>'
     : '';
-  body.innerHTML = '<section class="engineering-section"><div class="work-card-title">代码索引</div><div id="engineering-index-status" class="work-card-meta">读取中…</div><div class="work-card-meta">词法索引只提供近似定位，不做语义解析。</div><div class="work-card-actions"><button type="button" class="ghost-btn" id="engineering-index-rebuild">重建</button><button type="button" class="ghost-btn" id="engineering-index-clear">清除</button></div><div class="engineering-search"><select id="engineering-search-mode"><option value="definitions">定义</option><option value="references">引用</option><option value="text">文本</option></select><input id="engineering-search-query" type="search" maxlength="256" placeholder="搜索符号或文本" /><button type="button" class="ghost-btn" id="engineering-search-run">搜索</button></div><div id="engineering-search-results"></div></section><section class="engineering-section"><div class="work-card-title">验证档案</div>' + terminalNotice + '<div id="engineering-approval" class="engineering-job-detail hidden"></div><div id="engineering-profiles">读取中…</div></section><section class="engineering-section"><div class="work-card-title">验证作业</div><div id="engineering-jobs">读取中…</div><div id="engineering-job-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">MCP Tasks</div><div id="engineering-mcp-tasks"></div></section>';
+  body.innerHTML = '<section class="engineering-section"><div class="work-card-title">代码索引</div><div id="engineering-index-status" class="work-card-meta">读取中…</div><div class="work-card-meta">词法索引只提供近似定位，不做语义解析。</div><div class="work-card-actions"><button type="button" class="ghost-btn" id="engineering-index-rebuild">重建</button><button type="button" class="ghost-btn" id="engineering-index-clear">清除</button></div><div class="engineering-search"><select id="engineering-search-mode"><option value="definitions">定义</option><option value="references">引用</option><option value="text">文本</option></select><input id="engineering-search-query" type="search" maxlength="256" placeholder="搜索符号或文本" /><button type="button" class="ghost-btn" id="engineering-search-run">搜索</button></div><div id="engineering-search-results"></div></section><section class="engineering-section"><div class="work-card-title">验证档案</div>' + terminalNotice + '<div id="engineering-approval" class="engineering-job-detail hidden"></div><div id="engineering-profiles">读取中…</div></section><section class="engineering-section"><div class="work-card-title">工程工作流</div><div id="engineering-workflows">读取中…</div><div id="engineering-workflow-runs">读取中…</div><div id="engineering-workflow-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">验证作业</div><div id="engineering-jobs">读取中…</div><div id="engineering-job-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">MCP Tasks</div><div id="engineering-mcp-tasks"></div></section>';
   if (engineeringPendingApproval) renderEngineeringApprovalCard(engineeringPendingApproval);
   const refresh = () => refreshEngineeringIndexStatus(token);
   document.getElementById('engineering-index-rebuild')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexRebuild({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引重建失败'); await refresh(); });
@@ -2211,6 +2316,7 @@ async function renderEngineeringCenter() {
   document.getElementById('engineering-search-query')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') document.getElementById('engineering-search-run')?.click(); });
   await refresh();
   await loadEngineeringProfiles(token);
+  await loadEngineeringWorkflows(token);
   await loadEngineeringJobs(token);
   renderMcpTaskCenter();
 }
@@ -2684,6 +2790,253 @@ async function createProjectFromModal() {
   worktreeBindings.set(p.id, bound.projectBindingId);
   saveState(); closeProjectModal(); openProjectChat(p.id); toast('项目已添加并绑定目录');
 }
+
+const WORKFLOW_UNAVAILABLE_LABELS = {
+  WORKFLOW_PROFILE_NOT_FOUND: '引用的验证档案已删除',
+  WORKFLOW_PROFILE_DISABLED: '引用的验证档案已禁用',
+  WORKFLOW_PROFILE_CHANGED: '验证档案配置已变化，请编辑后保存',
+  WORKFLOW_INVALID: '工作流配置无效',
+};
+
+function workflowUnavailableText(reason) {
+  return WORKFLOW_UNAVAILABLE_LABELS[String(reason || '')] || String(reason || '当前不可运行');
+}
+
+function workflowPersistenceHtml(status) {
+  if (status?.persistence === 'memory') return '<div class="work-card-notice">仅当前进程：工作流定义和运行记录将在退出应用后丢失。</div>';
+  if (status?.error === 'WORKFLOW_STORE_CORRUPT') return '<div class="work-card-error">工作流加密存储已损坏，原文件已保留且不会覆盖。</div>';
+  if (status?.error) return '<div class="work-card-error">工作流加密存储暂不可用。</div>';
+  return '';
+}
+
+async function showEngineeringWorkflowResult(token, workflowRunRef) {
+  const detail = document.getElementById('engineering-workflow-detail');
+  if (!detail) return;
+  const result = await window.codex.getEngineeringWorkflowResult({ projectBindingId: token, workflowRunRef }).catch(() => null);
+  if (!result?.ok || !result.run) {
+    detail.innerHTML = `<div class="work-card-error">${escapeHtml(result?.error || '工作流结果不可用')}</div>`;
+    detail.classList.remove('hidden');
+    return;
+  }
+  const run = result.run;
+  const notices = [
+    run.workspaceChanged ? '工作区指纹已变化' : '',
+    run.status === 'configuration_changed' ? '工作流或验证档案配置已变化' : '',
+    run.status === 'interrupted' ? '应用退出时运行尚未完成' : '',
+    run.statusMessage || '',
+  ].filter(Boolean).join(' · ');
+  detail.innerHTML = [
+    `<div class="engineering-detail-title">${escapeHtml(run.workflowName || run.workflowId || '工作流')} · ${escapeHtml(engineeringStatusText(run.status))}</div>`,
+    `<div class="work-card-meta"><code>${escapeHtml(run.workflowRunRef)}</code> · ${run.passedCount || 0}/${run.nodeCount || 0} 节点通过 · ${escapeHtml(run.finishedAt || run.startedAt || run.createdAt || '')}</div>`,
+    notices ? `<div class="work-card-notice">${escapeHtml(notices)}</div>` : '',
+    `<div class="engineering-workflow-node-results">${(run.nodes || []).map((node) => `<div class="engineering-workflow-node-result"><div><strong>${escapeHtml(node.nodeId)}</strong><span class="badge ${escapeHtml(node.status || '')}">${escapeHtml(engineeringStatusText(node.status))}</span><div class="work-card-meta">依赖：${escapeHtml((node.dependsOn || []).join(', ') || '无')}${node.diagnosticCount ? ` · 诊断 ${node.diagnosticCount} 条` : ''}${Number.isFinite(node.exitCode) ? ` · 退出码 ${node.exitCode}` : ''}</div>${node.statusMessage ? `<div class="work-card-notice">${escapeHtml(node.statusMessage)}</div>` : ''}</div>${node.jobRef ? `<button type="button" class="ghost-btn" data-workflow-job="${escapeHtml(node.jobRef)}">查看节点结果</button>` : ''}</div>`).join('')}</div>`,
+    '<div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-workflow-close-detail">关闭</button></div>',
+  ].join('');
+  detail.classList.remove('hidden');
+  detail.querySelectorAll('[data-workflow-job]').forEach((button) => button.addEventListener('click', () => showEngineeringJobResult(token, button.dataset.workflowJob, 'engineering-workflow-detail')));
+  document.getElementById('engineering-workflow-close-detail')?.addEventListener('click', () => {
+    detail.classList.add('hidden');
+    detail.innerHTML = '';
+  });
+}
+
+async function loadEngineeringWorkflows(token = engineeringBindingToken()) {
+  const el = document.getElementById('engineering-workflows');
+  const runsEl = document.getElementById('engineering-workflow-runs');
+  if (!el || !token || !window.codex?.listEngineeringWorkflows) return;
+  const response = await window.codex.listEngineeringWorkflows({ projectBindingId: token, includeDisabled: true }).catch(() => null);
+  if (!response?.ok) {
+    el.innerHTML = `<div class="work-card-error">${escapeHtml(response?.error || '工作流读取失败')}</div>`;
+    return;
+  }
+  const workflows = response.workflows || [];
+  const workflowRows = workflows.map((workflow) => {
+    const runnable = workflow.runnable === true;
+    const unavailable = workflow.enabled === false ? '已禁用' : (runnable ? '' : workflowUnavailableText(workflow.unavailableReason));
+    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(workflow.name)}</strong><span class="badge ${runnable ? 'ready' : 'disabled'}">${runnable ? '可运行' : escapeHtml(unavailable)}</span><div class="work-card-meta"><code>${escapeHtml(workflow.workflowId)}</code> · ${workflow.nodeCount || workflow.nodes?.length || 0} 节点 · 并行 ${workflow.maxParallel || 1} · ${Math.round(Number(workflow.timeoutMs || 0) / 60000)} 分钟 · ${workflow.failFast === false ? '继续独立分支' : '失败即停'}</div></div><div class="work-card-actions"><button type="button" class="ghost-btn" data-workflow-run="${escapeHtml(workflow.workflowId)}" ${runnable ? '' : 'disabled'}>运行</button><button type="button" class="ghost-btn" data-workflow-edit="${escapeHtml(workflow.workflowId)}">编辑</button><button type="button" class="ghost-btn" data-workflow-copy="${escapeHtml(workflow.workflowId)}">复制</button><button type="button" class="ghost-btn" data-workflow-delete="${escapeHtml(workflow.workflowId)}">删除</button></div></div>`;
+  }).join('');
+  el.innerHTML = `${workflowPersistenceHtml(response.persistence)}<div class="work-card-actions"><button type="button" class="ghost-btn" id="engineering-workflow-new">新建工作流</button></div>${workflowRows || '<div class="work-empty">暂无工程工作流</div>'}`;
+  document.getElementById('engineering-workflow-new')?.addEventListener('click', () => editEngineeringWorkflow(token, null));
+  el.querySelectorAll('[data-workflow-run]').forEach((button) => button.addEventListener('click', async () => {
+    const result = await window.codex.runEngineeringWorkflow({ projectBindingId: token, workflowId: button.dataset.workflowRun });
+    if (!result?.ok) toast(result?.error || '工作流启动失败'); else toast('工作流已排队');
+    await loadEngineeringWorkflows(token);
+  }));
+  const openEditor = async (workflowId, copy = false) => {
+    const result = await window.codex.getEngineeringWorkflow({ projectBindingId: token, workflowId }).catch(() => null);
+    if (!result?.ok) return toast(result?.error || '读取工作流失败');
+    await editEngineeringWorkflow(token, result.workflow, { copy });
+  };
+  el.querySelectorAll('[data-workflow-edit]').forEach((button) => button.addEventListener('click', () => openEditor(button.dataset.workflowEdit)));
+  el.querySelectorAll('[data-workflow-copy]').forEach((button) => button.addEventListener('click', () => openEditor(button.dataset.workflowCopy, true)));
+  el.querySelectorAll('[data-workflow-delete]').forEach((button) => button.addEventListener('click', async () => {
+    const workflow = workflows.find((item) => item.workflowId === button.dataset.workflowDelete);
+    if (!workflow || !(await appConfirm(`确定删除工作流「${workflow.name}」？`))) return;
+    const result = await window.codex.deleteEngineeringWorkflow({ projectBindingId: token, workflowId: workflow.workflowId });
+    if (!result?.ok) toast(result?.error || '删除失败');
+    await loadEngineeringWorkflows(token);
+  }));
+  if (runsEl && window.codex.listEngineeringWorkflowRuns) {
+    const runsResponse = await window.codex.listEngineeringWorkflowRuns({ projectBindingId: token, limit: 50 }).catch(() => null);
+    const runs = runsResponse?.runs || [];
+    const project = sessionProject();
+    if (project) setWorkflowGateRuns(project, runs);
+    runsEl.innerHTML = '<div class="work-card-meta engineering-candidate-title">工作流运行</div>' + (runs.length ? runs.map((run) => {
+      const active = ['queued', 'running'].includes(run.status);
+      const notice = [run.workspaceChanged ? '工作区已变化' : '', run.status === 'configuration_changed' ? '配置已变化' : '', run.statusMessage || ''].filter(Boolean).join(' · ');
+      return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(run.workflowName || run.workflowId)}</strong><div class="work-card-meta"><code>${escapeHtml(run.workflowRunRef)}</code> · <span class="badge ${escapeHtml(run.status || '')}">${escapeHtml(engineeringStatusText(run.status))}</span> · ${run.passedCount || 0}/${run.nodeCount || 0} 节点通过 · ${escapeHtml(run.finishedAt || run.startedAt || run.createdAt || '')}</div>${notice ? `<div class="work-card-notice">${escapeHtml(notice)}</div>` : ''}</div><div class="work-card-actions"><button type="button" class="ghost-btn" data-workflow-view="${escapeHtml(run.workflowRunRef)}">查看</button>${active ? `<button type="button" class="ghost-btn" data-workflow-cancel="${escapeHtml(run.workflowRunRef)}">取消</button>` : `<button type="button" class="ghost-btn" data-workflow-rerun="${escapeHtml(run.workflowRunRef)}">重跑</button>`}</div></div>`;
+    }).join('') : '<div class="work-empty">暂无运行记录</div>');
+    runsEl.querySelectorAll('[data-workflow-cancel]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.cancelEngineeringWorkflow({ projectBindingId: token, workflowRunRef: button.dataset.workflowCancel }); if (!result?.ok) toast(result?.error || '取消失败'); await loadEngineeringWorkflows(token); }));
+    runsEl.querySelectorAll('[data-workflow-rerun]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.rerunEngineeringWorkflow({ projectBindingId: token, workflowRunRef: button.dataset.workflowRerun }); if (!result?.ok) toast(result?.error || '重跑失败'); else toast('工作流已重新排队'); await loadEngineeringWorkflows(token); }));
+    runsEl.querySelectorAll('[data-workflow-view]').forEach((button) => button.addEventListener('click', () => showEngineeringWorkflowResult(token, button.dataset.workflowView)));
+  }
+}
+
+function syncWorkflowEditorNodes(modal, nodes) {
+  for (const node of nodes) {
+    const row = modal.querySelector(`[data-workflow-editor-node="${node.key}"]`);
+    if (!row) continue;
+    node.nodeId = row.querySelector('[data-workflow-node-id]')?.value.trim() || '';
+    node.profileId = row.querySelector('[data-workflow-node-profile]')?.value || '';
+    node.continueOnFailure = row.querySelector('[data-workflow-node-continue]')?.checked === true;
+    node.dependsOnKeys = [...row.querySelectorAll('[data-workflow-dependency]:checked')].map((input) => input.dataset.workflowDependency);
+  }
+}
+
+function validateWorkflowEditorNodes(nodes, profiles) {
+  const enabledProfiles = new Set(profiles.filter((profile) => profile.enabled !== false).map((profile) => profile.id));
+  const ids = new Set();
+  for (const node of nodes) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(node.nodeId)) return { error: '节点 ID 需为 1-64 位字母、数字、下划线或连字符' };
+    if (ids.has(node.nodeId)) return { error: `节点 ID 重复：${node.nodeId}` };
+    if (!enabledProfiles.has(node.profileId)) return { error: `节点 ${node.nodeId} 未选择可用验证档案` };
+    ids.add(node.nodeId);
+  }
+  const byKey = new Map(nodes.map((node) => [node.key, node]));
+  const normalized = nodes.map((node) => ({
+    nodeId: node.nodeId,
+    profileId: node.profileId,
+    dependsOn: [...new Set(node.dependsOnKeys.map((key) => byKey.get(key)?.nodeId).filter(Boolean))].sort(),
+    continueOnFailure: node.continueOnFailure === true,
+  }));
+  const indegree = new Map(normalized.map((node) => [node.nodeId, node.dependsOn.length]));
+  const outgoing = new Map(normalized.map((node) => [node.nodeId, []]));
+  for (const node of normalized) for (const dep of node.dependsOn) outgoing.get(dep)?.push(node.nodeId);
+  const ready = normalized.filter((node) => indegree.get(node.nodeId) === 0).map((node) => node.nodeId);
+  let visited = 0;
+  while (ready.length) {
+    const id = ready.shift();
+    visited += 1;
+    for (const next of outgoing.get(id) || []) {
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) ready.push(next);
+    }
+  }
+  return visited === normalized.length ? { nodes: normalized } : { error: '节点依赖存在环，请调整依赖关系' };
+}
+
+async function editEngineeringWorkflow(token, current, options = {}) {
+  const profilesResponse = await window.codex.listVerificationProfiles({ projectBindingId: token }).catch(() => null);
+  const profiles = profilesResponse?.profiles || [];
+  const enabledProfiles = profiles.filter((profile) => profile.enabled !== false);
+  if (!enabledProfiles.length) return toast('请先保存至少一个已启用的验证档案');
+  engineeringWorkflowEditor?.remove();
+  const copy = options.copy === true;
+  const sourceNodes = current?.nodes?.length ? current.nodes : [{ nodeId: 'node_1', profileId: enabledProfiles[0].id, dependsOn: [], continueOnFailure: false }];
+  const nodes = sourceNodes.map((node) => ({
+    key: uid('wfn'),
+    nodeId: node.nodeId,
+    profileId: node.profileId,
+    dependsOnKeys: [],
+    continueOnFailure: node.continueOnFailure === true,
+  }));
+  const keyByNodeId = new Map(nodes.map((node) => [node.nodeId, node.key]));
+  sourceNodes.forEach((node, index) => { nodes[index].dependsOnKeys = (node.dependsOn || []).map((id) => keyByNodeId.get(id)).filter(Boolean); });
+  const modal = document.createElement('div');
+  modal.className = 'modal workflow-editor-modal';
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-modal', 'true');
+  modal.innerHTML = `<form class="modal-card workflow-editor-card"><div class="modal-title">${copy ? '复制工作流' : (current ? '编辑工作流' : '新建工作流')}</div><div class="workflow-editor-grid"><label class="field workflow-editor-name"><span>名称</span><input data-workflow-name maxlength="80" required value="${escapeHtml(copy ? `${current?.name || ''} 副本` : (current?.name || ''))}" /></label><label class="field"><span>最大并行数</span><input data-workflow-parallel type="number" min="1" max="4" step="1" value="${Number(current?.maxParallel || 4)}" /></label><label class="field"><span>总超时（分钟）</span><input data-workflow-timeout type="number" min="1" max="1440" step="1" value="${Math.max(1, Math.round(Number(current?.timeoutMs || 3600000) / 60000))}" /></label></div><div class="workflow-editor-switches"><label class="switch-row"><input type="checkbox" data-workflow-enabled ${current?.enabled === false ? '' : 'checked'} /><span>启用工作流</span></label><label class="switch-row"><input type="checkbox" data-workflow-fail-fast ${current?.failFast === false ? '' : 'checked'} /><span>节点失败时停止其它分支</span></label></div><div class="workflow-editor-heading"><strong>节点与依赖</strong><button type="button" class="ghost-btn" data-workflow-node-add>添加节点</button></div><div class="workflow-editor-nodes"></div><div class="workflow-editor-error" role="alert"></div><div class="modal-actions"><button type="button" class="btn-secondary" data-workflow-editor-cancel>取消</button><button type="submit" class="btn-primary">保存</button></div></form>`;
+  document.body.appendChild(modal);
+  engineeringWorkflowEditor = modal;
+  const close = () => {
+    if (engineeringWorkflowEditor === modal) engineeringWorkflowEditor = null;
+    document.removeEventListener('keydown', onKeyDown);
+    modal.remove();
+  };
+  const onKeyDown = (event) => { if (event.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKeyDown);
+  modal.addEventListener('mousedown', (event) => { if (event.target === modal) close(); });
+  const renderNodes = () => {
+    const container = modal.querySelector('.workflow-editor-nodes');
+    container.innerHTML = nodes.map((node, index) => {
+      const currentProfile = profiles.find((profile) => profile.id === node.profileId);
+      const unavailableOption = currentProfile?.enabled === false || !currentProfile
+        ? `<option value="${escapeHtml(node.profileId)}" selected disabled>${escapeHtml(currentProfile?.name || node.profileId)}（不可用）</option>` : '';
+      const profileOptions = enabledProfiles.map((profile) => `<option value="${escapeHtml(profile.id)}" ${profile.id === node.profileId ? 'selected' : ''}>${escapeHtml(profile.name)} · ${escapeHtml(profile.kind || 'custom')}</option>`).join('');
+      const dependencies = nodes.filter((candidate) => candidate.key !== node.key).map((candidate) => {
+        const profile = profiles.find((item) => item.id === candidate.profileId);
+        return `<label><input type="checkbox" data-workflow-dependency="${candidate.key}" ${node.dependsOnKeys.includes(candidate.key) ? 'checked' : ''} /><span>${escapeHtml(candidate.nodeId || '未命名节点')} · ${escapeHtml(profile?.name || candidate.profileId)}</span></label>`;
+      }).join('');
+      return `<fieldset class="workflow-editor-node" data-workflow-editor-node="${node.key}"><legend>节点 ${index + 1}</legend><button type="button" class="workflow-node-remove" data-workflow-node-remove="${node.key}" title="删除节点" aria-label="删除节点" ${nodes.length === 1 ? 'disabled' : ''}>×</button><div class="workflow-node-fields"><label class="field"><span>节点 ID</span><input data-workflow-node-id maxlength="64" value="${escapeHtml(node.nodeId)}" /></label><label class="field"><span>验证档案</span><select data-workflow-node-profile>${unavailableOption}${profileOptions}</select></label></div><fieldset class="workflow-node-dependencies"><legend>依赖</legend>${dependencies || '<span class="work-card-meta">无可选依赖</span>'}</fieldset><label class="switch-row"><input type="checkbox" data-workflow-node-continue ${node.continueOnFailure ? 'checked' : ''} /><span>依赖失败后仍运行此节点</span></label></fieldset>`;
+    }).join('');
+    container.querySelectorAll('[data-workflow-node-remove]').forEach((button) => button.addEventListener('click', () => {
+      syncWorkflowEditorNodes(modal, nodes);
+      const index = nodes.findIndex((node) => node.key === button.dataset.workflowNodeRemove);
+      if (index < 0 || nodes.length === 1) return;
+      const [removed] = nodes.splice(index, 1);
+      for (const node of nodes) node.dependsOnKeys = node.dependsOnKeys.filter((key) => key !== removed.key);
+      renderNodes();
+    }));
+  };
+  renderNodes();
+  modal.querySelector('[data-workflow-node-add]')?.addEventListener('click', () => {
+    syncWorkflowEditorNodes(modal, nodes);
+    if (nodes.length >= 32) return toast('工作流最多包含 32 个节点');
+    let serial = nodes.length + 1;
+    const used = new Set(nodes.map((node) => node.nodeId));
+    while (used.has(`node_${serial}`)) serial += 1;
+    nodes.push({ key: uid('wfn'), nodeId: `node_${serial}`, profileId: enabledProfiles[0].id, dependsOnKeys: [], continueOnFailure: false });
+    renderNodes();
+  });
+  modal.querySelector('[data-workflow-editor-cancel]')?.addEventListener('click', close);
+  modal.querySelector('form')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    syncWorkflowEditorNodes(modal, nodes);
+    const errorEl = modal.querySelector('.workflow-editor-error');
+    const name = modal.querySelector('[data-workflow-name]')?.value.trim() || '';
+    const maxParallel = Number(modal.querySelector('[data-workflow-parallel]')?.value);
+    const timeoutMinutes = Number(modal.querySelector('[data-workflow-timeout]')?.value);
+    const validated = validateWorkflowEditorNodes(nodes, profiles);
+    let validationError = '';
+    if (!name) validationError = '请填写工作流名称';
+    else if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > 4) validationError = '最大并行数必须为 1-4';
+    else if (!Number.isInteger(timeoutMinutes) || timeoutMinutes < 1 || timeoutMinutes > 1440) validationError = '总超时必须为 1-1440 分钟';
+    else if (validated.error) validationError = validated.error;
+    if (validationError) { errorEl.textContent = validationError; return; }
+    const submit = modal.querySelector('[type="submit"]');
+    submit.disabled = true;
+    const workflow = {
+      workflowId: copy ? '' : (current?.workflowId || ''),
+      name,
+      enabled: modal.querySelector('[data-workflow-enabled]')?.checked === true,
+      failFast: modal.querySelector('[data-workflow-fail-fast]')?.checked === true,
+      maxParallel,
+      timeoutMs: timeoutMinutes * 60000,
+      nodes: validated.nodes,
+    };
+    const result = await window.codex.saveEngineeringWorkflow({ projectBindingId: token, workflow }).catch(() => null);
+    if (!result?.ok) {
+      errorEl.textContent = result?.error || '保存工作流失败';
+      submit.disabled = false;
+      return;
+    }
+    close();
+    toast(current && !copy ? '工作流已更新' : '工作流已创建');
+    await loadEngineeringWorkflows(token);
+  });
+  modal.querySelector('[data-workflow-name]')?.focus();
+}
 function openProjectChat(projectId) {
   const p = getProject(projectId); if (!p) return;
   let session = sessions.find((s) => s.kind === 'project' && s.projectId === projectId);
@@ -2987,7 +3340,7 @@ function renderPullRequestView() {
         ${pr.state === 'OPEN' && pr.isDraft ? `<button type="button" class="btn-secondary" data-pr-action="ready" ${blocked ? 'disabled' : ''}>转为 Ready</button>` : ''}
         ${pr.state === 'OPEN' ? `<button type="button" class="btn-secondary" data-pr-action="close" ${blocked ? 'disabled' : ''}>关闭 PR</button>` : ''}
         ${pr.state === 'CLOSED' ? `<button type="button" class="btn-secondary" data-pr-action="reopen" ${blocked ? 'disabled' : ''}>重新打开</button>` : ''}
-        ${pr.state === 'OPEN' && !pr.isDraft ? `<select class="pr-merge-method" ${blocked ? 'disabled' : ''}><option value="squash">Squash</option><option value="merge">Merge commit</option><option value="rebase">Rebase</option></select><button type="button" class="btn-primary" data-pr-action="merge" ${blocked || !strictMergeReady(pr) ? 'disabled' : ''}>合并 PR</button>` : ''}
+        ${pr.state === 'OPEN' && !pr.isDraft ? `${workflowGateSelectHtml(project, 'merge', `pr:${pr.number}`, blocked)}<select class="pr-merge-method" ${blocked ? 'disabled' : ''}><option value="squash">Squash</option><option value="merge">Merge commit</option><option value="rebase">Rebase</option></select><button type="button" class="btn-primary" data-pr-action="merge" ${blocked || !strictMergeReady(pr) ? 'disabled' : ''}>合并 PR</button>` : ''}
       </div>`;
   }
   body.innerHTML = `
@@ -3019,6 +3372,11 @@ function renderPullRequestView() {
     loadPullRequestDetail(Number(button.dataset.prNumber));
   }));
   body.querySelectorAll('[data-pr-action]').forEach((button) => button.addEventListener('click', () => runPullRequestAction(button.dataset.prAction)));
+  body.querySelectorAll('[data-workflow-gate-select]').forEach((select) => select.addEventListener('change', () => {
+    if (select.value) workflowGateSelections.set(select.dataset.workflowGateSelect, select.value);
+    else workflowGateSelections.delete(select.dataset.workflowGateSelect);
+  }));
+  body.querySelectorAll('[data-workflow-gate-open]').forEach((button) => button.addEventListener('click', () => setView('scheduled')));
 }
 
 async function loadPullRequests({ keepDetail = false } = {}) {
@@ -3032,7 +3390,10 @@ async function loadPullRequests({ keepDetail = false } = {}) {
   try {
     const token = await bindWorktreeProject(project);
     if (!token) throw new Error('项目绑定已失效');
-    const response = await window.codex.listPullRequests({ projectBindingId: token, state: pullRequestView.filter });
+    const [response] = await Promise.all([
+      window.codex.listPullRequests({ projectBindingId: token, state: pullRequestView.filter }),
+      loadWorkflowGateRuns(project, token),
+    ]);
     if (sequence !== pullRequestView.seq) return;
     if (!response?.ok) throw new Error(response?.error || '无法读取 PR 列表');
     pullRequestView.repo = response.repo || null;
@@ -3116,6 +3477,7 @@ async function runPullRequestAction(action) {
     invoke = window.codex.readyPullRequest;
   } else if (action === 'merge') {
     payload.method = document.querySelector('.pr-merge-method')?.value || 'squash';
+    Object.assign(payload, workflowGatePayload(project, 'merge', `pr:${pr.number}`));
     question = `确定使用 ${payload.method.toUpperCase()} 合并 PR #${pr.number}？远端分支不会删除。`;
     invoke = window.codex.mergePullRequest;
   }
@@ -4960,10 +5322,20 @@ function boot() {
   });
   window.codex?.onEngineeringEvent?.((event) => {
     // Background jobs keep running while the user is on another view; only the
-    // engineering center needs a repaint, and nothing here touches history.
-    if (currentView !== 'scheduled') return;
-    loadEngineeringJobs().catch(() => {});
-    refreshEngineeringIndexStatus().catch(() => {});
+    // engineering and gate views repaint, and nothing here touches history.
+    const workflowFinished = event?.type === 'engineering:workflow:event' && ['finished', 'interrupted'].includes(event.reason);
+    if (currentView === 'scheduled') {
+      loadEngineeringJobs().catch(() => {});
+      loadEngineeringWorkflows().catch(() => {});
+      refreshEngineeringIndexStatus().catch(() => {});
+    } else if (workflowFinished) {
+      const project = sessionProject();
+      const token = project ? worktreeBindings.get(project.id) : '';
+      if (project && token) loadWorkflowGateRuns(project, token).then(() => {
+        renderMessages();
+        if (currentView === 'prs') renderPullRequestView();
+      }).catch(() => {});
+    }
   });
   loadMcpTasks().catch(() => {});
   setView('chat');

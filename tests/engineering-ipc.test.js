@@ -280,4 +280,69 @@ describe('D11 engineering IPC boundary', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('owns D12 workflow definitions and runs by sender binding and broadcasts project-scoped events', async () => {
+    const root = tempProject();
+    let storedProfiles = [];
+    const events = [];
+    try {
+      const handlers = createEngineeringIpcHandlers({
+        getProfiles: () => storedProfiles,
+        setProfiles: (_root, profiles) => { storedProfiles = profiles; },
+        getSettings: () => ({ terminalEnabled: true }),
+        workspaceFingerprint: () => 'workspace-fp',
+        createPermissionGate: () => ({ authorize: async () => ({ allowed: true, decision: 'allow_session' }), cancelPending: () => 0 }),
+        runTerminal: async () => ({ ok: true, code: 0, stdout: '', stderr: '' }),
+        onEvent: (item, owners) => events.push({ item, owners }),
+      });
+      const owner = event(21);
+      const token = handlers.bind(owner, { projectPath: root, projectBindingId: makeToken('11') });
+      const profile = await handlers.saveProfile(owner, {
+        projectBindingId: token.projectBindingId,
+        profile: { name: 'Tests', kind: 'test', command: 'node -v', cwd: '.', timeoutMs: 30000, enabled: true },
+      });
+      const saved = await handlers.workflowSave(owner, {
+        projectBindingId: token.projectBindingId,
+        workflow: {
+          name: 'Gate',
+          command: 'renderer-command-must-be-ignored',
+          projectPath: 'D:/forged',
+          nodes: [{ nodeId: 'test', profileId: profile.profile.id, dependsOn: [], command: 'ignored' }],
+        },
+      });
+      assert.equal(saved.ok, true);
+      assert.match(saved.workflow.workflowId, /^wf_[a-f0-9]{16}$/);
+      assert.equal('command' in saved.workflow, false);
+      assert.equal('projectPath' in saved.workflow, false);
+
+      const forgedCreate = await handlers.workflowSave(owner, {
+        projectBindingId: token.projectBindingId,
+        workflow: { workflowId: 'wf_' + 'a'.repeat(16), name: 'Forged', nodes: [{ nodeId: 'test', profileId: profile.profile.id }] },
+      });
+      assert.equal(forgedCreate.code, 'WORKFLOW_RUN_NOT_FOUND');
+      assert.equal((await handlers.workflows(event(22), { projectBindingId: token.projectBindingId })).code, 'ENGINEERING_PROJECT_BINDING_INVALID');
+
+      const started = await handlers.workflowRun(owner, { projectBindingId: token.projectBindingId, workflowId: saved.workflow.workflowId });
+      assert.equal(started.ok, true);
+      const deadline = Date.now() + 2000;
+      let run;
+      do {
+        run = await handlers.workflowResult(owner, { projectBindingId: token.projectBindingId, workflowRunRef: started.workflowRunRef });
+        if (run?.run?.status === 'passed') break;
+        if (Date.now() > deadline) throw new Error('workflow did not finish');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } while (true);
+      assert.ok(events.some((entry) => entry.item.type === 'engineering:workflow:event'
+        && entry.item.reason === 'finished' && entry.owners.includes(21)));
+      const gate = await handlers.workflowGateCheck(owner, {
+        projectBindingId: token.projectBindingId,
+        workflowRunRef: started.workflowRunRef,
+        action: 'apply',
+        expectedFingerprint: 'workspace-fp',
+      });
+      assert.equal(gate.ok, true);
+      assert.equal(gate.summary.completedAt, run.run.finishedAt);
+      handlers.close();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 });

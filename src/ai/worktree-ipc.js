@@ -14,7 +14,7 @@ function senderId(event) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, openExternal } = {}) {
+function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, openExternal, checkWorkflowGate } = {}) {
   if (!manager) throw new Error('worktree IPC requires manager');
   const bindingsBySender = new Map();
 
@@ -82,6 +82,35 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     return { projectPath: binding.projectPath, resultId };
   }
 
+  async function workflowGate(event, payload, action) {
+    const ref = String(payload?.workflowRunRef || '');
+    if (!ref) return null;
+    if (typeof checkWorkflowGate !== 'function') return ipcError('WORKFLOW_GATE_REQUIRED', '工作流门禁不可用');
+    const result = await checkWorkflowGate(event, {
+      projectBindingId: String(payload?.projectBindingId || ''),
+      workflowRunRef: ref,
+      action,
+      expectedFingerprint: payload?.expectedFingerprint ? String(payload.expectedFingerprint) : '',
+    });
+    if (!result?.ok) {
+      const code = ['WORKFLOW_FINGERPRINT_MISMATCH', 'WORKFLOW_STALE'].includes(result?.reason)
+        ? 'WORKFLOW_GATE_FINGERPRINT_MISMATCH'
+        : 'WORKFLOW_GATE_NOT_PASSED';
+      return { ...ipcError(code, result?.reason || '工作流门禁未通过'), reason: result?.reason };
+    }
+    return null;
+  }
+
+  async function guardedMutation(event, payload, action, run) {
+    if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
+    const execute = async () => {
+      const gateError = action ? await workflowGate(event, payload, action) : null;
+      if (gateError) return gateError;
+      return run();
+    };
+    return typeof withMutation === 'function' ? withMutation(execute) : execute();
+  }
+
   function prReferenceArgs(event, payload = {}) {
     const binding = resolveBinding(event, payload);
     if (!binding) return null;
@@ -118,12 +147,10 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     return manager.get({ ...args, preview: payload.preview === true });
   }
 
-  async function mutate(event, payload, method) {
+  async function mutate(event, payload, method, action = null) {
     const args = resultArgs(event, payload);
     if (!args) return ipcError('RESULT_NOT_FOUND', '隔离结果不存在');
-    if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
-    const run = () => manager[method](args);
-    return typeof withMutation === 'function' ? withMutation(run) : run();
+    return guardedMutation(event, payload, action, () => manager[method](args));
   }
 
   async function open(event, payload = {}) {
@@ -142,23 +169,22 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     payload = payload && typeof payload === 'object' ? payload : {};
     const args = resultArgs(event, payload);
     if (!args) return ipcError('RESULT_NOT_FOUND', '隔离结果不存在');
-    if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
     const run = () => manager[method]({
       ...args,
       title: String(payload.title || '').slice(0, 300),
       body: String(payload.body || '').slice(0, 10000),
       draft: payload.draft !== false,
     });
-    return typeof withMutation === 'function' ? withMutation(run) : run();
+    return guardedMutation(event, payload, 'create_pr', run);
   }
 
   async function prLifecycleMutate(event, payload, method, extra = {}) {
     payload = payload && typeof payload === 'object' ? payload : {};
     const args = prReferenceArgs(event, payload);
     if (!args || typeof manager[method] !== 'function') return ipcError('PR_INVALID', 'PR 引用无效');
-    if (typeof isBusy === 'function' && isBusy()) return ipcError('BUSY', '有对话、终端或其它 worktree 操作正在进行');
+    const action = method === 'mergePr' ? 'merge' : null;
     const run = () => manager[method]({ ...args, ...extra });
-    return typeof withMutation === 'function' ? withMutation(run) : run();
+    return guardedMutation(event, payload, action, run);
   }
 
   return {
@@ -174,7 +200,7 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     unbind,
     list,
     get,
-    apply: (event, payload) => mutate(event, payload, 'apply'),
+    apply: (event, payload) => mutate(event, payload, 'apply', 'apply'),
     discard: (event, payload) => mutate(event, payload, 'discard'),
     retryCollect: (event, payload) => mutate(event, payload, 'retryCollect'),
     cleanup: (event, payload) => mutate(event, payload, 'cleanup'),

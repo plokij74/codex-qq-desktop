@@ -2,6 +2,7 @@
 
 const { createProjectIndex, canonicalProjectPath, projectKey } = require('./project-index');
 const { createVerificationManager } = require('./verification-manager');
+const { createWorkflowManager, validWorkflowRunRef } = require('./workflow-manager');
 
 function error(code, message) {
   return { ok: false, code, error: String(message || code).slice(0, 500) };
@@ -37,7 +38,9 @@ function createEngineeringIpcHandlers(options = {}) {
   const approvalGates = new Map();
   const ownerProjects = new Map();
   const projectOwners = new Map();
+  const workflowGates = new Map();
   let verification = null;
+  let workflows = null;
 
   const resolve = typeof options.resolveBinding === 'function'
     ? options.resolveBinding
@@ -147,6 +150,51 @@ function createEngineeringIpcHandlers(options = {}) {
     return manager;
   }
 
+  function getWorkflows() {
+    if (!workflows) {
+      workflows = createWorkflowManager({
+        userDataPath: options.userDataPath,
+        safeStorage: options.safeStorage,
+        verificationManager: getVerification(),
+        getProfiles: (projectPath) => syncProfiles(projectPath).listProfiles(projectPath, { includeDisabled: true, includeCommand: true }),
+        startVerification: (args) => getVerification().start(args),
+        getVerification: (ref, root) => getVerification().get(ref, root),
+        cancelVerification: (ref, root) => getVerification().cancel(ref, root),
+        workspaceFingerprint: options.workspaceFingerprint,
+        onEvent: (event) => {
+          if (event?.workflowRunRef && ['finished', 'interrupted'].includes(event.reason)) {
+            const held = workflowGates.get(event.workflowRunRef);
+            if (held) {
+              unregisterGate(held.owner, held.gate);
+              workflowGates.delete(event.workflowRunRef);
+            }
+          }
+          const owners = [...(projectOwners.get(event.projectKey) || [])];
+          if (typeof options.onEvent === 'function') options.onEvent({ ...event }, owners);
+        },
+      });
+    }
+    return workflows;
+  }
+
+  function workflowPayload(payload = {}) {
+    const raw = payload.workflow && typeof payload.workflow === 'object' && !Array.isArray(payload.workflow) ? payload.workflow : payload;
+    return {
+      workflowId: String(raw.workflowId || raw.id || ''),
+      name: String(raw.name || ''),
+      enabled: raw.enabled !== false,
+      failFast: raw.failFast !== false,
+      maxParallel: raw.maxParallel,
+      timeoutMs: raw.timeoutMs,
+      nodes: Array.isArray(raw.nodes) ? raw.nodes.map((node) => ({
+        nodeId: String(node?.nodeId || ''),
+        profileId: String(node?.profileId || ''),
+        dependsOn: Array.isArray(node?.dependsOn) ? node.dependsOn : [],
+        continueOnFailure: node?.continueOnFailure === true,
+      })) : raw.nodes,
+    };
+  }
+
   function persistProfiles(projectPath, manager) {
     const profiles = manager.listProfiles(projectPath, { includeDisabled: true, includeCommand: true });
     if (typeof options.setProfiles === 'function') options.setProfiles(projectPath, profiles);
@@ -216,6 +264,30 @@ function createEngineeringIpcHandlers(options = {}) {
     verificationGet: (projectPath, jobRef) => syncProfiles(projectPath).get(jobRef, projectPath)
       || error('VERIFICATION_JOB_NOT_FOUND', '作业不存在'),
     verificationResult: (projectPath, jobRef) => syncProfiles(projectPath).result(jobRef, projectPath),
+    engineeringWorkflows: (projectPath) => getWorkflows().listWorkflows(projectPath),
+    workflowList: (projectPath) => getWorkflows().listWorkflows(projectPath),
+    workflowGetDefinition: (projectPath, workflowId) => getWorkflows().getWorkflow(projectPath, workflowId),
+    workflowStartAgent: async (projectPath, workflowId, context = {}) => {
+      const owner = Number.isInteger(context.ownerId) ? context.ownerId : null;
+      rememberOwner(owner, projectPath);
+      if (context.gate) registerGate(owner, context.gate);
+      const result = await getWorkflows().run(projectPath, workflowId, { ...context, permissionGate: context.permissionGate || context.gate });
+      if (result?.ok && result.workflowRunRef && context.gate) workflowGates.set(result.workflowRunRef, { owner, gate: context.gate });
+      else unregisterGate(owner, context.gate);
+      return result;
+    },
+    workflowGetRun: (projectPath, workflowRunRef) => getWorkflows().getRun(projectPath, workflowRunRef),
+    workflowResultForAgent: (projectPath, workflowRunRef) => getWorkflows().result(projectPath, workflowRunRef),
+    workflowCancelForAgent: (projectPath, workflowRunRef, context = {}) => getWorkflows().cancelForAgent(projectPath, workflowRunRef, context.agentRunId),
+    workflowStart: async (projectPath, workflowId, context = {}) => {
+      const owner = Number.isInteger(context.ownerId) ? context.ownerId : null;
+      rememberOwner(owner, projectPath);
+      if (context.gate) registerGate(owner, context.gate);
+      const result = await getWorkflows().run(projectPath, workflowId, { ...context, permissionGate: context.permissionGate || context.gate });
+      if (result?.ok && result.workflowRunRef && context.gate) workflowGates.set(result.workflowRunRef, { owner, gate: context.gate });
+      else unregisterGate(owner, context.gate);
+      return result;
+    },
 
     // Standalone/test binding support. Production resolves the worktree-owned
     // token via resolveBinding and never calls this method from preload.
@@ -330,6 +402,45 @@ function createEngineeringIpcHandlers(options = {}) {
       if (!validProfileId(payload.profileId)) return error('VERIFICATION_PROFILE_NOT_FOUND', '验证档案不存在');
       return syncProfiles(binding.projectPath).revokeGrant(binding.projectPath, payload.profileId);
     }),
+    workflows: (event, payload = {}) => withBinding(event, payload, (binding) => getWorkflows().listWorkflows(binding.projectPath, { includeDisabled: payload.includeDisabled === true })),
+    workflowGet: (event, payload = {}) => withBinding(event, payload, (binding) => getWorkflows().getWorkflow(binding.projectPath, String(payload.workflowId || ''))),
+    workflowSave: (event, payload = {}) => withBinding(event, payload, (binding) => getWorkflows().saveWorkflow(binding.projectPath, workflowPayload(payload))),
+    workflowDelete: (event, payload = {}) => withBinding(event, payload, (binding) => getWorkflows().deleteWorkflow(binding.projectPath, String(payload.workflowId || ''))),
+    workflowRun: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      const settings = options.getSettings ? options.getSettings() : {};
+      const context = permissionContext(event, payload, settings);
+      try {
+        const result = await getWorkflows().run(binding.projectPath, String(payload.workflowId || ''), { ...context.options, gate: context.gate, ownerId: ownerId(event) });
+        if (result?.ok && result.workflowRunRef && context.gate) workflowGates.set(result.workflowRunRef, { owner: context.owner, gate: context.gate });
+        else unregisterGate(context.owner, context.gate);
+        return result;
+      } catch (cause) { unregisterGate(context.owner, context.gate); throw cause; }
+    }),
+    workflowRuns: (event, payload = {}) => withBinding(event, payload, (binding) => getWorkflows().listRuns(binding.projectPath, payload.limit)),
+    workflowResult: (event, payload = {}) => withBinding(event, payload, (binding) => validWorkflowRunRef(payload.workflowRunRef)
+      ? getWorkflows().result(binding.projectPath, payload.workflowRunRef)
+      : error('WORKFLOW_RUN_NOT_FOUND', 'workflow run 引用无效')),
+    workflowCancel: (event, payload = {}) => withBinding(event, payload, (binding) => validWorkflowRunRef(payload.workflowRunRef)
+      ? getWorkflows().cancel(binding.projectPath, payload.workflowRunRef)
+      : error('WORKFLOW_RUN_NOT_FOUND', 'workflow run 引用无效')),
+    workflowRerun: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (!validWorkflowRunRef(payload.workflowRunRef)) return error('WORKFLOW_RUN_NOT_FOUND', 'workflow run 引用无效');
+      const settings = options.getSettings ? options.getSettings() : {};
+      const context = permissionContext(event, payload, settings);
+      try {
+        const old = getWorkflows().getRun(binding.projectPath, payload.workflowRunRef);
+        if (!old?.ok) return old;
+        const result = await getWorkflows().rerun(binding.projectPath, payload.workflowRunRef, { ...context.options, gate: context.gate, ownerId: ownerId(event) });
+        if (result?.ok && result.workflowRunRef && context.gate) workflowGates.set(result.workflowRunRef, { owner: context.owner, gate: context.gate });
+        else unregisterGate(context.owner, context.gate);
+        return result;
+      } catch (cause) { unregisterGate(context.owner, context.gate); throw cause; }
+    }),
+    workflowGateCheck: (event, payload = {}) => withBinding(event, payload, (binding) => getWorkflows().checkGate(binding.projectPath, {
+      workflowRunRef: String(payload.workflowRunRef || ''),
+      action: ['apply', 'create_pr', 'merge'].includes(payload.action) ? payload.action : undefined,
+      expectedFingerprint: payload.expectedFingerprint ? String(payload.expectedFingerprint) : '',
+    })),
 
     syncOwnerBindings: (eventOrId, projectPaths = []) => {
       const owner = typeof eventOrId === 'number' ? eventOrId : ownerId(eventOrId);
@@ -342,6 +453,7 @@ function createEngineeringIpcHandlers(options = {}) {
       if (owner == null) return;
       for (const gate of approvalGates.get(owner) || []) gate.cancelPending?.();
       approvalGates.delete(owner);
+      for (const [ref, held] of workflowGates) if (held.owner === owner) workflowGates.delete(ref);
       localBindings.delete(owner);
       forgetOwner(owner);
     },
@@ -367,23 +479,28 @@ function createEngineeringIpcHandlers(options = {}) {
     restoreAtStartup: () => {
       const manager = getVerification();
       const jobs = manager.list().jobs || [];
+      const workflowState = getWorkflows().restoreAtStartup();
       return {
         ok: true,
         persistence: manager.persistenceStatus?.() ?? null,
         interrupted: jobs.filter((job) => job.status === 'interrupted').length,
         jobs: jobs.length,
+        workflows: workflowState,
       };
     },
     close: () => {
       for (const index of indexes.values()) index.close();
+      workflows?.close();
       verification?.close();
       indexes.clear();
       approvalGates.clear();
+      workflowGates.clear();
       ownerProjects.clear();
       projectOwners.clear();
     },
     indexes,
     get verification() { return verification; },
+    get workflowManager() { return workflows; },
   };
 }
 

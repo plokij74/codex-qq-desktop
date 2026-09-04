@@ -147,4 +147,62 @@ describe('D5 worktree IPC boundary', () => {
     assert.equal((await handlers.editPr(event, { projectBindingId: token, number: 12, title: 'x', body: 'y' })).code, 'BUSY');
     fs.rmSync(root, { recursive: true, force: true });
   });
+
+  it('checks optional workflow gates inside the mutation lock for apply, Draft PR, and merge', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-qq-workflow-gate-'));
+    const calls = [];
+    let locked = false;
+    const manager = {
+      apply: async () => { calls.push('apply'); return { ok: true }; },
+      createPr: async () => { calls.push('create_pr'); return { ok: true }; },
+      mergePr: async () => { calls.push('merge'); return { ok: true }; },
+    };
+    const handlers = createWorktreeIpcHandlers({
+      manager,
+      isBusy: () => false,
+      withMutation: async (fn) => {
+        assert.equal(locked, false);
+        locked = true;
+        try { return await fn(); } finally { locked = false; }
+      },
+      checkWorkflowGate: async (_event, payload) => {
+        assert.equal(locked, true, 'fingerprint gate must be rechecked after taking the mutation lock');
+        assert.match(payload.projectBindingId, /^pb_[a-f0-9]{32}$/);
+        assert.equal(payload.workflowRunRef, 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa');
+        assert.equal(payload.expectedFingerprint, 'workspace-fp');
+        calls.push(`gate:${payload.action}`);
+        return { ok: true };
+      },
+    });
+    const owner = { sender: { id: 103 } };
+    const token = handlers.bind(owner, { projectId: 'p1', projectPath: root }).projectBindingId;
+    const gate = { projectBindingId: token, workflowRunRef: 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa', expectedFingerprint: 'workspace-fp' };
+    await handlers.apply(owner, { ...gate, resultId: 'wt_ab12cd34' });
+    await handlers.createPr(owner, { ...gate, resultId: 'wt_ab12cd34', title: 'Title', body: 'Body' });
+    await handlers.mergePr(owner, { ...gate, number: 7, method: 'squash' });
+    assert.deepEqual(calls, ['gate:apply', 'apply', 'gate:create_pr', 'create_pr', 'gate:merge', 'merge']);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not mutate when a selected workflow gate is stale', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-qq-workflow-gate-fail-'));
+    let applied = false;
+    const handlers = createWorktreeIpcHandlers({
+      manager: { apply: async () => { applied = true; return { ok: true }; } },
+      withMutation: async (fn) => fn(),
+      checkWorkflowGate: async () => ({ ok: false, reason: 'WORKFLOW_STALE' }),
+    });
+    const owner = { sender: { id: 104 } };
+    const token = handlers.bind(owner, { projectId: 'p1', projectPath: root }).projectBindingId;
+    const result = await handlers.apply(owner, {
+      projectBindingId: token,
+      resultId: 'wt_ab12cd34',
+      workflowRunRef: 'wf_run_aaaaaaaaaaaaaaaaaaaaaaaa',
+      expectedFingerprint: 'old-fp',
+    });
+    assert.equal(result.code, 'WORKFLOW_GATE_FINGERPRINT_MISMATCH');
+    assert.equal(result.reason, 'WORKFLOW_STALE');
+    assert.equal(applied, false);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
 });

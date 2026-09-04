@@ -15,6 +15,7 @@ const EXPLORE_READONLY = new Set([
 const ENGINEERING_READONLY = new Set([
   'code_index_status', 'code_index_search', 'verification_profiles',
   'verification_get', 'verification_result',
+  'engineering_workflows', 'workflow_get', 'workflow_result',
 ]);
 
 /**

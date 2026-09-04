@@ -251,6 +251,20 @@ describe('permission', () => {
     assert.equal(called, false);
   });
 
+  it('cancelPending rejects detached background approvals', async () => {
+    let requested = false;
+    const gate = createPermissionGate({
+      permissionMode: 'confirm-writes',
+      terminalEnabled: true,
+      onApprovalNeeded: async () => { requested = true; },
+    });
+    const pending = gate.authorize({ tool: 'verification_start', risk: 'terminal' });
+    while (!requested) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(gate.cancelPending('窗口已关闭'), 1);
+    await assert.rejects(pending, (error) => error.code === 'ABORTED' && error.message === '窗口已关闭');
+    assert.equal(gate.cancelPending(), 0);
+  });
+
   it('verification_start always asks for first approval even in full-auto', async () => {
     let called = 0;
     const gate = createPermissionGate({

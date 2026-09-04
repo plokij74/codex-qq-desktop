@@ -108,10 +108,11 @@ describe('builtin subagent tool filter', () => {
     assert.equal(JSON.parse(raw).ok, true);
   });
 
-  it('allows engineering reads to explore but never verification_start', async () => {
+  it('allows engineering reads to explore but never verification or workflow mutations', async () => {
     const defs = [
       'code_index_status', 'code_index_search', 'verification_profiles',
       'verification_get', 'verification_result', 'verification_start',
+      'engineering_workflows', 'workflow_get', 'workflow_result', 'workflow_start', 'workflow_cancel',
     ].map((name) => ({ type: 'function', function: { name } }));
     const p = createBuiltinProvider({
       getToolDefs: () => defs,
@@ -119,15 +120,21 @@ describe('builtin subagent tool filter', () => {
     });
     const explore = p.getTools({ subagentDepth: 1, subagentKind: 'explore', settings: { terminalEnabled: true } });
     assert.deepEqual(names(explore), [
-      'code_index_search', 'code_index_status', 'verification_get',
-      'verification_profiles', 'verification_result',
+      'code_index_search', 'code_index_status', 'engineering_workflows',
+      'verification_get', 'verification_profiles', 'verification_result',
+      'workflow_get', 'workflow_result',
     ]);
     const denied = JSON.parse(await p.execute('verification_start', { profileId: 'vfy_12345678' }, {
       subagentDepth: 1, subagentKind: 'explore', settings: { terminalEnabled: true },
     }));
     assert.equal(denied.ok, false);
+    const workflowDenied = JSON.parse(await p.execute('workflow_start', { workflowId: 'wf_aaaaaaaaaaaaaaaa' }, {
+      subagentDepth: 1, subagentKind: 'explore', settings: { terminalEnabled: true },
+    }));
+    assert.equal(workflowDenied.ok, false);
     const implement = p.getTools({ subagentDepth: 1, subagentKind: 'implement', settings: { terminalEnabled: true } });
     assert.ok(!implement.some((tool) => tool.function.name === 'verification_start'));
+    assert.ok(!implement.some((tool) => tool.function.name.startsWith('workflow_')));
   });
 
   it('keeps engineering tools out of implement subagents that run in an isolated worktree', async () => {

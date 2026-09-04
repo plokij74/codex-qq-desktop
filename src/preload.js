@@ -160,6 +160,31 @@ contextBridge.exposeInMainWorld('codex', {
   cancelVerification: (payload = {}) => ipcRenderer.invoke('engineering:verification:cancel', { projectBindingId: String(payload?.projectBindingId || ''), jobRef: String(payload?.jobRef || '') }),
   rerunVerification: (payload = {}) => ipcRenderer.invoke('engineering:verification:rerun', { projectBindingId: String(payload?.projectBindingId || ''), jobRef: String(payload?.jobRef || '') }),
   revokeVerificationGrant: (payload = {}) => ipcRenderer.invoke('engineering:verification:revoke-grant', { projectBindingId: String(payload?.projectBindingId || ''), profileId: String(payload?.profileId || '') }),
+  listEngineeringWorkflows: (payload = {}) => ipcRenderer.invoke('engineering:workflow:list', { projectBindingId: String(payload?.projectBindingId || ''), includeDisabled: payload?.includeDisabled === true }),
+  getEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:get', { projectBindingId: String(payload?.projectBindingId || ''), workflowId: String(payload?.workflowId || '') }),
+  saveEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:save', {
+    projectBindingId: String(payload?.projectBindingId || ''),
+    workflow: {
+      workflowId: String(payload?.workflow?.workflowId || payload?.workflow?.id || ''),
+      name: String(payload?.workflow?.name || ''),
+      enabled: payload?.workflow?.enabled !== false,
+      failFast: payload?.workflow?.failFast !== false,
+      maxParallel: payload?.workflow?.maxParallel,
+      timeoutMs: payload?.workflow?.timeoutMs,
+      nodes: Array.isArray(payload?.workflow?.nodes) ? payload.workflow.nodes.map((node) => ({
+        nodeId: String(node?.nodeId || ''), profileId: String(node?.profileId || ''),
+        dependsOn: Array.isArray(node?.dependsOn) ? node.dependsOn.map(String) : [],
+        continueOnFailure: node?.continueOnFailure === true,
+      })) : [],
+    },
+  }),
+  deleteEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:delete', { projectBindingId: String(payload?.projectBindingId || ''), workflowId: String(payload?.workflowId || '') }),
+  runEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:run', { projectBindingId: String(payload?.projectBindingId || ''), workflowId: String(payload?.workflowId || ''), sessionId: String(payload?.sessionId || '') }),
+  listEngineeringWorkflowRuns: (payload = {}) => ipcRenderer.invoke('engineering:workflow:runs', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),
+  getEngineeringWorkflowResult: (payload = {}) => ipcRenderer.invoke('engineering:workflow:result', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || '') }),
+  cancelEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:cancel', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || '') }),
+  rerunEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:rerun', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), sessionId: String(payload?.sessionId || '') }),
+  checkEngineeringWorkflowGate: (payload = {}) => ipcRenderer.invoke('engineering:workflow:gate-check', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), action: String(payload?.action || ''), expectedFingerprint: String(payload?.expectedFingerprint || '') }),
   onEngineeringEvent: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('engineering:event', listener);

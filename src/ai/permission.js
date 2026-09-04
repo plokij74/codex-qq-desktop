@@ -8,6 +8,7 @@ const READ_TOOLS = new Set([
   'recall',
   'code_index_status', 'code_index_search', 'verification_profiles',
   'verification_get', 'verification_result',
+  'engineering_workflows', 'workflow_get', 'workflow_result',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit', 'spawn_implement', 'run_skill',
@@ -33,6 +34,7 @@ function riskForTool(toolName) {
   if (name === 'delete_path') return 'delete';
   if (name === 'run_terminal') return 'terminal';
   if (name === 'verification_start') return 'terminal';
+  if (name === 'workflow_start' || name === 'workflow_cancel') return 'terminal';
   return 'write';
 }
 
@@ -118,6 +120,17 @@ function createPermissionGate({
       entry.resolve({ decision: 'deny' });
     }
     return true;
+  }
+
+  function cancelPending(reason = '审批已取消') {
+    const entries = [...pending.values()];
+    pending.clear();
+    for (const entry of entries) {
+      const error = new Error(String(reason || '审批已取消').slice(0, 200));
+      error.code = 'ABORTED';
+      entry.reject(error);
+    }
+    return entries.length;
   }
 
   async function waitForApproval(payload, signal) {
@@ -302,6 +315,7 @@ function createPermissionGate({
   return {
     authorize,
     resolveApproval,
+    cancelPending,
     rememberSession,
     riskForTool,
   };
