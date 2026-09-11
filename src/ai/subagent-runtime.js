@@ -390,7 +390,23 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
     }
   }
 
-  async function runImplement(ctx, { goal, maxTurns } = {}) {
+  function opaqueWorktreeResult(result) {
+    if (!result) return null;
+    return {
+      id: result.id,
+      state: result.state,
+      incomplete: result.incomplete === true,
+      fileCount: result.stats?.files || 0,
+      additions: result.stats?.additions || 0,
+      deletions: result.stats?.deletions || 0,
+      hasBinary: (result.stats?.binaryFiles || 0) > 0,
+      message: '改动在隔离 worktree 中，等待用户审阅',
+    };
+  }
+
+  async function runIsolatedImplement(ctx, {
+    goal, maxTurns, subagentId: requestedId, markerGoal,
+  } = {}) {
     const early = precheckChild(ctx, { kind: 'implement', goal });
     if (early) return early;
     return withImplementLock(ctx, async () => {
@@ -404,13 +420,13 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
           error: '隔离 worktree manager 不可用，已拒绝在主项目中执行修改',
         };
       }
-      const subagentId = nextId();
+      const subagentId = String(requestedId || nextId()).slice(0, 200);
       const created = await manager.create({
         project: ctx.project,
         projectBindingId: ctx.projectBindingId,
         sessionId: ctx.sessionKey,
         subagentId,
-        goal,
+        goal: String(markerGoal || goal || '').slice(0, 500),
         signal: ctx.signal,
       });
       if (!created?.ok) return created || { ok: false, kind: 'implement', error: '隔离 worktree 创建失败' };
@@ -433,6 +449,13 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
         const collected = await manager.collect(handle, { incomplete: true });
         if (collected?.ok && collected.changed && collected.result) {
           ctx.onEvent?.({ type: AGENT_EVENTS.WORKTREE_READY, result: collected.result, subagentId });
+          err.worktreeResult = opaqueWorktreeResult(collected.result);
+          err.incomplete = true;
+        } else if (collected?.ok && !collected.changed) {
+          err.noChanges = true;
+        } else if (collected?.code) {
+          err.collectCode = collected.code;
+          err.collectError = collected.error;
         }
         throw err;
       }
@@ -457,18 +480,13 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
       return {
         ...childResult,
         isolation: 'worktree',
-        result: {
-          id: result.id,
-          state: result.state,
-          incomplete: result.incomplete,
-          fileCount: result.stats?.files || 0,
-          additions: result.stats?.additions || 0,
-          deletions: result.stats?.deletions || 0,
-          hasBinary: (result.stats?.binaryFiles || 0) > 0,
-          message: '改动在隔离 worktree 中，等待用户在聊天卡片应用或丢弃',
-        },
+        result: opaqueWorktreeResult(result),
       };
     });
+  }
+
+  async function runImplement(ctx, { goal, maxTurns } = {}) {
+    return runIsolatedImplement(ctx, { goal, maxTurns, markerGoal: goal });
   }
 
   async function runExplores(ctx, { goals, maxTurns } = {}) {
@@ -497,7 +515,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
     };
   }
 
-  return { runExplore, runExplores, runImplement };
+  return { runExplore, runExplores, runImplement, runIsolatedImplement };
 }
 
 module.exports = { createSubagentRuntime, mergeSubagentFileChanges };

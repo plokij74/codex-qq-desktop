@@ -253,13 +253,16 @@ function clearEngineeringApprovalUi() {
   }
 }
 
-function renderEngineeringApprovalCard(ev) {
+function renderEngineeringApprovalCard(ev, {
+  title = '需要确认：后台验证（terminal）',
+  fallback = '运行已保存的验证档案',
+} = {}) {
   engineeringPendingApproval = ev;
   const box = document.getElementById('engineering-approval');
   if (!box) return;
   box.classList.remove('hidden');
-  box.innerHTML = '<div class="appr-title">需要确认：后台验证（terminal）</div>'
-    + '<div class="appr-summary">' + escapeHtml(ev.summary || ev.detail || '运行已保存的验证档案') + '</div>'
+  box.innerHTML = '<div class="appr-title">' + escapeHtml(title) + '</div>'
+    + '<div class="appr-summary">' + escapeHtml(ev.summary || ev.detail || fallback) + '</div>'
     + '<div class="appr-actions">'
     + '<button type="button" class="appr-btn" data-engineering-decision="allow">允许</button>'
     + '<button type="button" class="appr-btn appr-deny" data-engineering-decision="deny">拒绝</button>'
@@ -281,6 +284,13 @@ function renderEngineeringApprovalCard(ev) {
       toast(error?.message || String(error));
     }
   }));
+}
+
+function renderEngineeringRepairApprovalCard(ev) {
+  renderEngineeringApprovalCard(ev, {
+    title: '需要确认：生成隔离修复（write）',
+    fallback: '受限 Agent 只会在新的 D5 隔离 worktree 中提出修复建议',
+  });
 }
 
 function appendTermLine(text, className) {
@@ -383,6 +393,12 @@ function handleTerminalPanelEvent(ev) {
   // fall through to renderApprovalCard, which would attach them to chatRun.
   if (type === 'approval-needed' && ev.source === 'verification') {
     renderEngineeringApprovalCard(ev);
+    return true;
+  }
+  // Repair generation and advisory validation approvals share the engineering
+  // center's ephemeral panel, but must remain distinct from chat/terminal UI.
+  if (type === 'approval-needed' && ev.source === 'repair') {
+    renderEngineeringRepairApprovalCard(ev);
     return true;
   }
   if (type === 'approval-resolved' && engineeringPendingApproval
@@ -2128,6 +2144,110 @@ const JOB_STATUS_LABELS = {
   queued: '排队中', running: '运行中', passed: '通过', failed: '失败', timed_out: '超时',
   cancelled: '已取消', interrupted: '已中断', stale: '结果过期', configuration_changed: '配置已变化', skipped: '已跳过', error: '错误',
 };
+const REPAIR_STATUS_LABELS = {
+  queued: '排队中', preparing: '准备中', generating: '生成中', collecting: '收集中',
+  ready: '待审阅', no_changes: '无改动', failed: '失败', cancelled: '已取消', interrupted: '已中断',
+};
+const VALIDATION_STATUS_LABELS = {
+  not_run: '未验证', queued: '排队中', running: '验证中', passed: '通过', failed: '失败',
+  timed_out: '超时', cancelled: '已取消', stale: '结果过期', interrupted: '已中断', error: '错误',
+};
+
+function engineeringRepairStatusText(status) { return REPAIR_STATUS_LABELS[String(status || '')] || String(status || '未知'); }
+function engineeringValidationStatusText(status) { return VALIDATION_STATUS_LABELS[String(status || '')] || String(status || '未验证'); }
+
+async function beginEngineeringRepair(token, source) {
+  if (!source || !token) return;
+  const note = await appPrompt('可选：补充失败现象（最多 2000 字）', '', '生成隔离修复建议');
+  if (note == null) return;
+  if (!(await appConfirm('将由受限 Agent 在新的隔离 worktree 中生成一次修复建议。主项目不会被修改。继续？'))) return;
+  const result = await window.codex.startEngineeringRepair({ projectBindingId: token, source, note, sessionId: activeSessionId }).catch(() => null);
+  if (!result?.ok) return toast(result?.error || '生成修复建议失败');
+  toast('修复建议已排队，主项目不会被修改');
+  await loadEngineeringRepairs(token);
+}
+
+async function showEngineeringRepair(token, repairRef) {
+  const detail = document.getElementById('engineering-repair-detail');
+  if (!detail) return;
+  const result = await window.codex.getEngineeringRepairResult({ projectBindingId: token, repairRef }).catch(() => null);
+  if (!result?.ok || !result.repair) {
+    detail.innerHTML = `<div class="work-card-error">${escapeHtml(result?.error || '修复结果不可用')}</div>`;
+    detail.classList.remove('hidden');
+    return;
+  }
+  const repair = result.repair;
+  const validation = result.validationResult || repair.validation || {};
+  const advisory = validation.status && validation.status !== 'not_run'
+    ? `<div class="work-card-notice">最近一次隔离验证：${escapeHtml(engineeringValidationStatusText(validation.status))}（仅供参考，不影响应用或 Draft PR）</div>`
+    : '<div class="work-card-notice">尚未运行修复后验证。验证结果不会成为应用或 Draft PR 的门槛。</div>';
+  detail.innerHTML = [
+    `<div class="engineering-detail-title">修复建议 · ${escapeHtml(engineeringRepairStatusText(repair.status))}</div>`,
+    `<div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · 来源 ${escapeHtml(repair.source?.kind || '')} · ${escapeHtml(repair.profileId || '')}</div>`,
+    repair.resultId ? `<div class="work-card-meta">D5 隔离结果：<code>${escapeHtml(repair.resultId)}</code></div><div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-repair-open-result">查看 D5 结果卡</button></div>` : '',
+    repair.incomplete ? '<div class="work-card-notice">这是未完整结束的隔离结果，仍需用户审阅。</div>' : '',
+    repair.errorCode ? `<div class="work-card-error">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : '',
+    advisory,
+    validation.stdout ? `<details><summary>验证标准输出</summary><pre>${escapeHtml(validation.stdout)}</pre></details>` : '',
+    validation.stderr ? `<details><summary>验证错误输出</summary><pre>${escapeHtml(validation.stderr)}</pre></details>` : '',
+    `<div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-repair-close-detail">关闭</button></div>`,
+  ].join('');
+  detail.classList.remove('hidden');
+  document.getElementById('engineering-repair-close-detail')?.addEventListener('click', () => { detail.classList.add('hidden'); detail.innerHTML = ''; });
+  const project = sessionProject();
+  if (project?.path) {
+    await reconcileWorktreeResults(project);
+    document.getElementById('engineering-repair-open-result')?.addEventListener('click', () => {
+      setView('chat');
+      renderMessages();
+      setTimeout(() => {
+        const card = document.querySelector(`.worktree-result-card[data-result-id="${CSS.escape(String(repair.resultId || ''))}"]`);
+        card?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+        card?.querySelector('button')?.focus?.();
+      }, 0);
+    });
+  }
+}
+
+async function loadEngineeringRepairs(token = engineeringBindingToken()) {
+  const el = document.getElementById('engineering-repairs');
+  if (!el || !token || !window.codex?.listEngineeringRepairs) return;
+  const response = await window.codex.listEngineeringRepairs({ projectBindingId: token, limit: 50 }).catch(() => null);
+  if (!response?.ok) { el.innerHTML = `<div class="work-card-error">${escapeHtml(response?.error || '修复历史读取失败')}</div>`; return; }
+  const persistence = response.persistence?.persistence === 'memory'
+    ? '<div class="work-card-notice">修复历史仅保留在当前进程，未写入明文文件。</div>'
+    : response.persistence?.corrupt
+      ? '<div class="work-card-error">修复加密存储已损坏，原文件保留且不会覆盖。</div>'
+      : response.persistence?.error ? '<div class="work-card-notice">修复历史持久化暂不可用，当前结果仍可审阅。</div>' : '';
+  const repairs = response.repairs || [];
+  el.innerHTML = persistence + (repairs.length ? repairs.map((repair) => {
+    const active = ['queued', 'preparing', 'generating', 'collecting'].includes(repair.status);
+    const validation = repair.validation || {};
+    const validationLabel = repair.resultId ? ` · 验证 ${engineeringValidationStatusText(validation.status)}` : '';
+    const actions = active
+      ? `<button type="button" class="ghost-btn" data-repair-cancel="${escapeHtml(repair.repairRef)}">取消</button>`
+      : `<button type="button" class="ghost-btn" data-repair-view="${escapeHtml(repair.repairRef)}">查看</button>${repair.resultId && validation.status === 'running' ? `<button type="button" class="ghost-btn" data-repair-validate-cancel="${escapeHtml(repair.repairRef)}">取消验证</button>` : repair.resultId ? `<button type="button" class="ghost-btn" data-repair-validate="${escapeHtml(repair.repairRef)}">验证</button>` : ''}<button type="button" class="ghost-btn" data-repair-retry="${escapeHtml(repair.repairRef)}">重试</button>`;
+    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>隔离修复建议</strong><div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · <span class="badge ${escapeHtml(repair.status || '')}">${escapeHtml(engineeringRepairStatusText(repair.status))}</span>${validationLabel} · ${escapeHtml(repair.createdAt || '')}</div>${repair.diagnosticCount ? `<div class="work-card-meta">来源诊断 ${repair.diagnosticCount} 条${repair.outputExcerpted ? ' · 含输出摘录' : ''}</div>` : ''}${repair.errorCode ? `<div class="work-card-notice">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : ''}</div><div class="work-card-actions">${actions}</div></div>`;
+  }).join('') : '<div class="work-empty">暂无隔离修复建议</div>');
+  el.querySelectorAll('[data-repair-view]').forEach((button) => button.addEventListener('click', () => showEngineeringRepair(token, button.dataset.repairView)));
+  el.querySelectorAll('[data-repair-cancel]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.cancelEngineeringRepair({ projectBindingId: token, repairRef: button.dataset.repairCancel }); if (!result?.ok) toast(result?.error || '取消修复失败'); await loadEngineeringRepairs(token); }));
+  el.querySelectorAll('[data-repair-retry]').forEach((button) => button.addEventListener('click', async () => {
+    const note = await appPrompt('可选：本次重试的补充说明', '', '重试隔离修复'); if (note == null) return;
+    const result = await window.codex.retryEngineeringRepair({ projectBindingId: token, repairRef: button.dataset.repairRetry, note, sessionId: activeSessionId });
+    if (!result?.ok) toast(result?.error || '重试修复失败'); else toast('修复已重新排队');
+    await loadEngineeringRepairs(token);
+  }));
+  el.querySelectorAll('[data-repair-validate]').forEach((button) => button.addEventListener('click', async () => {
+    const result = await window.codex.validateEngineeringRepair({ projectBindingId: token, repairRef: button.dataset.repairValidate, sessionId: activeSessionId });
+    if (!result?.ok) toast(result?.error || '启动隔离验证失败'); else toast('隔离验证已启动');
+    await loadEngineeringRepairs(token);
+  }));
+  el.querySelectorAll('[data-repair-validate-cancel]').forEach((button) => button.addEventListener('click', async () => {
+    const result = await window.codex.cancelEngineeringRepairValidation({ projectBindingId: token, repairRef: button.dataset.repairValidateCancel });
+    if (!result?.ok) toast(result?.error || '取消隔离验证失败'); else toast('已请求取消隔离验证');
+    await loadEngineeringRepairs(token);
+  }));
+}
 
 function engineeringIndexStateText(state) {
   const key = String(state || '');
@@ -2298,8 +2418,11 @@ async function renderEngineeringCenter() {
   const terminalNotice = settings && !settings.terminalEnabled
     ? '<div class="work-card-notice">验证作业需要在设置中开启「允许终端命令」后才能启动。</div>'
     : '';
-  body.innerHTML = '<section class="engineering-section"><div class="work-card-title">代码索引</div><div id="engineering-index-status" class="work-card-meta">读取中…</div><div class="work-card-meta">词法索引只提供近似定位，不做语义解析。</div><div class="work-card-actions"><button type="button" class="ghost-btn" id="engineering-index-rebuild">重建</button><button type="button" class="ghost-btn" id="engineering-index-clear">清除</button></div><div class="engineering-search"><select id="engineering-search-mode"><option value="definitions">定义</option><option value="references">引用</option><option value="text">文本</option></select><input id="engineering-search-query" type="search" maxlength="256" placeholder="搜索符号或文本" /><button type="button" class="ghost-btn" id="engineering-search-run">搜索</button></div><div id="engineering-search-results"></div></section><section class="engineering-section"><div class="work-card-title">验证档案</div>' + terminalNotice + '<div id="engineering-approval" class="engineering-job-detail hidden"></div><div id="engineering-profiles">读取中…</div></section><section class="engineering-section"><div class="work-card-title">工程工作流</div><div id="engineering-workflows">读取中…</div><div id="engineering-workflow-runs">读取中…</div><div id="engineering-workflow-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">验证作业</div><div id="engineering-jobs">读取中…</div><div id="engineering-job-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">MCP Tasks</div><div id="engineering-mcp-tasks"></div></section>';
-  if (engineeringPendingApproval) renderEngineeringApprovalCard(engineeringPendingApproval);
+  body.innerHTML = '<section class="engineering-section"><div class="work-card-title">代码索引</div><div id="engineering-index-status" class="work-card-meta">读取中…</div><div class="work-card-meta">词法索引只提供近似定位，不做语义解析。</div><div class="work-card-actions"><button type="button" class="ghost-btn" id="engineering-index-rebuild">重建</button><button type="button" class="ghost-btn" id="engineering-index-clear">清除</button></div><div class="engineering-search"><select id="engineering-search-mode"><option value="definitions">定义</option><option value="references">引用</option><option value="text">文本</option></select><input id="engineering-search-query" type="search" maxlength="256" placeholder="搜索符号或文本" /><button type="button" class="ghost-btn" id="engineering-search-run">搜索</button></div><div id="engineering-search-results"></div></section><section class="engineering-section"><div class="work-card-title">验证档案</div>' + terminalNotice + '<div id="engineering-approval" class="engineering-job-detail hidden"></div><div id="engineering-profiles">读取中…</div></section><section class="engineering-section"><div class="work-card-title">工程工作流</div><div id="engineering-workflows">读取中…</div><div id="engineering-workflow-runs">读取中…</div><div id="engineering-workflow-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">验证作业</div><div id="engineering-jobs">读取中…</div><div id="engineering-job-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">隔离修复建议</div><div id="engineering-repairs">读取中…</div><div id="engineering-repair-detail" class="engineering-job-detail hidden"></div></section><section class="engineering-section"><div class="work-card-title">MCP Tasks</div><div id="engineering-mcp-tasks"></div></section>';
+  if (engineeringPendingApproval) {
+    if (engineeringPendingApproval.source === 'repair') renderEngineeringRepairApprovalCard(engineeringPendingApproval);
+    else renderEngineeringApprovalCard(engineeringPendingApproval);
+  }
   const refresh = () => refreshEngineeringIndexStatus(token);
   document.getElementById('engineering-index-rebuild')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexRebuild({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引重建失败'); await refresh(); });
   document.getElementById('engineering-index-clear')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexClear({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引清除失败'); await refresh(); });
@@ -2318,6 +2441,7 @@ async function renderEngineeringCenter() {
   await loadEngineeringProfiles(token);
   await loadEngineeringWorkflows(token);
   await loadEngineeringJobs(token);
+  await loadEngineeringRepairs(token);
   renderMcpTaskCenter();
 }
 
@@ -2326,12 +2450,14 @@ async function loadEngineeringJobs(token = engineeringBindingToken()) {
   el.innerHTML = jobs.length ? jobs.map((j) => {
     const active = j.status === 'running' || j.status === 'queued';
     const notices = [j.status === 'stale' ? '工作区在验证期间发生变化' : '', j.status === 'interrupted' ? '应用退出时未完成' : '', j.outputTruncated ? '输出已截断' : '', j.diagnosticsTruncated ? '诊断已截断' : '', j.diagnosticCount ? `诊断 ${j.diagnosticCount} 条` : ''].filter(Boolean).join(' · ');
-    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(j.profileName || j.profileId || '验证')}</strong><div class="work-card-meta"><code>${escapeHtml(j.jobRef)}</code> · <span class="badge ${escapeHtml(j.status || '')}">${escapeHtml(engineeringStatusText(j.status))}</span>${Number.isFinite(j.exitCode) ? ` · 退出码 ${j.exitCode}` : ''} · ${escapeHtml(j.finishedAt || j.startedAt || j.createdAt || '')}</div>${notices ? `<div class="work-card-notice">${escapeHtml(notices)}</div>` : ''}</div><div class="work-card-actions">${active ? `<button type="button" class="ghost-btn" data-vfy-cancel="${escapeHtml(j.jobRef)}">取消</button>` : `<button type="button" class="ghost-btn" data-vfy-view="${escapeHtml(j.jobRef)}">查看结果</button><button type="button" class="ghost-btn" data-vfy-copy="${escapeHtml(j.jobRef)}">复制摘要</button><button type="button" class="ghost-btn" data-vfy-rerun="${escapeHtml(j.jobRef)}">重跑</button>`}</div></div>`;
+    const repairButton = j.status === 'failed' ? `<button type="button" class="ghost-btn" data-vfy-repair="${escapeHtml(j.jobRef)}">生成修复</button>` : '';
+    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(j.profileName || j.profileId || '验证')}</strong><div class="work-card-meta"><code>${escapeHtml(j.jobRef)}</code> · <span class="badge ${escapeHtml(j.status || '')}">${escapeHtml(engineeringStatusText(j.status))}</span>${Number.isFinite(j.exitCode) ? ` · 退出码 ${j.exitCode}` : ''} · ${escapeHtml(j.finishedAt || j.startedAt || j.createdAt || '')}</div>${notices ? `<div class="work-card-notice">${escapeHtml(notices)}</div>` : ''}</div><div class="work-card-actions">${active ? `<button type="button" class="ghost-btn" data-vfy-cancel="${escapeHtml(j.jobRef)}">取消</button>` : `<button type="button" class="ghost-btn" data-vfy-view="${escapeHtml(j.jobRef)}">查看结果</button><button type="button" class="ghost-btn" data-vfy-copy="${escapeHtml(j.jobRef)}">复制摘要</button><button type="button" class="ghost-btn" data-vfy-rerun="${escapeHtml(j.jobRef)}">重跑</button>${repairButton}`}</div></div>`;
   }).join('') : '<div class="work-empty">暂无验证作业</div>';
   el.querySelectorAll('[data-vfy-cancel]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.cancelVerification({ projectBindingId: token, jobRef: button.dataset.vfyCancel }); if (!result?.ok) toast(result?.error || '取消失败'); await loadEngineeringJobs(token); }));
   el.querySelectorAll('[data-vfy-rerun]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.rerunVerification({ projectBindingId: token, jobRef: button.dataset.vfyRerun }); if (!result?.ok) toast(result?.error || '重跑失败'); else toast('验证已重新排队'); await loadEngineeringJobs(token); }));
   el.querySelectorAll('[data-vfy-view]').forEach((button) => button.addEventListener('click', () => showEngineeringJobResult(token, button.dataset.vfyView)));
   el.querySelectorAll('[data-vfy-copy]').forEach((button) => button.addEventListener('click', () => copyEngineeringSummary(token, button.dataset.vfyCopy)));
+  el.querySelectorAll('[data-vfy-repair]').forEach((button) => button.addEventListener('click', () => beginEngineeringRepair(token, { kind: 'verification', jobRef: button.dataset.vfyRepair })));
 }
 
 async function loadMcpTasks() {
@@ -2829,11 +2955,12 @@ async function showEngineeringWorkflowResult(token, workflowRunRef) {
     `<div class="engineering-detail-title">${escapeHtml(run.workflowName || run.workflowId || '工作流')} · ${escapeHtml(engineeringStatusText(run.status))}</div>`,
     `<div class="work-card-meta"><code>${escapeHtml(run.workflowRunRef)}</code> · ${run.passedCount || 0}/${run.nodeCount || 0} 节点通过 · ${escapeHtml(run.finishedAt || run.startedAt || run.createdAt || '')}</div>`,
     notices ? `<div class="work-card-notice">${escapeHtml(notices)}</div>` : '',
-    `<div class="engineering-workflow-node-results">${(run.nodes || []).map((node) => `<div class="engineering-workflow-node-result"><div><strong>${escapeHtml(node.nodeId)}</strong><span class="badge ${escapeHtml(node.status || '')}">${escapeHtml(engineeringStatusText(node.status))}</span><div class="work-card-meta">依赖：${escapeHtml((node.dependsOn || []).join(', ') || '无')}${node.diagnosticCount ? ` · 诊断 ${node.diagnosticCount} 条` : ''}${Number.isFinite(node.exitCode) ? ` · 退出码 ${node.exitCode}` : ''}</div>${node.statusMessage ? `<div class="work-card-notice">${escapeHtml(node.statusMessage)}</div>` : ''}</div>${node.jobRef ? `<button type="button" class="ghost-btn" data-workflow-job="${escapeHtml(node.jobRef)}">查看节点结果</button>` : ''}</div>`).join('')}</div>`,
+    `<div class="engineering-workflow-node-results">${(run.nodes || []).map((node) => `<div class="engineering-workflow-node-result"><div><strong>${escapeHtml(node.nodeId)}</strong><span class="badge ${escapeHtml(node.status || '')}">${escapeHtml(engineeringStatusText(node.status))}</span><div class="work-card-meta">依赖：${escapeHtml((node.dependsOn || []).join(', ') || '无')}${node.diagnosticCount ? ` · 诊断 ${node.diagnosticCount} 条` : ''}${Number.isFinite(node.exitCode) ? ` · 退出码 ${node.exitCode}` : ''}</div>${node.statusMessage ? `<div class="work-card-notice">${escapeHtml(node.statusMessage)}</div>` : ''}</div>${node.jobRef ? `<button type="button" class="ghost-btn" data-workflow-job="${escapeHtml(node.jobRef)}">查看节点结果</button>${node.status === 'failed' ? `<button type="button" class="ghost-btn" data-workflow-repair-node="${escapeHtml(node.nodeId)}">生成修复</button>` : ''}` : ''}</div>`).join('')}</div>`,
     '<div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-workflow-close-detail">关闭</button></div>',
   ].join('');
   detail.classList.remove('hidden');
   detail.querySelectorAll('[data-workflow-job]').forEach((button) => button.addEventListener('click', () => showEngineeringJobResult(token, button.dataset.workflowJob, 'engineering-workflow-detail')));
+  detail.querySelectorAll('[data-workflow-repair-node]').forEach((button) => button.addEventListener('click', () => beginEngineeringRepair(token, { kind: 'workflow', workflowRunRef, nodeId: button.dataset.workflowRepairNode })));
   document.getElementById('engineering-workflow-close-detail')?.addEventListener('click', () => {
     detail.classList.add('hidden');
     detail.innerHTML = '';
@@ -5326,6 +5453,7 @@ function boot() {
     const workflowFinished = event?.type === 'engineering:workflow:event' && ['finished', 'interrupted'].includes(event.reason);
     if (currentView === 'scheduled') {
       loadEngineeringJobs().catch(() => {});
+      loadEngineeringRepairs().catch(() => {});
       loadEngineeringWorkflows().catch(() => {});
       refreshEngineeringIndexStatus().catch(() => {});
     } else if (workflowFinished) {
@@ -5336,6 +5464,14 @@ function boot() {
         if (currentView === 'prs') renderPullRequestView();
       }).catch(() => {});
     }
+  });
+  window.codex?.onEngineeringRepairEvent?.((event) => {
+    // The dedicated channel is the authoritative repaint trigger for D13;
+    // the aggregate engineering channel remains for older consumers.
+    if (currentView !== 'scheduled') return;
+    loadEngineeringRepairs().catch(() => {});
+    const project = sessionProject();
+    if (project?.path && event?.resultId) reconcileWorktreeResults(project).catch(() => {});
   });
   loadMcpTasks().catch(() => {});
   setView('chat');

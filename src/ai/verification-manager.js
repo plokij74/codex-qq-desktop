@@ -625,6 +625,20 @@ class VerificationManager {
     return this._owns(job, projectPath) ? jobSummary(job) : null;
   }
 
+  // Main-internal source lookup for D13. This deliberately returns the
+  // authoritative in-memory record only to trusted main-process callers;
+  // renderer-facing get/result continue to use the bounded public shapers.
+  getRepairSource(jobRef, projectPath) {
+    const job = this.jobs.get(String(jobRef || ''));
+    if (!this._owns(job, projectPath)) return null;
+    const profile = this.profiles.get(this._profileKey(projectPath || job.projectPath, job.profileId));
+    return {
+      job,
+      profile: profile ? { ...profile, fingerprint: profileFingerprint(profile) } : null,
+      result: publicJob(job),
+    };
+  }
+
   result(jobRef, projectPath) {
     const job = this.jobs.get(String(jobRef || ''));
     if (!this._owns(job, projectPath)) return { ok: false, code: 'VERIFICATION_JOB_NOT_FOUND', error: '作业不存在' };
@@ -663,6 +677,83 @@ class VerificationManager {
       return { ok: false, code: 'VERIFICATION_PROFILE_CHANGED', error: '验证 profile 已修改或删除，请重新确认' };
     }
     return this.start({ ...options, projectPath, profileId: old.profileId });
+  }
+
+  // Main-internal D13 entry point. It deliberately bypasses the normal job
+  // queue/history/event path and only executes an already persisted profile
+  // against the caller-provided isolated checkout.
+  async runFrozenProfile(options = {}) {
+    const originalRoot = canonicalProjectPath(options.projectPath || this.root);
+    const executionRoot = canonicalProjectPath(options.executionRoot);
+    if (!originalRoot || !executionRoot) throw codeError('VERIFICATION_PROFILE_INVALID', '验证目录无效');
+    let profile;
+    try { profile = this._findProfile(originalRoot, options.profileId); } catch (error) { throw error; }
+    const fingerprint = profileFingerprint(profile);
+    if (String(options.expectedFingerprint || '') !== fingerprint) throw codeError('REPAIR_PROFILE_CHANGED', '验证 profile 已修改');
+    if (options.settings?.terminalEnabled !== true) throw codeError('REPAIR_TERMINAL_DISABLED', '终端未启用');
+    let cwdResolved;
+    try {
+      cwdResolved = this.fs.realpathSync(path.resolve(executionRoot, profile.cwd));
+      const rel = path.relative(executionRoot, cwdResolved);
+      if (rel.startsWith('..') || path.isAbsolute(rel) || !this.fs.statSync(cwdResolved).isDirectory()) throw new Error('unsafe cwd');
+    } catch { throw codeError('VERIFICATION_PROFILE_INVALID', '隔离验证 cwd 无效'); }
+
+    let stdout = '';
+    let stderr = '';
+    let outputTruncated = false;
+    const append = (stream, chunk) => {
+      const next = redact(`${stream === 'stdout' ? stdout : stderr}${String(chunk || '')}`, executionRoot);
+      if (stream === 'stdout') stdout = next.text;
+      else stderr = next.text;
+      outputTruncated ||= next.truncated;
+    };
+    let before = '';
+    let after = '';
+    try { before = workspaceFingerprint(executionRoot); } catch { before = ''; }
+    let result;
+    let internalError = false;
+    try {
+      result = await this.runTerminal(executionRoot, profile.command, {
+        cwd: cwdResolved,
+        timeoutMs: profile.timeoutMs,
+        signal: options.signal,
+        onStdout: (chunk) => append('stdout', chunk),
+        onStderr: (chunk) => append('stderr', chunk),
+      });
+    } catch (error) {
+      internalError = true;
+      result = { ok: false, code: -1, stderr: clean(error?.message || error, 1000) };
+    }
+    if (!stdout && result?.stdout) append('stdout', result.stdout);
+    if (!stderr && result?.stderr) append('stderr', result.stderr);
+    try { after = workspaceFingerprint(executionRoot); } catch { after = ''; }
+    const workspaceChanged = !before || !after || before !== after;
+    const timedOut = result?.timedOut === true;
+    let status = 'failed';
+    if (options.signal?.aborted || result?.aborted) status = 'cancelled';
+    else if (timedOut) status = 'timed_out';
+    else if (workspaceChanged) status = 'stale';
+    else if (internalError) status = 'error';
+    else if (result?.ok) status = 'passed';
+    const parsed = ['failed', 'stale', 'timed_out', 'error'].includes(status)
+      ? parseDiagnostics(`${stdout}\n${stderr}`, { projectRoot: executionRoot })
+      : { diagnostics: [], truncated: false };
+    return {
+      ok: status === 'passed',
+      status,
+      exitCode: Number.isFinite(result?.code) ? result.code : -1,
+      timedOut,
+      workspaceChanged,
+      workspaceFingerprintStart: before,
+      workspaceFingerprintEnd: after,
+      stdout,
+      stderr,
+      diagnostics: parsed.diagnostics.slice(0, MAX_DIAGNOSTICS),
+      diagnosticsTruncated: parsed.truncated,
+      outputTruncated,
+      errorCode: status === 'stale' ? 'REPAIR_PATCH_CHANGED' : undefined,
+      statusMessage: status === 'passed' ? undefined : status === 'cancelled' ? '验证已取消' : status === 'timed_out' ? '验证超时' : status === 'stale' ? '验证期间隔离工作区发生变化' : status === 'error' ? '验证执行失败' : '验证命令失败',
+    };
   }
 
   close() {

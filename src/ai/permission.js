@@ -9,10 +9,12 @@ const READ_TOOLS = new Set([
   'code_index_status', 'code_index_search', 'verification_profiles',
   'verification_get', 'verification_result',
   'engineering_workflows', 'workflow_get', 'workflow_result',
+  'engineering_repairs', 'repair_get', 'repair_result',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit', 'spawn_implement', 'run_skill',
   'remember', 'forget',
+  'repair_start', 'repair_cancel',
 ]);
 
 /**
@@ -35,6 +37,7 @@ function riskForTool(toolName) {
   if (name === 'run_terminal') return 'terminal';
   if (name === 'verification_start') return 'terminal';
   if (name === 'workflow_start' || name === 'workflow_cancel') return 'terminal';
+  if (name === 'repair_start' || name === 'repair_cancel') return 'write';
   return 'write';
 }
 

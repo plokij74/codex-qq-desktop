@@ -406,6 +406,13 @@ class WorkflowManager {
   listRuns(projectPath, limit = 50) { const root = canonicalProjectPath(projectPath); if (!root) return error('WORKFLOW_PROJECT_BINDING_INVALID', '项目绑定无效'); return { ok: true, runs: [...this.runs.values()].filter((run) => run.projectKey === projectKey(root)).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, Math.min(200, Number(limit) || 50)).map((run) => publicRun(run, false)) }; }
   list(projectPath, limit = 50) { return this.listRuns(projectPath, limit); }
   getRun(projectPath, ref) { const root = canonicalProjectPath(projectPath); const run = validWorkflowRunRef(ref) ? this.runs.get(ref) : null; return run && run.projectKey === projectKey(root) ? { ok: true, run: publicRun(run) } : error('WORKFLOW_RUN_NOT_FOUND', 'workflow run 不存在'); }
+  // Main-internal D13 lookup. Keep authoritative node/profile fingerprints and
+  // the frozen workspace fields available without widening the public run API.
+  getRunForRepair(projectPath, ref) {
+    const root = canonicalProjectPath(projectPath);
+    const run = validWorkflowRunRef(ref) ? this.runs.get(ref) : null;
+    return run && run.projectKey === projectKey(root) ? run : null;
+  }
   get(projectPath, ref) { return this.getRun(projectPath, ref); }
   result(projectPath, ref) { return this.getRun(projectPath, ref); }
   getResult(projectPath, ref) { return this.result(projectPath, ref); }

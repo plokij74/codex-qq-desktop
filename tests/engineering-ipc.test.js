@@ -345,4 +345,103 @@ describe('D11 engineering IPC boundary', () => {
       handlers.close();
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
+
+  it('routes D13 repair channels through sender bindings and rejects forged source fields', async () => {
+    const root = tempProject();
+    let storedProfiles = [];
+    try {
+      const handlers = createEngineeringIpcHandlers({
+        getProfiles: () => storedProfiles,
+        setProfiles: (_root, profiles) => { storedProfiles = profiles; },
+        getSettings: () => ({ terminalEnabled: true, permissionMode: 'full-auto' }),
+        createPermissionGate: () => ({ authorize: async () => ({ allowed: true, decision: 'allow_session' }) }),
+        runTerminal: async () => ({ ok: false, code: 1, stdout: 'failure', stderr: '' }),
+        subagentRuntime: {
+          runIsolatedImplement: async () => ({ ok: true, terminalReason: 'completed', result: { id: 'wt_ipc01', changed: false } }),
+        },
+      });
+      const owner = event(31);
+      const token = handlers.bind(owner, { projectPath: root, projectBindingId: makeToken('31') });
+      const profile = await handlers.saveProfile(owner, { projectBindingId: token.projectBindingId, profile: { name: 'Repair source', kind: 'test', command: 'node -e "process.exit(1)"', cwd: '.', timeoutMs: 30000, enabled: true } });
+      const failed = await handlers.run(owner, { projectBindingId: token.projectBindingId, profileId: profile.profile.id });
+      assert.equal(failed.ok, true);
+      let failedJob;
+      for (let i = 0; i < 100; i += 1) {
+        const jobs = await handlers.list(owner, { projectBindingId: token.projectBindingId, limit: 10 });
+        failedJob = jobs.jobs?.find((job) => job.jobRef === failed.job.jobRef);
+        if (failedJob?.status === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(failedJob?.status, 'failed');
+      const started = await handlers.repairStart(owner, {
+        projectBindingId: token.projectBindingId,
+        source: { kind: 'verification', jobRef: failed.job.jobRef, command: 'forged', projectPath: 'D:/forged' },
+        note: 'user note', sessionId: 'session-31',
+      });
+      assert.equal(started.ok, false);
+      assert.equal(started.code, 'REPAIR_SOURCE_INVALID');
+
+      const valid = await handlers.repairStart(owner, {
+        projectBindingId: token.projectBindingId,
+        source: { kind: 'verification', jobRef: failed.job.jobRef },
+        note: 'user note', sessionId: 'session-31',
+      });
+      assert.equal(valid.ok, true, JSON.stringify(valid));
+      assert.match(valid.repairRef, /^rpr_[a-f0-9]{24}$/);
+      const foreign = await handlers.repairGet(event(32), { projectBindingId: token.projectBindingId, repairRef: valid.repairRef });
+      assert.equal(foreign.code, 'ENGINEERING_PROJECT_BINDING_INVALID');
+      const listed = await handlers.repairList(owner, { projectBindingId: token.projectBindingId, limit: 10 });
+      assert.equal(listed.ok, true);
+      assert.equal(listed.repairs[0].repairRef, valid.repairRef);
+      const result = await handlers.repairResult(owner, { projectBindingId: token.projectBindingId, repairRef: valid.repairRef });
+      assert.equal(result.ok, true);
+      assert.equal(result.repair.note, undefined);
+      assert.equal(result.repair.prompt, undefined);
+      handlers.close();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('limits Agent repair cancellation to the creating run owner', async () => {
+    const root = tempProject();
+    let storedProfiles = [];
+    let entered;
+    const enteredPromise = new Promise((resolve) => { entered = resolve; });
+    try {
+      const handlers = createEngineeringIpcHandlers({
+        getProfiles: () => storedProfiles,
+        setProfiles: (_root, profiles) => { storedProfiles = profiles; },
+        getSettings: () => ({ terminalEnabled: true, permissionMode: 'full-auto' }),
+        createPermissionGate: () => ({ authorize: async () => ({ allowed: true, decision: 'allow_session' }) }),
+        runTerminal: async () => ({ ok: false, code: 1, stdout: '', stderr: '' }),
+        subagentRuntime: {
+          runIsolatedImplement: async ({ signal }) => new Promise((resolve) => {
+            entered();
+            signal.addEventListener('abort', () => resolve({ ok: true, terminalReason: 'aborted', incomplete: true, result: { id: 'wt_ipc02', changed: true } }), { once: true });
+          }),
+        },
+      });
+      const owner = event(33);
+      const token = handlers.bind(owner, { projectPath: root, projectBindingId: makeToken('33') });
+      const profile = await handlers.saveProfile(owner, { projectBindingId: token.projectBindingId, profile: { name: 'Repair owner', kind: 'test', command: 'node -e "process.exit(1)"', cwd: '.', timeoutMs: 30000, enabled: true } });
+      const failed = await handlers.run(owner, { projectBindingId: token.projectBindingId, profileId: profile.profile.id });
+      let failedJob;
+      for (let i = 0; i < 100; i += 1) {
+        const jobs = await handlers.list(owner, { projectBindingId: token.projectBindingId, limit: 10 });
+        failedJob = jobs.jobs?.find((job) => job.jobRef === failed.job.jobRef);
+        if (failedJob?.status === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const agentStart = handlers.repairStartForAgent(root, { source: { kind: 'verification', jobRef: failed.job.jobRef } }, { agentRunId: 'run-a', ownerId: 33 });
+      await enteredPromise;
+      const repairList = await handlers.repairListForAgent(root, 10);
+      const repairRef = repairList.repairs[0].repairRef;
+      const foreign = await handlers.repairCancelForAgent(root, repairRef, { agentRunId: 'run-b' });
+      assert.equal(foreign.ok, false);
+      assert.equal(foreign.code, 'REPAIR_CANCEL_FAILED');
+      const own = await handlers.repairCancelForAgent(root, repairRef, { agentRunId: 'run-a' });
+      assert.equal(own.ok, true);
+      await agentStart;
+      handlers.close();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 });

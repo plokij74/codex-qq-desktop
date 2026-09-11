@@ -288,6 +288,52 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'engineering_repairs',
+      description: 'List bounded repair attempts for the current project.',
+      parameters: { type: 'object', properties: { limit: { type: 'integer' } } },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'repair_get',
+      description: 'Read one bounded repair attempt by opaque repairRef.',
+      parameters: { type: 'object', properties: { repairRef: { type: 'string' } }, required: ['repairRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'repair_result',
+      description: 'Read a bounded repair result and recent advisory validation summary.',
+      parameters: { type: 'object', properties: { repairRef: { type: 'string' } }, required: ['repairRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'repair_start',
+      description: 'Request one isolated repair attempt from a failed verification job or workflow node.',
+      parameters: {
+        type: 'object',
+        properties: {
+          jobRef: { type: 'string' }, workflowRunRef: { type: 'string' },
+          nodeId: { type: 'string' }, note: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'repair_cancel',
+      description: 'Cancel an active repair attempt started by this Agent run.',
+      parameters: { type: 'object', properties: { repairRef: { type: 'string' } }, required: ['repairRef'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'git_commit',
       description: 'Stage optional paths and create a git commit. Does not push. Does not git add -A unless paths listed.',
       parameters: {
@@ -691,6 +737,9 @@ function toolDetail(name, args) {
   if (name === 'verification_get' || name === 'verification_result') return `job=${String(args.jobRef || '').slice(0, 80)}`;
   if (name === 'workflow_start') return `workflow=${String(args.workflowId || '').slice(0, 80)}`;
   if (name === 'workflow_get' || name === 'workflow_result' || name === 'workflow_cancel') return `run=${String(args.workflowRunRef || '').slice(0, 80)}`;
+  if (name === 'engineering_repairs') return `repairs limit=${String(args.limit || '')}`;
+  if (name === 'repair_get' || name === 'repair_result' || name === 'repair_cancel') return `repair=${String(args.repairRef || '').slice(0, 80)}`;
+  if (name === 'repair_start') return args.jobRef ? `repair from job=${String(args.jobRef).slice(0, 80)}` : `repair from run=${String(args.workflowRunRef || '').slice(0, 80)} node=${String(args.nodeId || '').slice(0, 60)}`;
   try {
     return JSON.stringify(args).slice(0, 2000);
   } catch {
@@ -720,6 +769,9 @@ function summarizeToolResult(name, parsed) {
   if (name === 'engineering_workflows') return `workflows=${(parsed.workflows && parsed.workflows.length) || 0}`;
   if (name === 'workflow_start') return parsed.workflowRunRef ? `run ${parsed.workflowRunRef}` : (parsed.error || 'workflow');
   if (name === 'workflow_get' || name === 'workflow_result' || name === 'workflow_cancel') return parsed.status || parsed.run?.status || 'workflow';
+  if (name === 'engineering_repairs') return `repairs=${(parsed.repairs && parsed.repairs.length) || 0}`;
+  if (name === 'repair_start') return parsed.repairRef ? `repair ${parsed.repairRef}` : (parsed.error || 'repair');
+  if (name === 'repair_get' || name === 'repair_result' || name === 'repair_cancel') return parsed.status || parsed.repair?.status || 'repair';
   if (name === 'spawn_explore') {
     if (parsed.ok === false) return parsed.error || 'explore failed';
     return parsed.summary ? String(parsed.summary).slice(0, 120) : `turns=${parsed.turns ?? '?'}`;
@@ -1009,6 +1061,26 @@ async function executeTool(name, args, ctx) {
       const ref = String(args.workflowRunRef || '');
       if (!engineering?.workflowCancelForAgent || !/^wf_run_[a-f0-9]{24}$/.test(ref)) return JSON.stringify({ ok: false, error: 'workflow run 引用无效' });
       return JSON.stringify(await engineering.workflowCancelForAgent(root, ref));
+    }
+    if (name === 'engineering_repairs' || name === 'repair_get' || name === 'repair_result' || name === 'repair_start' || name === 'repair_cancel') {
+      const engineering = ctx.extensions?.engineering;
+      if (!engineering) return JSON.stringify({ ok: false, error: 'repair 管理器不可用' });
+      if (name === 'engineering_repairs') return JSON.stringify(await engineering.repairList(root, Math.min(50, Number(args.limit) || 20)));
+      if (name === 'repair_get' || name === 'repair_result' || name === 'repair_cancel') {
+        const ref = String(args.repairRef || '');
+        if (!/^rpr_[a-f0-9]{24}$/.test(ref)) return JSON.stringify({ ok: false, error: 'repairRef 无效' });
+        const method = name === 'repair_get' ? engineering.repairGet : name === 'repair_result' ? engineering.repairResult : engineering.repairCancelForAgent;
+        if (typeof method !== 'function') return JSON.stringify({ ok: false, error: 'repair 操作不可用' });
+        return JSON.stringify(await method(root, ref, { agentRunId: ctx.runId }));
+      }
+      const jobRef = String(args.jobRef || '');
+      const workflowRunRef = String(args.workflowRunRef || '');
+      const nodeId = String(args.nodeId || '').slice(0, 120);
+      const hasJob = Boolean(jobRef); const hasWorkflow = Boolean(workflowRunRef || nodeId);
+      if ((hasJob && hasWorkflow) || (!hasJob && (!workflowRunRef || !nodeId)) || (hasJob && !/^vfy_job_[a-f0-9]{24}$/.test(jobRef)) || (workflowRunRef && !/^wf_run_[a-f0-9]{24}$/.test(workflowRunRef))) return JSON.stringify({ ok: false, error: 'repair 来源必须是 jobRef 或 workflowRunRef + nodeId' });
+      const source = hasJob ? { kind: 'verification', jobRef } : { kind: 'workflow', workflowRunRef, nodeId };
+      if (typeof engineering.repairStartForAgent !== 'function') return JSON.stringify({ ok: false, error: 'repair start 不可用' });
+      return JSON.stringify(await engineering.repairStartForAgent(root, { source, note: String(args.note || '').slice(0, 2000) }, { ...ctx, agentRunId: ctx.runId }));
     }
     if (name === 'run_terminal') {
       if (!settings.terminalEnabled) {

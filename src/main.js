@@ -72,6 +72,7 @@ const { aggregate } = require('./ai/usage');
 const { createWorktreeManager } = require('./ai/worktree');
 const { createWorktreeIpcHandlers } = require('./ai/worktree-ipc');
 const { createEngineeringIpcHandlers } = require('./ai/engineering-ipc');
+const { createSubagentRuntime } = require('./ai/subagent-runtime');
 const { projectKey } = require('./ai/project-index');
 const {
   usageFilePath,
@@ -145,6 +146,7 @@ const rootTokenRecords = new Map();
 const mcpProjectBySender = new Map();
 
 const worktreeManager = createWorktreeManager();
+const subagentRuntime = createSubagentRuntime({ runLoop: runAgentLoop, worktreeManager });
 const worktreeIpc = createWorktreeIpcHandlers({
   manager: worktreeManager,
   checkWorkflowGate: (event, payload) => getEngineeringIpc().workflowGateCheck(event, payload),
@@ -167,6 +169,8 @@ function getEngineeringIpc() {
     resolveBinding: (event, payload) => worktreeIpc.resolveBinding(event, payload),
     userDataPath: userDataPath(),
     safeStorage,
+    worktreeManager,
+    subagentRuntime,
     runTerminal,
     indexStorePathFor: (projectPath) => path.join(userDataPath(), `engineering-index-${crypto.createHash('sha256').update(path.resolve(projectPath)).digest('hex').slice(0, 16)}.json`),
     isIndexEnabled: () => loadSettings(userDataPath()).codeIndexEnabled !== false,
@@ -188,18 +192,32 @@ function getEngineeringIpc() {
       });
     },
     getSettings: () => loadSettings(userDataPath()),
+    isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
     createPermissionGate: (event, settings) => createPermissionGate({
       permissionMode: PERMISSION_MODES.has(settings.permissionMode) ? settings.permissionMode : 'confirm-writes',
       terminalEnabled: settings.terminalEnabled === true,
       terminalRequireConfirm: true,
       onApprovalNeeded: async (approval) => {
-        safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.APPROVAL_NEEDED, source: 'verification', runId: null, ...approval });
+        const source = approval?.source || (approval?.tool === 'verification_start' ? 'verification' : undefined);
+        safeSend(event.sender, 'chat:event', {
+          type: AGENT_EVENTS.APPROVAL_NEEDED,
+          runId: null,
+          ...approval,
+          ...(source ? { source } : {}),
+        });
       },
     }),
     onEvent: (event, ownerIds = []) => {
       const owners = new Set(ownerIds);
       for (const win of BrowserWindow.getAllWindows()) {
-        if (owners.has(win.webContents.id)) safeSend(win.webContents, 'engineering:event', event);
+        if (!owners.has(win.webContents.id)) continue;
+        // Keep the aggregate engineering channel for existing consumers and
+        // also expose the D13-specific channel so repair events never need to
+        // share the ordinary verification/workflow event contract.
+        safeSend(win.webContents, 'engineering:event', event);
+        if (event?.type === 'engineering:repair:event') {
+          safeSend(win.webContents, 'engineering:repair:event', event);
+        }
       }
     },
   });
@@ -1283,6 +1301,14 @@ ipcMain.handle('engineering:workflow:result', async (event, payload = {}) => get
 ipcMain.handle('engineering:workflow:cancel', async (event, payload = {}) => getEngineeringIpc().workflowCancel(event, payload));
 ipcMain.handle('engineering:workflow:rerun', async (event, payload = {}) => getEngineeringIpc().workflowRerun(event, payload));
 ipcMain.handle('engineering:workflow:gate-check', async (event, payload = {}) => getEngineeringIpc().workflowGateCheck(event, payload));
+ipcMain.handle('engineering:repair:list', async (event, payload = {}) => getEngineeringIpc().repairList(event, payload));
+ipcMain.handle('engineering:repair:get', async (event, payload = {}) => getEngineeringIpc().repairGet(event, payload));
+ipcMain.handle('engineering:repair:result', async (event, payload = {}) => getEngineeringIpc().repairResult(event, payload));
+ipcMain.handle('engineering:repair:start', async (event, payload = {}) => getEngineeringIpc().repairStart(event, payload));
+ipcMain.handle('engineering:repair:retry', async (event, payload = {}) => getEngineeringIpc().repairRetry(event, payload));
+ipcMain.handle('engineering:repair:cancel', async (event, payload = {}) => getEngineeringIpc().repairCancel(event, payload));
+ipcMain.handle('engineering:repair:validate', async (event, payload = {}) => getEngineeringIpc().repairValidate(event, payload));
+ipcMain.handle('engineering:repair:validate-cancel', async (event, payload = {}) => getEngineeringIpc().repairValidateCancel(event, payload));
 
 ipcMain.handle('dialog:selectDirectory', async () => {
   const win = BrowserWindow.getFocusedWindow();
@@ -1591,11 +1617,11 @@ async function startChatRun(event, payload = {}, opts = {}) {
         runId,
         ...approvalPayload,
       };
-      // Agent verification_start shares the chat gate for authorization,
-      // but its approval belongs to the ephemeral engineering panel. Keep
-      // ordinary chat approvals source-less so they remain on chatRun.
-      if (approvalPayload.tool === 'verification_start') approvalEvent.source = 'verification';
-      else if (approvalPayload.source) approvalEvent.source = approvalPayload.source;
+      // Engineering callers can explicitly route approvals (for example,
+      // repair validation); ordinary verification still uses its own panel.
+      // Keep ordinary chat approvals source-less so they remain on chatRun.
+      if (approvalPayload.source) approvalEvent.source = approvalPayload.source;
+      else if (approvalPayload.tool === 'verification_start') approvalEvent.source = 'verification';
       safeSend(sender, 'chat:event', approvalEvent);
     },
   });
@@ -1763,6 +1789,21 @@ async function startChatRun(event, payload = {}, opts = {}) {
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
         workflowCancelForAgent: (root, workflowRunRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
           ? getEngineeringIpc().workflowCancelForAgent(engineeringRoot, workflowRunRef, { agentRunId: runId })
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        repairList: (root, limit) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().repairListForAgent(engineeringRoot, limit)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        repairGet: (root, repairRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().repairGetForAgent(engineeringRoot, repairRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        repairResult: (root, repairRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().repairResultForAgent(engineeringRoot, repairRef)
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        repairStartForAgent: (root, payload, ctx) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().repairStartForAgent(engineeringRoot, payload, { ...ctx, ownerId: event.sender.id, agentRunId: runId })
+          : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        repairCancelForAgent: (root, repairRef, ctx) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().repairCancelForAgent(engineeringRoot, repairRef, { ...ctx, agentRunId: runId })
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
       },
     };

@@ -1038,6 +1038,63 @@ function createWorktreeManager(opts = {}) {
     });
   }
 
+  async function restoreValidationCheckout(result, repo) {
+    // Keep this recovery path inside the D5 manager so validation can never
+    // leave tracked/index changes in the repair checkout or touch the main tree.
+    await validateWorktreeMetadata(result, repo);
+    const reset = await git(result.checkout, ['reset', '--hard', result.marker.baseHead]);
+    if (!reset.ok) throw Object.assign(new Error(reset.error || '无法恢复隔离 worktree 基线'), { code: 'REPAIR_PATCH_CHANGED' });
+    const clean = await git(result.checkout, ['clean', '-fd', '--', '.']);
+    if (!clean.ok) throw Object.assign(new Error(clean.error || '无法清理验证临时文件'), { code: 'REPAIR_PATCH_CHANGED' });
+    const applied = await git(result.checkout, ['apply', '--index', '--binary', result.patch]);
+    if (!applied.ok) throw Object.assign(new Error(applied.error || '无法恢复隔离补丁'), { code: 'REPAIR_PATCH_CHANGED' });
+    await validateScopedModes(result.checkout, repo.projectRel);
+    await validateReadyResult(result, repo);
+  }
+
+  async function validateFrozenProfile({ projectPath, resultId, profileId, profileFingerprint, signal, runProfile }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'RESULT_NOT_FOUND', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const result = await resultById(repo.projectRoot, resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+      if (result.marker.state !== 'ready') return worktreeError('REPAIR_RESULT_UNAVAILABLE', '当前隔离结果不可验证');
+      try {
+        await validateReadyResult(result, repo);
+        const expected = result.marker.expectedTree;
+        const beforeTree = await writeTree(result.checkout, undefined, 'REPAIR_PATCH_CHANGED');
+        if (beforeTree !== expected) throw Object.assign(new Error('验证前隔离补丁树不一致'), { code: 'REPAIR_PATCH_CHANGED' });
+        if (typeof runProfile !== 'function') return worktreeError('REPAIR_VALIDATION_UNAVAILABLE', '验证执行器不可用');
+        let output;
+        let runError = null;
+        try {
+          output = await runProfile({
+            projectPath: repo.projectRoot,
+            executionRoot: result.childProjectPath || path.join(result.checkout, repo.projectRel),
+            profileId,
+            expectedFingerprint: profileFingerprint,
+            signal,
+          });
+        } catch (error) { runError = error; }
+        try {
+          await restoreValidationCheckout(result, repo);
+        } catch (error) {
+          return {
+            ok: false,
+            status: signal?.aborted ? 'cancelled' : 'error',
+            errorCode: 'REPAIR_PATCH_CHANGED',
+            statusMessage: '验证期间隔离补丁无法安全恢复，已保留现场',
+            workspaceChanged: true,
+          };
+        }
+        if (runError) throw runError;
+        return output || { ok: false, status: 'error', errorCode: 'REPAIR_VALIDATION_UNAVAILABLE', statusMessage: '验证无结果' };
+      } catch (error) {
+        return worktreeError(error.code || 'REPAIR_PATCH_CHANGED', error.message || '隔离补丁完整性校验失败');
+      }
+    });
+  }
+
   async function get({ projectPath, resultId, preview = false }) {
     let repo;
     try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
@@ -1640,7 +1697,7 @@ function createWorktreeManager(opts = {}) {
   }
 
   return {
-    create, collect, retryCollect, list, recover, get, open, apply, discard, cleanup,
+    create, collect, retryCollect, validateFrozenProfile, list, recover, get, open, apply, discard, cleanup,
     preflightPr, createPr, retryPr, cleanupPr,
     listPrs, getPr, editPr, commentPr, closePr, reopenPr, readyPr, mergePr,
   };

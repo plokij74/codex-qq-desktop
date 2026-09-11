@@ -11,6 +11,8 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'verification_start',
   'workflow_start',
   'workflow_cancel',
+  'repair_start',
+  'repair_cancel',
   'spawn_explore',
   'spawn_explores',
   'spawn_implement',

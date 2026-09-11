@@ -3,6 +3,8 @@
 const { createProjectIndex, canonicalProjectPath, projectKey } = require('./project-index');
 const { createVerificationManager } = require('./verification-manager');
 const { createWorkflowManager, validWorkflowRunRef } = require('./workflow-manager');
+const { createRepairManager } = require('./repair-manager');
+const { isRepairRef } = require('./repair-state');
 
 function error(code, message) {
   return { ok: false, code, error: String(message || code).slice(0, 500) };
@@ -41,6 +43,7 @@ function createEngineeringIpcHandlers(options = {}) {
   const workflowGates = new Map();
   let verification = null;
   let workflows = null;
+  let repairs = null;
 
   const resolve = typeof options.resolveBinding === 'function'
     ? options.resolveBinding
@@ -177,6 +180,28 @@ function createEngineeringIpcHandlers(options = {}) {
     return workflows;
   }
 
+  function getRepairs() {
+    if (!repairs) {
+      repairs = createRepairManager({
+        userDataPath: options.userDataPath,
+        safeStorage: options.safeStorage,
+        verificationManager: getVerification(),
+        workflowManager: getWorkflows(),
+        worktreeManager: options.worktreeManager,
+        subagentRuntime: options.subagentRuntime,
+        runLoop: options.runLoop,
+        getProfiles: options.getProfiles,
+        getSettings: options.getSettings,
+        workspaceFingerprint: options.workspaceFingerprint,
+        onEvent: (event) => {
+          const owners = [...(projectOwners.get(event.projectKey) || [])];
+          if (typeof options.onEvent === 'function') options.onEvent({ ...event }, owners);
+        },
+      });
+    }
+    return repairs;
+  }
+
   function workflowPayload(payload = {}) {
     const raw = payload.workflow && typeof payload.workflow === 'object' && !Array.isArray(payload.workflow) ? payload.workflow : payload;
     return {
@@ -288,6 +313,14 @@ function createEngineeringIpcHandlers(options = {}) {
       else unregisterGate(owner, context.gate);
       return result;
     },
+    repairListForAgent: async (projectPath, limit) => {
+      if (typeof options.isBusy !== 'function' || !options.isBusy()) await getRepairs().restoreAtStartup(projectPath);
+      return getRepairs().list(projectPath, limit);
+    },
+    repairGetForAgent: (projectPath, repairRef) => getRepairs().get(projectPath, repairRef),
+    repairResultForAgent: (projectPath, repairRef) => getRepairs().result(projectPath, repairRef),
+    repairStartForAgent: (projectPath, payload, context = {}) => getRepairs().start(projectPath, payload, context),
+    repairCancelForAgent: (projectPath, repairRef, context = {}) => getRepairs().cancel(projectPath, repairRef, context),
 
     // Standalone/test binding support. Production resolves the worktree-owned
     // token via resolveBinding and never calls this method from preload.
@@ -441,6 +474,51 @@ function createEngineeringIpcHandlers(options = {}) {
       action: ['apply', 'create_pr', 'merge'].includes(payload.action) ? payload.action : undefined,
       expectedFingerprint: payload.expectedFingerprint ? String(payload.expectedFingerprint) : '',
     })),
+    repairList: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      const recovery = typeof options.isBusy === 'function' && options.isBusy()
+        ? { recovery: { ok: true, deferred: true, recovered: 0, warnings: 0 } }
+        : await getRepairs().restoreAtStartup(binding.projectPath);
+      const listed = getRepairs().list(binding.projectPath, payload.limit);
+      return recovery?.recovery && listed?.ok
+        ? { ...listed, recovery: recovery.recovery }
+        : listed;
+    }),
+    repairGet: (event, payload = {}) => withBinding(event, payload, (binding) => {
+      if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      return getRepairs().get(binding.projectPath, String(payload.repairRef));
+    }),
+    repairResult: (event, payload = {}) => withBinding(event, payload, (binding) => {
+      if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      return getRepairs().result(binding.projectPath, String(payload.repairRef));
+    }),
+    repairStart: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      const settings = options.getSettings ? options.getSettings() : {};
+      const context = permissionContext(event, payload, settings);
+      try { return await getRepairs().start(binding.projectPath, { source: payload.source, note: payload.note }, { ...context.options, projectBindingId: payload.projectBindingId }); }
+      finally { unregisterGate(context.owner, context.gate); }
+    }),
+    repairRetry: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      const settings = options.getSettings ? options.getSettings() : {};
+      const context = permissionContext(event, payload, settings);
+      try { return await getRepairs().retry(binding.projectPath, String(payload.repairRef || ''), { note: payload.note }, { ...context.options, projectBindingId: payload.projectBindingId }); }
+      finally { unregisterGate(context.owner, context.gate); }
+    }),
+    repairCancel: (event, payload = {}) => withBinding(event, payload, (binding) => {
+      if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      return getRepairs().cancel(binding.projectPath, String(payload.repairRef), { ownerId: ownerId(event) });
+    }),
+    repairValidate: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      const settings = options.getSettings ? options.getSettings() : {};
+      const context = permissionContext(event, payload, settings);
+      try { return await getRepairs().validate(binding.projectPath, String(payload.repairRef || ''), context.options); }
+      finally { unregisterGate(context.owner, context.gate); }
+    }),
+    repairValidateCancel: (event, payload = {}) => withBinding(event, payload, (binding) => {
+      if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      return getRepairs().validateCancel(binding.projectPath, String(payload.repairRef));
+    }),
 
     syncOwnerBindings: (eventOrId, projectPaths = []) => {
       const owner = typeof eventOrId === 'number' ? eventOrId : ownerId(eventOrId);
@@ -480,18 +558,21 @@ function createEngineeringIpcHandlers(options = {}) {
       const manager = getVerification();
       const jobs = manager.list().jobs || [];
       const workflowState = getWorkflows().restoreAtStartup();
+      const repairState = getRepairs().restoreAtStartup();
       return {
         ok: true,
         persistence: manager.persistenceStatus?.() ?? null,
         interrupted: jobs.filter((job) => job.status === 'interrupted').length,
         jobs: jobs.length,
         workflows: workflowState,
+        repairs: repairState,
       };
     },
     close: () => {
       for (const index of indexes.values()) index.close();
       workflows?.close();
       verification?.close();
+      repairs?.close();
       indexes.clear();
       approvalGates.clear();
       workflowGates.clear();
@@ -501,7 +582,8 @@ function createEngineeringIpcHandlers(options = {}) {
     indexes,
     get verification() { return verification; },
     get workflowManager() { return workflows; },
+    get repairManager() { return repairs; },
   };
 }
 
-module.exports = { createEngineeringIpcHandlers, validBindingId, validJobRef, validProfileId, profilePayload };
+module.exports = { createEngineeringIpcHandlers, validBindingId, validJobRef, validProfileId, isRepairRef, profilePayload };

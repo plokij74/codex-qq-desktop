@@ -185,9 +185,28 @@ contextBridge.exposeInMainWorld('codex', {
   cancelEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:cancel', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || '') }),
   rerunEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:rerun', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), sessionId: String(payload?.sessionId || '') }),
   checkEngineeringWorkflowGate: (payload = {}) => ipcRenderer.invoke('engineering:workflow:gate-check', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), action: String(payload?.action || ''), expectedFingerprint: String(payload?.expectedFingerprint || '') }),
+  listEngineeringRepairs: (payload = {}) => ipcRenderer.invoke('engineering:repair:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),
+  getEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:get', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
+  getEngineeringRepairResult: (payload = {}) => ipcRenderer.invoke('engineering:repair:result', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
+  startEngineeringRepair: (payload = {}) => {
+    const source = payload?.source && typeof payload.source === 'object' ? payload.source : {};
+    const normalizedSource = source.kind === 'verification'
+      ? { kind: 'verification', jobRef: String(source.jobRef || '') }
+      : { kind: 'workflow', workflowRunRef: String(source.workflowRunRef || ''), nodeId: String(source.nodeId || '').slice(0, 120) };
+    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || '') });
+  },
+  retryEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:retry', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || '') }),
+  cancelEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
+  validateEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:validate', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), sessionId: String(payload?.sessionId || '') }),
+  cancelEngineeringRepairValidation: (payload = {}) => ipcRenderer.invoke('engineering:repair:validate-cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
   onEngineeringEvent: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('engineering:event', listener);
     return () => ipcRenderer.removeListener('engineering:event', listener);
+  },
+  onEngineeringRepairEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('engineering:repair:event', listener);
+    return () => ipcRenderer.removeListener('engineering:repair:event', listener);
   },
 });

@@ -57,7 +57,8 @@ describe('D11 renderer engineering center contract', () => {
   it('routes Agent verification approvals to the engineering source', () => {
     const start = main.indexOf('async function startChatRun');
     const section = main.slice(start, main.indexOf('// --- Manual terminal panel IPC', start));
-    assert.match(section, /if \(approvalPayload\.tool === 'verification_start'\) approvalEvent\.source = 'verification'/);
+    assert.match(section, /if \(approvalPayload\.source\) approvalEvent\.source = approvalPayload\.source/);
+    assert.match(section, /else if \(approvalPayload\.tool === 'verification_start'\) approvalEvent\.source = 'verification'/);
     assert.match(section, /ordinary chat approvals source-less/);
     assert.doesNotMatch(section, /source:\s*approvalPayload\.tool === 'verification_start'[\s\S]{0,120}\? 'verification'[\s\S]{0,120}: \(approvalPayload\.source \|\| 'user'\)/);
   });
@@ -88,6 +89,31 @@ describe('D11 renderer engineering center contract', () => {
     assert.ok(start >= 0);
     assert.match(handler, /loadEngineeringJobs/);
     assert.match(handler, /refreshEngineeringIndexStatus/);
+  });
+
+  it('shows failed verification and workflow repair entry points with advisory validation controls', () => {
+    assert.match(app, /j\.status === 'failed'[\s\S]{0,180}data-vfy-repair/);
+    assert.match(app, /node\.status === 'failed'[\s\S]{0,180}data-workflow-repair-node/);
+    assert.match(app, /仅供参考，不影响应用或 Draft PR/);
+    assert.match(app, /data-repair-validate-cancel/);
+    assert.match(app, /cancelEngineeringRepairValidation/);
+  });
+
+  it('refreshes repair history on engineering events without persisting notes or validation output', () => {
+    const start = app.indexOf('onEngineeringEvent');
+    const handler = app.slice(start, start + 1200);
+    assert.match(handler, /loadEngineeringRepairs/);
+    const saveStart = app.indexOf('function saveState()');
+    const saveBody = app.slice(saveStart, app.indexOf('function activeSession()', saveStart));
+    assert.doesNotMatch(saveBody, /repair|note|stdout|stderr|diagnostic/i);
+  });
+
+  it('routes repair approvals and subscribes to the dedicated repair event channel', () => {
+    assert.match(app, /function renderEngineeringRepairApprovalCard\(/);
+    assert.match(app, /ev\.source === 'repair'[\s\S]{0,180}renderEngineeringRepairApprovalCard\(ev\)/);
+    assert.match(app, /onEngineeringRepairEvent/);
+    assert.match(app, /engineering-repair-open-result/);
+    assert.match(app, /查看 D5 结果卡/);
   });
 
   it('provides a structured D12 DAG editor and drill-down workflow results', () => {
