@@ -1,20 +1,116 @@
 'use strict';
 
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
+
+const {
+  MAX_CHECK_RUNS,
+  MAX_ANNOTATIONS,
+  MAX_RAW_LOG_BYTES,
+  normalizeDecimalId,
+  normalizeSha,
+  redactRemoteText,
+} = require('./remote-ci-state');
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const OUTPUT_MAX = 256 * 1024;
 
 function clip(value, max = 4000) {
-  return String(value || '')
+  return redactRemoteText(String(value || ''))
     .replace(/\b(https?:\/\/)[^/\s@]+@/gi, '$1[REDACTED]@')
     .replace(/\b(?:gh[opurs]_|github_pat_)[A-Za-z0-9_]{8,}/gi, '[REDACTED]')
     .replace(/\bAuthorization\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+/gi, 'Authorization: [REDACTED]')
     .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED]')
+    .replace(/\b(?:ASIA|A3T)[0-9A-Z]{16,}\b/g, '[REDACTED]')
+    .replace(/\b(?:xox[baprs]-|glpat-)[A-Za-z0-9_-]{10,}\b/gi, '[REDACTED]')
+    .replace(/([?&](?:token|sig|signature|x-amz-signature|x-goog-signature)=)[^&\s]+/gi, '$1[REDACTED]')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/((?:aws_)?secret(?:_access_key)?|password|token|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
     .replace(/[\r\n]+/g, ' ')
     .trim()
     .slice(0, max);
+}
+
+function runRawCommand(command, args, opts = {}) {
+  const impl = typeof opts.spawnImpl === 'function' ? opts.spawnImpl : spawn;
+  const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT_MS;
+  const maxBytes = Number.isFinite(Number(opts.maxBytes)) ? Math.max(1, Number(opts.maxBytes)) : MAX_RAW_LOG_BYTES;
+  return new Promise((resolve) => {
+    let child;
+    let timer;
+    let settled = false;
+    let timedOut = false;
+    let truncated = false;
+    let stdoutBytes = 0;
+    const stdout = [];
+    let stderr = Buffer.alloc(0);
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (opts.signal) opts.signal.removeEventListener?.('abort', onAbort);
+      resolve(result);
+    };
+    const onAbort = () => {
+      try { child?.kill?.(); } catch {}
+    };
+    try {
+      child = impl(command, args, { cwd: opts.cwd, windowsHide: true, shell: false });
+    } catch (error) {
+      finish({ ok: false, code: -1, stdout: '', stderr: '', error: clip(error?.message || error), truncated: false });
+      return;
+    }
+    child.stdout?.on?.('data', (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk || '');
+      const remaining = Math.max(0, maxBytes - stdoutBytes);
+      if (remaining) {
+        const kept = bytes.subarray(0, remaining);
+        stdout.push(kept);
+        stdoutBytes += kept.length;
+      }
+      if (bytes.length > remaining && !truncated) {
+        truncated = true;
+        try { child.kill?.(); } catch {}
+      }
+    });
+    child.stderr?.on?.('data', (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk || '');
+      stderr = Buffer.concat([stderr, bytes]).subarray(-64 * 1024);
+    });
+    child.on?.('error', (error) => {
+      finish({
+        ok: false,
+        code: -1,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: '',
+        error: error?.code === 'ENOENT' ? `${command} 未安装或无法执行` : clip(error?.message || error),
+        truncated,
+      });
+    });
+    child.on?.('close', (code) => {
+      const output = Buffer.concat(stdout).toString('utf8');
+      if (truncated) {
+        finish({ ok: true, code: 0, stdout: output, stderr: '', error: '', truncated: true });
+      } else if (timedOut || opts.signal?.aborted) {
+        finish({ ok: false, code: -1, stdout: output, stderr: '', error: timedOut ? `${command} 超时` : '请求已取消', truncated: false });
+      } else if (code !== 0) {
+        finish({ ok: false, code: typeof code === 'number' ? code : 1, stdout: '', stderr: '', error: clip(stderr.toString('utf8') || `${command} 执行失败`), truncated: false });
+      } else {
+        finish({ ok: true, code: 0, stdout: output, stderr: '', error: '', truncated: false });
+      }
+    });
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener?.('abort', onAbort, { once: true });
+    }
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { child?.kill?.(); } catch {}
+    }, timeoutMs);
+  });
 }
 
 function remoteParts(hostValue, pathValue) {
@@ -182,6 +278,8 @@ function normalizePrSummary(raw, { detail = false } = {}) {
     headRefName: boundedText(raw.headRefName, 255),
     baseRefName: boundedText(raw.baseRefName, 255),
     headSha: sha(raw.headRefOid || raw.headSha || raw.headCommit?.oid),
+    isCrossRepository: raw.isCrossRepository === true,
+    headRepository: boundedText(raw.headRepository?.nameWithOwner || raw.headRepository?.nameWithOwnerWithOwner || raw.headRepository, 600),
     updatedAt: boundedText(raw.updatedAt, 80),
     mergeable: boundedText(raw.mergeable, 40).toUpperCase(),
     mergeStateStatus: boundedText(raw.mergeStateStatus, 60).toUpperCase(),
@@ -192,6 +290,102 @@ function normalizePrSummary(raw, { detail = false } = {}) {
     files,
     filesTruncated: detail && Array.isArray(raw.files) && raw.files.length > files.length,
   };
+}
+
+function flattenApiPages(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((item) => Array.isArray(item) ? item : [item]);
+}
+
+function normalizeCheckRun(raw, { includeOutput = false } = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = normalizeDecimalId(raw.id);
+  const name = boundedText(raw.name, 200);
+  const status = boundedText(raw.status, 40).toLowerCase();
+  const conclusion = boundedText(raw.conclusion, 40).toLowerCase();
+  const detailsUrl = /^https:\/\//i.test(String(raw.details_url || raw.detailsUrl || ''))
+    ? String(raw.details_url || raw.detailsUrl).slice(0, 2000) : '';
+  if (!id || !name || !status) return null;
+  const normalized = {
+    id,
+    name,
+    status,
+    conclusion,
+    detailsUrl,
+    appSlug: boundedText(raw.app_slug || raw.app?.slug, 100).toLowerCase(),
+    startedAt: boundedText(raw.started_at || raw.startedAt, 80),
+    completedAt: boundedText(raw.completed_at || raw.completedAt, 80),
+    annotationCount: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(Number(raw.annotations_count ?? raw.output?.annotations_count) || 0))),
+  };
+  if (includeOutput) {
+    normalized.output = {
+      title: String(raw.output_title ?? raw.output?.title ?? '').slice(0, 1000),
+      summary: String(raw.output_summary ?? raw.output?.summary ?? '').slice(0, 12000),
+    };
+  }
+  return normalized;
+}
+
+function normalizeActionsRun(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = normalizeDecimalId(raw.id);
+  const headSha = normalizeSha(raw.head_sha || raw.headSha);
+  const runAttempt = Number(raw.run_attempt ?? raw.runAttempt);
+  if (!id || !headSha || !Number.isInteger(runAttempt) || runAttempt < 1) return null;
+  return {
+    id,
+    name: boundedText(raw.name, 200),
+    headSha,
+    headBranch: boundedText(raw.head_branch || raw.headBranch, 255),
+    runAttempt,
+    status: boundedText(raw.status, 40).toLowerCase(),
+    conclusion: boundedText(raw.conclusion, 40).toLowerCase(),
+  };
+}
+
+function normalizeActionsJob(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = normalizeDecimalId(raw.id);
+  const runId = normalizeDecimalId(raw.run_id || raw.runId);
+  const headSha = normalizeSha(raw.head_sha || raw.headSha);
+  const runAttempt = Number(raw.run_attempt ?? raw.runAttempt);
+  const name = boundedText(raw.name, 200);
+  if (!id || !runId || !headSha || !Number.isInteger(runAttempt) || runAttempt < 1 || !name) return null;
+  const steps = Array.isArray(raw.steps) ? raw.steps.map((step) => ({
+    name: boundedText(step?.name, 200),
+    status: boundedText(step?.status, 40).toLowerCase(),
+    conclusion: boundedText(step?.conclusion, 40).toLowerCase(),
+    number: Number.isFinite(Number(step?.number)) ? Math.max(0, Math.floor(Number(step.number))) : 0,
+  })).filter((step) => step.name).slice(0, 100) : [];
+  return {
+    id,
+    runId,
+    headSha,
+    runAttempt,
+    workflowName: boundedText(raw.workflow_name || raw.workflowName, 200),
+    name,
+    status: boundedText(raw.status, 40).toLowerCase(),
+    conclusion: boundedText(raw.conclusion, 40).toLowerCase(),
+    startedAt: boundedText(raw.started_at || raw.startedAt, 80),
+    completedAt: boundedText(raw.completed_at || raw.completedAt, 80),
+    logsAvailable: Boolean(raw.logs_url || raw.logsUrl),
+    steps,
+  };
+}
+
+function parseActionsDetailsUrl(value, { host, owner, repo } = {}) {
+  try {
+    const parsed = new URL(String(value || ''));
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash
+      || parsed.host.toLowerCase() !== String(host || '').toLowerCase()) return null;
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (parts.length !== 7 || parts[0].toLowerCase() !== String(owner || '').toLowerCase()
+      || parts[1].toLowerCase() !== String(repo || '').toLowerCase()
+      || parts[2] !== 'actions' || parts[3] !== 'runs' || parts[5] !== 'job') return null;
+    const runId = normalizeDecimalId(parts[4]);
+    const jobId = normalizeDecimalId(parts[6]);
+    return runId && jobId ? { runId, jobId } : null;
+  } catch { return null; }
 }
 
 function normalizeChecks(raw) {
@@ -220,6 +414,7 @@ function normalizeChecks(raw) {
 
 function createGithubCli(opts = {}) {
   const execFileImpl = opts.execFileImpl;
+  const spawnImpl = opts.spawnImpl;
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
   const command = (name, args, extra = {}) => runCommand(name, args, {
     ...extra,
@@ -229,6 +424,15 @@ function createGithubCli(opts = {}) {
 
   async function git(repoRoot, args, extra = {}) {
     return command('git', ['-C', repoRoot, ...args], extra);
+  }
+
+  async function apiJson({ repoRoot, host, endpoint, jq }) {
+    const args = ['api', '--hostname', String(host || '').toLowerCase(), endpoint];
+    if (jq) args.push('--jq', jq);
+    const result = await command('gh', args, { cwd: repoRoot });
+    const parsed = parseJson(result.stdout);
+    if (!result.ok || parsed == null) return { ok: false, code: 'GH_API_FAILED', error: clip(result.error || 'GitHub API 返回无效结果'), uncertain: result.code === -1 };
+    return { ok: true, value: parsed };
   }
 
   async function preflight({ repoRoot, baseHead }) {
@@ -329,7 +533,7 @@ function createGithubCli(opts = {}) {
     if (!args) return { ok: false, code: 'PR_INVALID', error: 'PR 编号无效' };
     const result = await command('gh', [
       'pr', 'view', args.number, '--repo', args.qualified,
-      '--json', 'number,url,title,body,state,isDraft,author,headRefName,headRefOid,baseRefName,updatedAt,mergeable,mergeStateStatus,reviewDecision,labels,comments,files',
+      '--json', 'number,url,title,body,state,isDraft,author,headRefName,headRefOid,headRepository,isCrossRepository,baseRefName,updatedAt,mergeable,mergeStateStatus,reviewDecision,labels,comments,files',
     ], { cwd: repoRoot });
     if (!result.ok) return { ok: false, code: 'PR_LOOKUP_FAILED', error: clip(result.error || '无法读取 PR 详情') };
     const pr = normalizePrSummary(parseJson(result.stdout), { detail: true });
@@ -344,6 +548,162 @@ function createGithubCli(opts = {}) {
     if (!Array.isArray(parsed)) return { ok: false, code: 'PR_CHECKS_FAILED', error: clip(result.error || 'GitHub checks 格式无效') };
     const normalized = normalizeChecks(parsed);
     return { ok: true, ...normalized, exitCode: result.code };
+  }
+
+  async function getCheckRunsForRef({ repoRoot, host, owner, repo, headSha }) {
+    const qualified = qualifiedRepo(host, owner, repo);
+    const cleanSha = sha(headSha);
+    if (!qualified || !cleanSha) return { ok: false, code: 'PR_CHECKS_FAILED', error: 'check run 参数无效' };
+    const checks = [];
+    let truncated = false;
+    const jq = '.check_runs | map({id:(.id|tostring),name,status,conclusion,details_url,app_slug:.app.slug,started_at,completed_at,annotations_count:.output.annotations_count})';
+    for (let page = 1; page <= 2; page += 1) {
+      const result = await apiJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/commits/${cleanSha}/check-runs?filter=latest&per_page=100&page=${page}`, jq });
+      if (!result.ok) return { ok: false, code: 'PR_CHECKS_FAILED', error: result.error };
+      const rows = flattenApiPages(result.value);
+      for (const raw of rows) {
+        const item = normalizeCheckRun(raw);
+        if (item) checks.push(item);
+        if (checks.length >= MAX_CHECK_RUNS) { truncated = rows.length >= 100 || page === 2; break; }
+      }
+      if (rows.length < 100 || checks.length >= MAX_CHECK_RUNS) break;
+    }
+    return { ok: true, checks: checks.slice(0, MAX_CHECK_RUNS), truncated };
+  }
+
+  async function getCheckRun({ repoRoot, host, owner, repo, checkRunId }) {
+    const id = normalizeDecimalId(checkRunId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'PR_CHECKS_FAILED', error: 'check run 参数无效' };
+    const jq = '{id:(.id|tostring),name,status,conclusion,details_url,app_slug:.app.slug,started_at,completed_at,annotations_count:.output.annotations_count}';
+    const result = await apiJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/check-runs/${id}`, jq });
+    if (!result.ok) return { ok: false, code: 'PR_CHECKS_FAILED', error: result.error };
+    const check = normalizeCheckRun(result.value);
+    return check ? { ok: true, check } : { ok: false, code: 'PR_CHECKS_FAILED', error: 'check run 格式无效' };
+  }
+
+  async function getCheckRunContent({ repoRoot, host, owner, repo, checkRunId }) {
+    const id = normalizeDecimalId(checkRunId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'PR_CHECKS_FAILED', error: 'check run 参数无效' };
+    const jq = '{id:(.id|tostring),name,status,conclusion,details_url,app_slug:.app.slug,started_at,completed_at,output_title:.output.title,output_summary:.output.summary,annotations_count:.output.annotations_count}';
+    const result = await apiJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/check-runs/${id}`, jq });
+    if (!result.ok) return { ok: false, code: 'PR_CHECKS_FAILED', error: result.error };
+    const check = normalizeCheckRun(result.value, { includeOutput: true });
+    return check ? { ok: true, check } : { ok: false, code: 'PR_CHECKS_FAILED', error: 'check run 格式无效' };
+  }
+
+  async function getCheckAnnotations({ repoRoot, host, owner, repo, checkRunId }) {
+    const id = normalizeDecimalId(checkRunId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'PR_CHECKS_FAILED', error: 'annotation 参数无效' };
+    const jq = 'map({path,start_line,end_line,start_column,end_column,annotation_level,title,message,raw_details})';
+    const annotations = [];
+    let truncated = false;
+    // GitHub caps a page at 100. Read at most two pages and stop as soon as
+    // the bounded public set is known to be truncated.
+    for (let page = 1; page <= 2; page += 1) {
+      const result = await apiJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/check-runs/${id}/annotations?per_page=100&page=${page}`, jq });
+      if (!result.ok || !Array.isArray(result.value)) return { ok: false, code: 'PR_CHECKS_FAILED', error: result.error || 'annotation 格式无效' };
+      annotations.push(...result.value);
+      if (annotations.length > MAX_ANNOTATIONS) {
+        truncated = true;
+        break;
+      }
+      if (result.value.length < 100) break;
+      truncated = true;
+    }
+    return { ok: true, annotations: annotations.slice(0, MAX_ANNOTATIONS), truncated };
+  }
+
+  async function getActionsRun({ repoRoot, host, owner, repo, runId }) {
+    const id = normalizeDecimalId(runId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'GH_API_FAILED', error: 'workflow run 参数无效' };
+    const jq = '{id:(.id|tostring),name,head_sha,head_branch,run_attempt,status,conclusion}';
+    const result = await apiJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/actions/runs/${id}`, jq });
+    if (!result.ok) return result;
+    const run = normalizeActionsRun(result.value);
+    return run ? { ok: true, run } : { ok: false, code: 'GH_API_FAILED', error: 'workflow run 格式无效' };
+  }
+
+  async function getActionsJob({ repoRoot, host, owner, repo, jobId }) {
+    const id = normalizeDecimalId(jobId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'GH_API_FAILED', error: 'Actions job 参数无效' };
+    const jq = '{id:(.id|tostring),run_id:(.run_id|tostring),workflow_name,head_sha,run_attempt,name,status,conclusion,started_at,completed_at,logs_url,steps}';
+    const result = await apiJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/actions/jobs/${id}`, jq });
+    if (!result.ok) return result;
+    const job = normalizeActionsJob(result.value);
+    return job ? { ok: true, job } : { ok: false, code: 'GH_API_FAILED', error: 'Actions job 格式无效' };
+  }
+
+  async function getActionsJobLog({ repoRoot, host, owner, repo, jobId, signal }) {
+    const id = normalizeDecimalId(jobId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'GH_API_FAILED', error: 'Actions job log 参数无效' };
+    const result = await runRawCommand('gh', ['api', '--hostname', String(host || '').toLowerCase(), `repos/${owner}/${repo}/actions/jobs/${id}/logs`], {
+      cwd: repoRoot,
+      timeoutMs,
+      maxBytes: MAX_RAW_LOG_BYTES,
+      spawnImpl,
+      signal,
+    });
+    return result.ok
+      ? { ok: true, log: result.stdout, truncated: result.truncated === true }
+      : { ok: false, code: 'GH_API_FAILED', error: clip(result.error || '无法读取 Actions job log'), uncertain: result.code === -1 };
+  }
+
+  async function rerunActionsJob({ repoRoot, host, owner, repo, jobId }) {
+    const id = normalizeDecimalId(jobId);
+    if (!qualifiedRepo(host, owner, repo) || !id) return { ok: false, code: 'GH_API_FAILED', error: 'Actions job 参数无效' };
+    const result = await command('gh', ['api', '--hostname', String(host || '').toLowerCase(), '--method', 'POST', `repos/${owner}/${repo}/actions/jobs/${id}/rerun`], { cwd: repoRoot });
+    return result.ok
+      ? { ok: true }
+      : { ok: false, code: 'GH_API_FAILED', error: clip(result.error || '重新运行 Actions job 失败'), uncertain: result.code === -1 };
+  }
+
+  async function branchTip({ repoRoot, branch }) {
+    const cleanBranch = shellSafeName(branch);
+    if (!cleanBranch) return { ok: false, code: 'REMOTE_HEAD_FAILED', error: '远端分支无效' };
+    const result = await git(repoRoot, ['ls-remote', 'origin', `refs/heads/${cleanBranch}`]);
+    const head = result.ok ? sha(String(result.stdout || '').trim().split(/\s+/)[0]) : '';
+    return head ? { ok: true, head } : { ok: false, code: 'REMOTE_HEAD_FAILED', error: '无法读取远端分支 HEAD', uncertain: result.code === -1 };
+  }
+
+  async function exactLeasePush({ repoRoot, branch, oldHead, newCommit }) {
+    const cleanBranch = shellSafeName(branch);
+    const oldSha = sha(oldHead);
+    const nextSha = sha(newCommit);
+    if (!cleanBranch || !oldSha || !nextSha) return { ok: false, code: 'PUSH_FAILED', error: '精确推送参数无效' };
+    const ref = `refs/heads/${cleanBranch}`;
+    const result = await git(repoRoot, ['push', `--force-with-lease=${ref}:${oldSha}`, 'origin', `${nextSha}:${ref}`]);
+    return result.ok ? { ok: true } : { ok: false, code: 'PUSH_FAILED', error: clip(result.error || '精确推送失败'), uncertain: result.code === -1 };
+  }
+
+  async function fetchBranchToRef({ repoRoot, branch, targetRef }) {
+    const cleanBranch = shellSafeName(branch);
+    const cleanRef = String(targetRef || '');
+    if (!cleanBranch || !/^refs\/codex\/remote-ci\/rci_[a-f0-9]{24}$/.test(cleanRef)) {
+      return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI fetch 参数无效' };
+    }
+    // Keep the long-lived fetch tail stable for callers while pinning the
+    // submodule/refmap behavior before the existing output-suppression flags.
+    const result = await git(repoRoot, ['fetch', '--no-recurse-submodules', '--refmap=', '--no-tags', '--no-write-fetch-head', 'origin', `refs/heads/${cleanBranch}:${cleanRef}`]);
+    return result.ok
+      ? { ok: true }
+      : { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: clip(result.error || '无法获取 PR head'), uncertain: result.code === -1 };
+  }
+
+  async function resolveCommit({ repoRoot, ref }) {
+    const cleanRef = String(ref || '');
+    if (!/^refs\/codex\/remote-ci\/rci_[a-f0-9]{24}$/.test(cleanRef)) {
+      return { ok: false, code: 'REMOTE_CI_FETCH_MISMATCH', error: '远程 CI ref 无效' };
+    }
+    const result = await git(repoRoot, ['rev-parse', '--verify', `${cleanRef}^{commit}`]);
+    const head = result.ok ? sha(result.stdout) : '';
+    return head ? { ok: true, head } : { ok: false, code: 'REMOTE_CI_FETCH_MISMATCH', error: '无法验证 PR head commit' };
+  }
+
+  async function deleteInternalRef({ repoRoot, ref }) {
+    const cleanRef = String(ref || '');
+    if (!/^refs\/codex\/remote-ci\/rci_[a-f0-9]{24}$/.test(cleanRef)) return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI ref 无效' };
+    const result = await git(repoRoot, ['update-ref', '-d', cleanRef]);
+    return result.ok ? { ok: true } : { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: clip(result.error || '无法清理远程 CI ref') };
   }
 
   async function runPrAction({ repoRoot, host, owner, repo, number, action, extra = [] }) {
@@ -386,6 +746,9 @@ function createGithubCli(opts = {}) {
   return {
     parseRemote, runCommand: command, preflight, pushBranch, findExistingPr, createPr,
     repository, listPrs, getPr, getChecks, editPr, commentPr, closePr, reopenPr, readyPr, mergePr,
+    getCheckRunsForRef, getCheckRun, getCheckRunContent, getCheckAnnotations, getActionsRun, getActionsJob,
+    getActionsJobLog, rerunActionsJob, branchTip, exactLeasePush,
+    fetchBranchToRef, resolveCommit, deleteInternalRef,
   };
 }
 
@@ -393,8 +756,13 @@ module.exports = {
   DEFAULT_TIMEOUT_MS,
   parseRemote,
   runCommand,
+  runRawCommand,
   createGithubCli,
   qualifiedRepo,
   normalizePrSummary,
   normalizeChecks,
+  normalizeCheckRun,
+  normalizeActionsRun,
+  normalizeActionsJob,
+  parseActionsDetailsUrl,
 };

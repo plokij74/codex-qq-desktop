@@ -50,7 +50,8 @@ describe('D5 worktree marker state', () => {
     assert.equal(normalized.projectRel, 'packages/app');
     assert.equal(normalized.files[0].path, 'packages/app/a.js');
     assert.equal(normalizeMarker(marker({ id: '../bad' })), null);
-    assert.equal(normalizeMarker(marker({ version: 2 })), null);
+    assert.equal(normalizeMarker(marker({ version: 1 })).version, MARKER_VERSION);
+    assert.equal(normalizeMarker(marker({ version: 3 })), null);
     assert.equal(normalizeMarker(marker({ projectRel: '../outside' })), null);
     assert.equal(normalizeMarker(marker({ patchSha256: 'nope' })), null);
   });
@@ -104,6 +105,7 @@ describe('D5 worktree marker state', () => {
       canApply: false, canDiscard: true, canRetryCollect: true,
       canCleanup: false, canOpen: true, canPreview: false,
       canCreatePr: false, canRetryPr: false, canCleanupPr: false, canOpenPr: false,
+      canUpdatePr: false, canRetryPrUpdate: false,
     });
     assert.equal(capabilityFor('applied_cleanup_pending').canCleanup, true);
     assert.equal(capabilityFor('applied_cleanup_pending').canDiscard, false);
@@ -116,5 +118,13 @@ describe('D5 worktree marker state', () => {
       { bad: true },
     ]), 1);
     assert.equal(PENDING_LIMIT, 3);
+  });
+
+  it('maps remote CI delivery fields and disables creating a second PR', () => {
+    const remote = marker({ baseKind: 'remote_commit', originKind: 'remote_ci', remoteCiRef: 'rci_' + '1'.repeat(24), deliveryKind: 'github_pr_update' });
+    const summary = publicSummary(remote);
+    assert.equal(summary.canCreatePr, false);
+    assert.equal(summary.canUpdatePr, true);
+    assert.equal(summary.remoteCiRef, remote.remoteCiRef);
   });
 });

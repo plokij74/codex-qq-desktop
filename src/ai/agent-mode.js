@@ -13,6 +13,8 @@ const PLAN_HIDDEN_TOOLS = new Set([
   'workflow_cancel',
   'repair_start',
   'repair_cancel',
+  'remote_ci_sources',
+  'remote_ci_get',
   'spawn_explore',
   'spawn_explores',
   'spawn_implement',

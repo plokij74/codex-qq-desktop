@@ -185,6 +185,12 @@ contextBridge.exposeInMainWorld('codex', {
   cancelEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:cancel', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || '') }),
   rerunEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:rerun', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), sessionId: String(payload?.sessionId || '') }),
   checkEngineeringWorkflowGate: (payload = {}) => ipcRenderer.invoke('engineering:workflow:gate-check', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), action: String(payload?.action || ''), expectedFingerprint: String(payload?.expectedFingerprint || '') }),
+  getRemoteCiFailures: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:failures', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber) }),
+  snapshotRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:snapshot', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber), checkRunId: String(payload?.checkRunId || '') }),
+  listRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),
+  getRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:get', { projectBindingId: String(payload?.projectBindingId || ''), remoteCiRef: String(payload?.remoteCiRef || '') }),
+  rerunRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:rerun', { projectBindingId: String(payload?.projectBindingId || ''), remoteCiRef: String(payload?.remoteCiRef || '') }),
+  updateRemoteCiPr: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:update-pr', { projectBindingId: String(payload?.projectBindingId || ''), resultId: String(payload?.resultId || ''), subject: String(payload?.subject || '').slice(0, 300) }),
   listEngineeringRepairs: (payload = {}) => ipcRenderer.invoke('engineering:repair:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),
   getEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:get', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
   getEngineeringRepairResult: (payload = {}) => ipcRenderer.invoke('engineering:repair:result', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
@@ -192,8 +198,9 @@ contextBridge.exposeInMainWorld('codex', {
     const source = payload?.source && typeof payload.source === 'object' ? payload.source : {};
     const normalizedSource = source.kind === 'verification'
       ? { kind: 'verification', jobRef: String(source.jobRef || '') }
-      : { kind: 'workflow', workflowRunRef: String(source.workflowRunRef || ''), nodeId: String(source.nodeId || '').slice(0, 120) };
-    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || '') });
+      : source.kind === 'remote_ci' ? { kind: 'remote_ci', remoteCiRef: String(source.remoteCiRef || '') }
+        : { kind: 'workflow', workflowRunRef: String(source.workflowRunRef || ''), nodeId: String(source.nodeId || '').slice(0, 120) };
+    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || ''), ...(normalizedSource.kind === 'remote_ci' && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
   },
   retryEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:retry', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || '') }),
   cancelEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),

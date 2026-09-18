@@ -9,7 +9,7 @@ const {
   TERMINAL_REPAIR_STATES,
 } = require('./repair-state');
 
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 const MAX_PROJECT_REPAIRS = 50;
 const MAX_REPAIRS = 200;
 
@@ -37,7 +37,7 @@ class RepairStore {
     if (this.mode !== 'encrypted' || !this.repairPath || !this.fs.existsSync(this.repairPath)) return null;
     try {
       const envelope = JSON.parse(this.fs.readFileSync(this.repairPath, 'utf8'));
-      if (envelope.version !== STORE_VERSION || envelope.cipher !== 'electron-safeStorage' || !envelope.payload) throw new Error('invalid envelope');
+      if (![1, STORE_VERSION].includes(Number(envelope.version)) || envelope.cipher !== 'electron-safeStorage' || !envelope.payload) throw new Error('invalid envelope');
       const parsed = JSON.parse(this.safeStorage.decryptString(Buffer.from(String(envelope.payload), 'base64')));
       if (!Array.isArray(parsed)) throw new Error('invalid repair store');
       return parsed;

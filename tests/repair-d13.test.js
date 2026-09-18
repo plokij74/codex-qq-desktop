@@ -78,6 +78,32 @@ describe('D13 repair contracts', () => {
     assert.equal(publicValue.note, undefined);
     assert.equal(publicValue.prompt, undefined);
     assert.equal(publicValue.projectPath, undefined);
+    assert.deepEqual(normalizeSource({ kind: 'remote_ci', remoteCiRef: 'rci_' + 'a'.repeat(24) }), { kind: 'remote_ci', remoteCiRef: 'rci_' + 'a'.repeat(24) });
+    assert.throws(() => normalizeSource({ kind: 'remote_ci', remoteCiRef: 'rci_' + 'a'.repeat(24), headSha: 'b'.repeat(40) }), /字段无效/);
+  });
+
+  it('migrates v1 repair records to the v2 source and validation profile shape', () => {
+    const old = normalizeRepair({
+      repairRef: 'rpr_' + 'a'.repeat(24), projectKey: 'b'.repeat(64),
+      source: { kind: 'verification', jobRef: 'vfy_job_' + 'c'.repeat(24) },
+      profileId: 'vfy_' + 'd'.repeat(8), profileFingerprint: 'e'.repeat(64),
+      sourceWorkspaceFingerprint: 'f'.repeat(64), status: 'ready', createdAt: new Date(0).toISOString(),
+    });
+    assert.equal(old.validationProfile.profileId, 'vfy_' + 'd'.repeat(8));
+    assert.match(old.sourceFingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(publicRepairSummary(old).profileId, old.validationProfile.profileId);
+    assert.equal(old.sourceWorkspaceFingerprint, undefined);
+  });
+
+  it('allows a remote CI repair record without a local validation profile', () => {
+    const remote = normalizeRepair({
+      repairRef: 'rpr_' + '1'.repeat(24), projectKey: '2'.repeat(64),
+      source: { kind: 'remote_ci', remoteCiRef: 'rci_' + '3'.repeat(24) },
+      sourceFingerprint: '4'.repeat(64), status: 'queued', createdAt: new Date(0).toISOString(),
+    });
+    const publicValue = publicRepairSummary(remote);
+    assert.equal(publicValue.profileId, undefined);
+    assert.equal(publicValue.validationProfile, undefined);
   });
 
   it('preserves an encrypted corrupt store and refuses writes', () => {

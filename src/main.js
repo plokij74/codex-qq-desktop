@@ -172,6 +172,11 @@ function getEngineeringIpc() {
     worktreeManager,
     subagentRuntime,
     runTerminal,
+    withMutation: async (fn) => {
+      if (activeRun || manualTerm || worktreeMutation) return { ok: false, code: 'BUSY', error: '有对话或终端正在进行，请稍后重试' };
+      worktreeMutation = true;
+      try { return await fn(); } finally { worktreeMutation = false; }
+    },
     indexStorePathFor: (projectPath) => path.join(userDataPath(), `engineering-index-${crypto.createHash('sha256').update(path.resolve(projectPath)).digest('hex').slice(0, 16)}.json`),
     isIndexEnabled: () => loadSettings(userDataPath()).codeIndexEnabled !== false,
     getProfiles: (projectPath) => {
@@ -1302,6 +1307,12 @@ ipcMain.handle('engineering:workflow:cancel', async (event, payload = {}) => get
 ipcMain.handle('engineering:workflow:rerun', async (event, payload = {}) => getEngineeringIpc().workflowRerun(event, payload));
 ipcMain.handle('engineering:workflow:gate-check', async (event, payload = {}) => getEngineeringIpc().workflowGateCheck(event, payload));
 ipcMain.handle('engineering:repair:list', async (event, payload = {}) => getEngineeringIpc().repairList(event, payload));
+ipcMain.handle('engineering:remote-ci:failures', (event, payload = {}) => getEngineeringIpc().remoteCiFailures(event, payload));
+ipcMain.handle('engineering:remote-ci:snapshot', (event, payload = {}) => getEngineeringIpc().remoteCiSnapshot(event, payload));
+ipcMain.handle('engineering:remote-ci:list', (event, payload = {}) => getEngineeringIpc().remoteCiList(event, payload));
+ipcMain.handle('engineering:remote-ci:get', (event, payload = {}) => getEngineeringIpc().remoteCiGet(event, payload));
+ipcMain.handle('engineering:remote-ci:rerun', (event, payload = {}) => getEngineeringIpc().remoteCiRerun(event, payload));
+ipcMain.handle('engineering:remote-ci:update-pr', (event, payload = {}) => getEngineeringIpc().remoteCiUpdatePr(event, payload));
 ipcMain.handle('engineering:repair:get', async (event, payload = {}) => getEngineeringIpc().repairGet(event, payload));
 ipcMain.handle('engineering:repair:result', async (event, payload = {}) => getEngineeringIpc().repairResult(event, payload));
 ipcMain.handle('engineering:repair:start', async (event, payload = {}) => getEngineeringIpc().repairStart(event, payload));
@@ -1790,6 +1801,10 @@ async function startChatRun(event, payload = {}, opts = {}) {
         workflowCancelForAgent: (root, workflowRunRef) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
           ? getEngineeringIpc().workflowCancelForAgent(engineeringRoot, workflowRunRef, { agentRunId: runId })
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
+        remoteCiList: (root, limit) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().remoteCiListForAgent(engineeringRoot, limit) : { ok: false, code: 'REMOTE_CI_PROJECT_BINDING_INVALID' },
+        remoteCiGet: (root, ref) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
+          ? getEngineeringIpc().remoteCiGetForAgent(engineeringRoot, ref) : { ok: false, code: 'REMOTE_CI_PROJECT_BINDING_INVALID' },
         repairList: (root, limit) => engineeringRoot && canonicalDirectory(root) === engineeringRoot
           ? getEngineeringIpc().repairListForAgent(engineeringRoot, limit)
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },

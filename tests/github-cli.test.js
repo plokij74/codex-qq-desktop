@@ -2,7 +2,11 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseRemote, runCommand, createGithubCli, normalizeChecks } = require('../src/ai/github-cli');
+const { EventEmitter } = require('node:events');
+const {
+  parseRemote, runCommand, runRawCommand, createGithubCli, normalizeChecks,
+  parseActionsDetailsUrl,
+} = require('../src/ai/github-cli');
 
 describe('D6 GitHub CLI adapter', () => {
   it('parses github.com and Enterprise HTTPS/SSH remotes', () => {
@@ -59,6 +63,19 @@ describe('D6 GitHub CLI adapter', () => {
     assert.equal(result.ok, false);
     assert.doesNotMatch(result.error, /ghp_/);
     assert.match(result.error, /REDACTED/);
+  });
+
+  it('redacts cloud credentials and terminal control sequences from failures', async () => {
+    const result = await runCommand('gh', ['x'], {
+      execFileImpl: (_command, _args, _options, callback) => {
+        const error = Object.assign(new Error('failed'), { code: 1 });
+        callback(error, '', '\x1b]0;token=private\x07 AWS_SECRET_ACCESS_KEY=supersecret');
+        return { kill() {} };
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.doesNotMatch(result.error, /supersecret|private/);
+    assert.doesNotMatch(result.error, /\x1b/);
   });
 
   it('does not echo command arguments when a failure has no stderr', async () => {
@@ -147,5 +164,98 @@ describe('D6 GitHub CLI adapter', () => {
     assert.ok(mergeArgs.includes('--squash'));
     assert.equal(mergeArgs[mergeArgs.indexOf('--match-head-commit') + 1], 'a'.repeat(40));
     assert.ok(mergeArgs.includes('--delete-branch=false'));
+  });
+
+  it('strictly parses Actions details URLs for the current host and repository', () => {
+    assert.deepEqual(parseActionsDetailsUrl('https://github.com/acme/widget/actions/runs/123/job/456', {
+      host: 'github.com', owner: 'acme', repo: 'widget',
+    }), { runId: '123', jobId: '456' });
+    assert.equal(parseActionsDetailsUrl('https://evil.test/acme/widget/actions/runs/123/job/456', {
+      host: 'github.com', owner: 'acme', repo: 'widget',
+    }), null);
+    assert.equal(parseActionsDetailsUrl('https://github.com/acme/other/actions/runs/123/job/456?token=secret', {
+      host: 'github.com', owner: 'acme', repo: 'widget',
+    }), null);
+  });
+
+  it('reads bounded raw job logs without flattening line breaks or exposing stderr', async () => {
+    const spawnImpl = () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('line one\nline two\n'));
+        child.stderr.emit('data', Buffer.from('Authorization: Bearer ghp_supersecret'));
+        child.emit('close', 0);
+      });
+      return child;
+    };
+    const result = await runRawCommand('gh', ['api', 'fixed'], { spawnImpl, maxBytes: 1024 });
+    assert.equal(result.ok, true);
+    assert.equal(result.stdout, 'line one\nline two\n');
+    assert.equal(result.stderr, '');
+    assert.doesNotMatch(JSON.stringify(result), /supersecret/);
+  });
+
+  it('pages annotations with a bounded result and reports truncation', async () => {
+    const calls = [];
+    const execFileImpl = (command, args, _options, callback) => {
+      calls.push([command, args]);
+      if (command === 'gh' && args[0] === 'api' && args.some((arg) => String(arg).includes('/annotations?'))) {
+        const page = Number(String(args.find((arg) => String(arg).includes('page=')) || '').split('page=')[1]) || 1;
+        const rows = Array.from({ length: page === 1 ? 100 : 1 }, (_, index) => ({
+          path: `src/file-${page}-${index}.js`, start_line: index + 1, annotation_level: 'failure', message: `failure ${index}`,
+        }));
+        callback(null, JSON.stringify(rows), '');
+        return { kill() {} };
+      }
+      callback(null, '[]', '');
+      return { kill() {} };
+    };
+    const cli = createGithubCli({ execFileImpl });
+    const result = await cli.getCheckAnnotations({ repoRoot: 'D:/repo', host: 'github.com', owner: 'acme', repo: 'widget', checkRunId: '34' });
+    assert.equal(result.ok, true);
+    assert.equal(result.annotations.length, 50);
+    assert.equal(result.truncated, true);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0][1].find((arg) => String(arg).includes('/annotations?')), /per_page=100&page=1/);
+  });
+
+  it('uses string-preserving jq projections for check runs, Actions jobs, rerun, and exact lease push', async () => {
+    const calls = [];
+    const head = 'a'.repeat(40);
+    const execFileImpl = (command, args, _options, callback) => {
+      calls.push([command, args]);
+      let stdout = '';
+      if (command === 'gh' && args[0] === 'api' && args.some((arg) => String(arg).includes('/commits/'))) {
+        stdout = JSON.stringify([{ id: '90071992547409931', name: 'tests', status: 'completed', conclusion: 'failure', details_url: 'https://github.com/acme/widget/actions/runs/12/job/34', app_slug: 'github-actions', annotations_count: 2 }]);
+      } else if (command === 'gh' && args[0] === 'api' && args.some((arg) => String(arg).includes('/actions/jobs/34')) && !args.includes('--method')) {
+        stdout = JSON.stringify({ id: '34', run_id: '12', workflow_name: 'CI', head_sha: head, run_attempt: 1, name: 'tests', status: 'completed', conclusion: 'failure', logs_url: 'https://api.github.com/log' });
+      } else if (command === 'git' && args.includes('ls-remote')) {
+        stdout = `${head}\trefs/heads/feature\n`;
+      }
+      callback(null, stdout, '');
+      return { kill() {} };
+    };
+    const cli = createGithubCli({ execFileImpl });
+    const checks = await cli.getCheckRunsForRef({ repoRoot: 'D:/repo', host: 'github.com', owner: 'acme', repo: 'widget', headSha: head });
+    assert.equal(checks.checks[0].id, '90071992547409931');
+    assert.equal(checks.checks[0].output, undefined);
+    const job = await cli.getActionsJob({ repoRoot: 'D:/repo', host: 'github.com', owner: 'acme', repo: 'widget', jobId: '34' });
+    assert.equal(job.job.runId, '12');
+    assert.equal((await cli.rerunActionsJob({ repoRoot: 'D:/repo', host: 'github.com', owner: 'acme', repo: 'widget', jobId: '34' })).ok, true);
+    assert.equal((await cli.branchTip({ repoRoot: 'D:/repo', branch: 'feature' })).head, head);
+    assert.equal((await cli.exactLeasePush({ repoRoot: 'D:/repo', branch: 'feature', oldHead: head, newCommit: 'b'.repeat(40) })).ok, true);
+    assert.equal((await cli.fetchBranchToRef({ repoRoot: 'D:/repo', branch: 'feature', targetRef: `refs/codex/remote-ci/rci_${'1'.repeat(24)}` })).ok, true);
+    assert.equal((await cli.deleteInternalRef({ repoRoot: 'D:/repo', ref: `refs/codex/remote-ci/rci_${'1'.repeat(24)}` })).ok, true);
+    const checkCall = calls.find(([, args]) => args.some((arg) => String(arg).includes('/commits/')));
+    assert.match(checkCall[1][checkCall[1].indexOf('--jq') + 1], /tostring/);
+    assert.doesNotMatch(checkCall[1][checkCall[1].indexOf('--jq') + 1], /output_title|output_summary/);
+    const push = calls.find(([command, args]) => command === 'git' && args.includes('push'))[1];
+    assert.ok(push.includes(`--force-with-lease=refs/heads/feature:${head}`));
+    assert.ok(push.includes(`${'b'.repeat(40)}:refs/heads/feature`));
+    const fetch = calls.find(([command, args]) => command === 'git' && args.includes('fetch'))[1];
+    assert.deepEqual(fetch.slice(-4), ['--no-tags', '--no-write-fetch-head', 'origin', `refs/heads/feature:refs/codex/remote-ci/rci_${'1'.repeat(24)}`]);
   });
 });

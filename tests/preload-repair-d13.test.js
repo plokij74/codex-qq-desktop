@@ -19,6 +19,15 @@ const electronStub = {
 const originalLoad = Module._load;
 
 describe('D13 repair IPC and preload contract', () => {
+  it('D14 rebuilds remote payloads without renderer-provided target authority', async () => {
+    const payload = { projectBindingId: 'pb_test', prNumber: 7, checkRunId: '90071992547409931', remoteCiRef: 'rci_test', resultId: 'wt_test', subject: 'Fix', log: 'private', repo: 'other/repo', sha: 'forged', approval: true };
+    await exposed.snapshotRemoteCi(payload);
+    assert.deepEqual(calls.at(-1), ['engineering:remote-ci:snapshot', { projectBindingId: 'pb_test', prNumber: 7, checkRunId: '90071992547409931' }]);
+    await exposed.updateRemoteCiPr(payload);
+    assert.deepEqual(calls.at(-1), ['engineering:remote-ci:update-pr', { projectBindingId: 'pb_test', resultId: 'wt_test', subject: 'Fix' }]);
+    await exposed.startEngineeringRepair({ ...payload, source: { kind: 'remote_ci', remoteCiRef: 'rci_test', log: 'private', headSha: 'forged' }, validationProfileId: 'vfy_test' });
+    assert.deepEqual(calls.at(-1)[1], { projectBindingId: 'pb_test', source: { kind: 'remote_ci', remoteCiRef: 'rci_test' }, note: '', sessionId: '', validationProfileId: 'vfy_test' });
+  });
   before(() => {
     Module._load = function loadWithElectronStub(request, parent, isMain) {
       if (request === 'electron') return electronStub;

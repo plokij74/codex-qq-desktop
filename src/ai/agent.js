@@ -42,6 +42,8 @@ const {
 const MUTATING_TOOLS = new Set(['search_replace', 'write_file', 'delete_path']);
 
 const TOOL_DEFS = [
+  { type: 'function', function: { name: 'remote_ci_sources', description: 'List existing GitHub Actions failure snapshots for this project; never returns logs.', parameters: { type: 'object', properties: { limit: { type: 'integer' } }, additionalProperties: false } } },
+  { type: 'function', function: { name: 'remote_ci_get', description: 'Read metadata and freshness of an existing CI snapshot.', parameters: { type: 'object', properties: { remoteCiRef: { type: 'string' } }, required: ['remoteCiRef'], additionalProperties: false } } },
   {
     type: 'function',
     function: {
@@ -318,7 +320,7 @@ const TOOL_DEFS = [
         type: 'object',
         properties: {
           jobRef: { type: 'string' }, workflowRunRef: { type: 'string' },
-          nodeId: { type: 'string' }, note: { type: 'string' },
+          nodeId: { type: 'string' }, note: { type: 'string' }, remoteCiRef: { type: 'string' },
         },
       },
     },
@@ -1062,6 +1064,12 @@ async function executeTool(name, args, ctx) {
       if (!engineering?.workflowCancelForAgent || !/^wf_run_[a-f0-9]{24}$/.test(ref)) return JSON.stringify({ ok: false, error: 'workflow run 引用无效' });
       return JSON.stringify(await engineering.workflowCancelForAgent(root, ref));
     }
+    if (name === 'remote_ci_sources' || name === 'remote_ci_get') {
+      const engineering = ctx.extensions?.engineering;
+      const method = name === 'remote_ci_sources' ? engineering?.remoteCiList : engineering?.remoteCiGet;
+      if (!method) return JSON.stringify({ ok: false, code: 'REMOTE_CI_RESULT_UNAVAILABLE' });
+      return JSON.stringify(await method(root, name === 'remote_ci_sources' ? Math.min(50, Number(args.limit) || 20) : String(args.remoteCiRef || '')));
+    }
     if (name === 'engineering_repairs' || name === 'repair_get' || name === 'repair_result' || name === 'repair_start' || name === 'repair_cancel') {
       const engineering = ctx.extensions?.engineering;
       if (!engineering) return JSON.stringify({ ok: false, error: 'repair 管理器不可用' });
@@ -1074,6 +1082,10 @@ async function executeTool(name, args, ctx) {
         return JSON.stringify(await method(root, ref, { agentRunId: ctx.runId }));
       }
       const jobRef = String(args.jobRef || '');
+      if (args.remoteCiRef) {
+        if (!/^rci_[a-f0-9]{24}$/.test(args.remoteCiRef) || Object.keys(args).some((key) => !['remoteCiRef', 'note'].includes(key))) return JSON.stringify({ ok: false, code: 'REPAIR_INVALID' });
+        return JSON.stringify(await engineering.repairStartForAgent(root, { source: { kind: 'remote_ci', remoteCiRef: args.remoteCiRef }, note: String(args.note || '').slice(0, 2000) }, { ...ctx, agentRunId: ctx.runId }));
+      }
       const workflowRunRef = String(args.workflowRunRef || '');
       const nodeId = String(args.nodeId || '').slice(0, 120);
       const hasJob = Boolean(jobRef); const hasWorkflow = Boolean(workflowRunRef || nodeId);

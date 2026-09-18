@@ -4,7 +4,7 @@ const RESULT_ID_RE = /^wt_[A-Za-z0-9]{6,80}$/;
 const SHA1_RE = /^[a-f0-9]{40}$/i;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 
-const MARKER_VERSION = 1;
+const MARKER_VERSION = 2;
 const PENDING_LIMIT = 3;
 const PATCH_MAX_BYTES = 16 * 1024 * 1024;
 const FILE_SUMMARY_LIMIT = 200;
@@ -30,16 +30,22 @@ const STATES = new Set([
   'pr_failed',
   'pr_cleanup_pending',
   'pr_created',
+  'pr_update_preparing',
+  'pr_update_pushing',
+  'pr_update_failed',
+  'pr_update_uncertain',
+  'pr_update_cleanup_pending',
+  'pr_updated',
 ]);
 
 const TRANSITIONS = Object.freeze({
   creating: new Set(['running', 'collect_failed']),
   running: new Set(['collecting', 'collect_failed', 'discarded_cleanup_pending']),
   collecting: new Set(['ready', 'collect_failed', 'oversize', 'discarded_cleanup_pending']),
-  ready: new Set(['applying', 'discarded_cleanup_pending', 'conflict', 'pr_preparing']),
+  ready: new Set(['applying', 'discarded_cleanup_pending', 'conflict', 'pr_preparing', 'pr_update_preparing']),
   collect_failed: new Set(['collecting', 'discarded_cleanup_pending']),
   oversize: new Set(['discarded_cleanup_pending']),
-  conflict: new Set(['applying', 'discarded_cleanup_pending', 'pr_preparing']),
+  conflict: new Set(['applying', 'discarded_cleanup_pending', 'pr_preparing', 'pr_update_preparing']),
   applying: new Set(['ready', 'conflict', 'apply_uncertain', 'applied_cleanup_pending']),
   apply_uncertain: new Set(),
   applied_cleanup_pending: new Set(),
@@ -51,6 +57,12 @@ const TRANSITIONS = Object.freeze({
   pr_failed: new Set(['pr_preparing', 'discarded_cleanup_pending']),
   pr_cleanup_pending: new Set(['pr_created']),
   pr_created: new Set(),
+  pr_update_preparing: new Set(['pr_update_pushing', 'pr_update_failed', 'pr_update_uncertain']),
+  pr_update_pushing: new Set(['pr_update_cleanup_pending', 'pr_update_failed', 'pr_update_uncertain']),
+  pr_update_failed: new Set(['pr_update_preparing', 'discarded_cleanup_pending']),
+  pr_update_uncertain: new Set(['pr_update_preparing', 'pr_update_cleanup_pending']),
+  pr_update_cleanup_pending: new Set(['pr_updated']),
+  pr_updated: new Set(),
 });
 
 function text(value, max = ERROR_MAX) {
@@ -131,7 +143,8 @@ function normalizePrChecks(raw) {
 
 function normalizeMarker(raw, { now = Date.now() } = {}) {
   if (!raw || typeof raw !== 'object') return null;
-  if (Number(raw.version) !== MARKER_VERSION || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
+  const inputVersion = Number(raw.version);
+  if (![1, MARKER_VERSION].includes(inputVersion) || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
   const repoRoot = normalizePath(raw.repoRoot);
   const projectRoot = normalizePath(raw.projectRoot);
   const projectIdentity = text(raw.projectIdentity, 600);
@@ -184,6 +197,20 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     updatedAt: text(rawPr.updatedAt, 80),
     checksSummary: normalizePrChecks(rawPr.checksSummary),
   };
+  const baseKind = raw.baseKind === 'remote_commit' ? 'remote_commit' : 'local_head';
+  const originKind = raw.originKind === 'remote_ci' ? 'remote_ci' : 'default';
+  const deliveryKind = raw.deliveryKind === 'github_pr_update' ? 'github_pr_update' : 'default';
+  const remoteCiRef = /^rci_[a-f0-9]{24}$/.test(String(raw.remoteCiRef || '')) ? String(raw.remoteCiRef) : '';
+  if ((originKind === 'remote_ci' || deliveryKind === 'github_pr_update' || baseKind === 'remote_commit') && !remoteCiRef) return null;
+  const rawUpdate = raw.prUpdate && typeof raw.prUpdate === 'object' ? raw.prUpdate : {};
+  const prUpdate = {
+    oldHead: isSha1(rawUpdate.oldHead) ? String(rawUpdate.oldHead).toLowerCase() : '',
+    newCommit: isSha1(rawUpdate.newCommit) ? String(rawUpdate.newCommit).toLowerCase() : '',
+    expectedTree: isSha1(rawUpdate.expectedTree) ? String(rawUpdate.expectedTree).toLowerCase() : '',
+    subject: text(rawUpdate.subject, 300),
+    prNumber: Number.isInteger(Number(rawUpdate.prNumber)) && Number(rawUpdate.prNumber) > 0 ? Number(rawUpdate.prNumber) : 0,
+    updatedAt: Number.isFinite(Number(rawUpdate.updatedAt)) ? Number(rawUpdate.updatedAt) : 0,
+  };
 
   return {
     version: MARKER_VERSION,
@@ -199,6 +226,10 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     projectIdentity,
     projectRel,
     baseHead,
+    baseKind,
+    originKind,
+    ...(remoteCiRef ? { remoteCiRef } : {}),
+    deliveryKind,
     worktreeGitDir,
     expectedTree,
     patchSha256,
@@ -210,6 +241,7 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     errorCode: raw.errorCode ? text(raw.errorCode, 80) : null,
     error: raw.error ? text(raw.error, ERROR_MAX) : null,
     pr,
+    prUpdate,
     ...(Number.isFinite(Number(now)) ? {} : {}),
   };
 }
@@ -250,25 +282,27 @@ function transitionMarker(marker, state, patch = {}, { now = Date.now() } = {}) 
 
 function isUnresolved(marker) {
   const value = typeof marker === 'string' ? marker : marker?.state;
-  return !['applied_cleanup_pending', 'discarded_cleanup_pending', 'pr_created'].includes(value);
+  return !['applied_cleanup_pending', 'discarded_cleanup_pending', 'pr_created', 'pr_updated'].includes(value);
 }
 
 function capabilityFor(marker) {
   const state = typeof marker === 'string' ? marker : marker?.state;
   const discardable = new Set([
-    'running', 'collecting', 'ready', 'collect_failed', 'oversize', 'conflict', 'pr_failed',
+    'running', 'collecting', 'ready', 'collect_failed', 'oversize', 'conflict', 'pr_failed', 'pr_update_failed',
   ]);
   return {
     canApply: state === 'ready' || state === 'conflict',
     canDiscard: discardable.has(state),
     canRetryCollect: state === 'collect_failed',
     canCleanup: state === 'applied_cleanup_pending' || state === 'discarded_cleanup_pending',
-    canOpen: STATES.has(state) && !['creating', 'pr_created', 'pr_cleanup_pending'].includes(state),
-    canPreview: state === 'ready' || state === 'conflict' || state === 'applied_cleanup_pending',
-    canCreatePr: state === 'ready' || state === 'conflict' || state === 'pr_failed',
+    canOpen: STATES.has(state) && !['creating', 'pr_created', 'pr_cleanup_pending', 'pr_update_cleanup_pending', 'pr_updated'].includes(state),
+    canPreview: ['ready', 'conflict', 'applied_cleanup_pending', 'pr_update_failed', 'pr_update_uncertain'].includes(state),
+    canCreatePr: (state === 'ready' || state === 'conflict' || state === 'pr_failed') && marker?.deliveryKind !== 'github_pr_update',
     canRetryPr: state === 'pr_failed',
     canCleanupPr: state === 'pr_cleanup_pending',
     canOpenPr: (state === 'pr_created' || state === 'pr_cleanup_pending') && Boolean(marker?.pr?.url),
+    canUpdatePr: marker?.deliveryKind === 'github_pr_update' && ['ready', 'conflict', 'pr_update_failed', 'pr_update_uncertain', 'pr_update_cleanup_pending'].includes(state),
+    canRetryPrUpdate: marker?.deliveryKind === 'github_pr_update' && ['pr_update_failed', 'pr_update_uncertain'].includes(state),
   };
 }
 
@@ -284,6 +318,10 @@ function publicSummary(raw) {
     createdAt: marker.createdAt,
     updatedAt: marker.updatedAt,
     baseHead: marker.baseHead,
+    baseKind: marker.baseKind,
+    originKind: marker.originKind,
+    ...(marker.remoteCiRef ? { remoteCiRef: marker.remoteCiRef } : {}),
+    deliveryKind: marker.deliveryKind,
     incomplete: marker.incomplete,
     files: marker.files,
     filesTruncated: marker.filesTruncated,
@@ -291,6 +329,7 @@ function publicSummary(raw) {
     errorCode: marker.errorCode,
     error: marker.error,
     pr: marker.pr,
+    prUpdate: marker.prUpdate,
     ...capabilityFor(marker),
   };
 }

@@ -5,6 +5,9 @@ const { createVerificationManager } = require('./verification-manager');
 const { createWorkflowManager, validWorkflowRunRef } = require('./workflow-manager');
 const { createRepairManager } = require('./repair-manager');
 const { isRepairRef } = require('./repair-state');
+const { createRemoteCiManager } = require('./remote-ci-manager');
+const { createRemoteCiStore } = require('./remote-ci-store');
+const { createGithubCli } = require('./github-cli');
 
 function error(code, message) {
   return { ok: false, code, error: String(message || code).slice(0, 500) };
@@ -44,6 +47,40 @@ function createEngineeringIpcHandlers(options = {}) {
   let verification = null;
   let workflows = null;
   let repairs = null;
+  let remoteCi = null;
+  const remoteProtected = new Set();
+  const remoteOwners = new Map();
+
+  function getRemoteCi() {
+    if (!remoteCi) remoteCi = options.remoteCiManager || createRemoteCiManager({
+      githubCli: options.githubCli || createGithubCli(),
+      worktreeManager: options.worktreeManager,
+      mutationLock: options.withMutation,
+      store: createRemoteCiStore({ userDataPath: options.userDataPath, safeStorage: options.safeStorage,
+        // Until a project has been scanned, conservatively retain its sources.
+        isProtected: (ref, item) => !remoteProtected.has(item.projectKey) || remoteProtected.has(ref),
+      }),
+    });
+    return remoteCi;
+  }
+
+  async function remoteRequest(event, payload, fields, fn, mutation = false) {
+    if (!payload || typeof payload !== 'object' || Object.keys(payload).some((key) => !['projectBindingId', ...fields].includes(key))) return error('REMOTE_CI_INVALID', '远程 CI 参数无效');
+    return withBinding(event, payload, async (binding) => {
+      const manager = getRemoteCi();
+      if (!mutation) return fn(manager, binding, {});
+      const context = permissionContext(event, payload, options.getSettings?.() || {});
+      const abort = new AbortController();
+      const owner = ownerId(event);
+      const active = remoteOwners.get(owner) || new Set();
+      active.add(abort); remoteOwners.set(owner, active);
+      try {
+        return await fn(manager, binding, { ...context.options, signal: abort.signal,
+          isCurrent: () => !abort.signal.aborted && !event.sender?.isDestroyed?.() && getBinding(event, payload)?.projectPath === binding.projectPath,
+        });
+      } finally { active.delete(abort); if (!active.size) remoteOwners.delete(owner); unregisterGate(context.owner, context.gate); }
+    });
+  }
 
   const resolve = typeof options.resolveBinding === 'function'
     ? options.resolveBinding
@@ -188,6 +225,7 @@ function createEngineeringIpcHandlers(options = {}) {
         verificationManager: getVerification(),
         workflowManager: getWorkflows(),
         worktreeManager: options.worktreeManager,
+        remoteCiManager: getRemoteCi(),
         subagentRuntime: options.subagentRuntime,
         runLoop: options.runLoop,
         getProfiles: options.getProfiles,
@@ -262,6 +300,24 @@ function createEngineeringIpcHandlers(options = {}) {
   }
 
   return {
+    remoteCiFailures: (event, payload) => remoteRequest(event, payload, ['prNumber'], (m, b) => m.failures(b.projectPath, payload.prNumber)),
+    remoteCiSnapshot: (event, payload) => remoteRequest(event, payload, ['prNumber', 'checkRunId'], async (m, b) => {
+      const key = projectKey(b.projectPath);
+      const results = await options.worktreeManager?.list?.({ projectPath: b.projectPath });
+      if (results?.ok) {
+        for (const row of m.store?.list(key) || []) remoteProtected.delete(row.remoteCiRef);
+        for (const row of getRepairs().store.list(key)) if (row.source?.kind === 'remote_ci') remoteProtected.add(row.source.remoteCiRef);
+        for (const row of results.results || []) if (row.remoteCiRef && !['pr_updated', 'pr_created', 'discarded_cleanup_pending', 'applied_cleanup_pending'].includes(row.state)) remoteProtected.add(row.remoteCiRef);
+        remoteProtected.add(key);
+      }
+      return m.snapshot(b.projectPath, payload.prNumber, payload.checkRunId);
+    }),
+    remoteCiList: (event, payload) => remoteRequest(event, payload, ['limit'], (m, b) => m.list(b.projectPath, payload.limit)),
+    remoteCiGet: (event, payload) => remoteRequest(event, payload, ['remoteCiRef'], (m, b) => m.get(b.projectPath, payload.remoteCiRef)),
+    remoteCiRerun: (event, payload) => remoteRequest(event, payload, ['remoteCiRef'], (m, b, c) => m.rerun(b.projectPath, payload.remoteCiRef, c), true),
+    remoteCiUpdatePr: (event, payload) => remoteRequest(event, payload, ['resultId', 'subject'], (m, b, c) => m.updatePr(b.projectPath, payload.resultId, payload.subject, c), true),
+    remoteCiListForAgent: (root, limit) => getRemoteCi().list(root, limit),
+    remoteCiGetForAgent: (root, ref) => getRemoteCi().get(root, ref),
     // Agent bridge. The project path has already been validated by main and
     // these methods are intentionally absent from preload.
     indexStatus: (projectPath) => {
@@ -494,7 +550,10 @@ function createEngineeringIpcHandlers(options = {}) {
     repairStart: (event, payload = {}) => withBinding(event, payload, async (binding) => {
       const settings = options.getSettings ? options.getSettings() : {};
       const context = permissionContext(event, payload, settings);
-      try { return await getRepairs().start(binding.projectPath, { source: payload.source, note: payload.note }, { ...context.options, projectBindingId: payload.projectBindingId }); }
+      try {
+        if (Object.keys(payload).some((key) => !['projectBindingId', 'source', 'note', 'validationProfileId', 'sessionId'].includes(key))) return error('REPAIR_INVALID', '修复参数无效');
+        return await getRepairs().start(binding.projectPath, { source: payload.source, note: payload.note, ...(payload.validationProfileId ? { validationProfileId: payload.validationProfileId } : {}) }, { ...context.options, projectBindingId: payload.projectBindingId });
+      }
       finally { unregisterGate(context.owner, context.gate); }
     }),
     repairRetry: (event, payload = {}) => withBinding(event, payload, async (binding) => {
@@ -529,6 +588,7 @@ function createEngineeringIpcHandlers(options = {}) {
     dropSender: (eventOrId) => {
       const owner = typeof eventOrId === 'number' ? eventOrId : ownerId(eventOrId);
       if (owner == null) return;
+      for (const abort of remoteOwners.get(owner) || []) abort.abort();
       for (const gate of approvalGates.get(owner) || []) gate.cancelPending?.();
       approvalGates.delete(owner);
       for (const [ref, held] of workflowGates) if (held.owner === owner) workflowGates.delete(ref);
@@ -569,6 +629,8 @@ function createEngineeringIpcHandlers(options = {}) {
       };
     },
     close: () => {
+      for (const active of remoteOwners.values()) for (const abort of active) abort.abort();
+      remoteCi?.store?.close();
       for (const index of indexes.values()) index.close();
       workflows?.close();
       verification?.close();

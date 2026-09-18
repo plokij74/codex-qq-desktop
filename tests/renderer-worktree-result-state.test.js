@@ -73,4 +73,14 @@ describe('D5 renderer result state', () => {
     assert.equal('body' in item.pr, false);
     assert.equal('comments' in item.pr, false);
   });
+
+  it('preserves bounded remote CI delivery metadata', () => {
+    const item = state.normalizeOne(result({
+      baseKind: 'remote_commit', originKind: 'remote_ci', remoteCiRef: 'rci_' + '2'.repeat(24),
+      deliveryKind: 'github_pr_update', canCreatePr: false, canUpdatePr: true,
+    }));
+    assert.equal(item.remoteCiRef, 'rci_' + '2'.repeat(24));
+    assert.equal(item.deliveryKind, 'github_pr_update');
+    assert.equal(item.canUpdatePr, true);
+  });
 });

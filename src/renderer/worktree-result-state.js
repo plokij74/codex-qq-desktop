@@ -11,6 +11,8 @@
     'conflict', 'applying', 'apply_uncertain', 'applied_cleanup_pending',
     'discarded_cleanup_pending', 'pr_preparing', 'pr_committing', 'pr_pushing',
     'pr_creating', 'pr_failed', 'pr_cleanup_pending', 'pr_created',
+    'pr_update_preparing', 'pr_update_pushing', 'pr_update_failed',
+    'pr_update_uncertain', 'pr_update_cleanup_pending', 'pr_updated',
   ]);
   const MAX_GOAL = 160;
   const MAX_FILES = 200;
@@ -50,6 +52,15 @@
       createdAt,
       updatedAt,
       baseHead: /^[a-f0-9]{40}$/i.test(String(raw.baseHead || '')) ? String(raw.baseHead).toLowerCase() : '',
+      baseKind: raw.baseKind === 'remote_commit' ? 'remote_commit' : 'local_head',
+      originKind: raw.originKind === 'remote_ci' ? 'remote_ci' : 'default',
+      remoteCiRef: /^rci_[a-f0-9]{24}$/.test(String(raw.remoteCiRef || '')) ? String(raw.remoteCiRef) : '',
+      deliveryKind: raw.deliveryKind === 'github_pr_update' ? 'github_pr_update' : 'default',
+      prUpdate: {
+        subject: trim(raw.prUpdate?.subject, 300),
+        prNumber: n(raw.prUpdate?.prNumber),
+        newCommit: /^[a-f0-9]{40}$/.test(raw.prUpdate?.newCommit || '') ? raw.prUpdate.newCommit : '',
+      },
       incomplete: raw.incomplete === true,
       files,
       filesTruncated: raw.filesTruncated === true || (Array.isArray(raw.files) && raw.files.length > MAX_FILES),
@@ -99,6 +110,8 @@
       canRetryPr: raw.canRetryPr === true,
       canCleanupPr: raw.canCleanupPr === true,
       canOpenPr: raw.canOpenPr === true,
+      canUpdatePr: raw.canUpdatePr === true,
+      canRetryPrUpdate: raw.canRetryPrUpdate === true,
     };
   }
 
@@ -148,7 +161,7 @@
   }
 
   function unresolved(items) {
-    return normalizeList(items).filter((item) => !['applied_cleanup_pending', 'discarded_cleanup_pending', 'pr_created'].includes(item.state));
+    return normalizeList(items).filter((item) => !['applied_cleanup_pending', 'discarded_cleanup_pending', 'pr_created', 'pr_updated'].includes(item.state));
   }
 
   return { ID_RE, normalizeOne, normalizeList, merge, upsert, replaceAuthoritative, remove, unresolved };

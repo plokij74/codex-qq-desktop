@@ -716,6 +716,7 @@ function createWorktreeManager(opts = {}) {
         continue;
       }
       let summary = publicSummary(marker);
+      if (summary?.deliveryKind === 'github_pr_update') summary.canApply = summary.canApply && repo.baseHead === marker.baseHead;
       if (summary && ['ready', 'conflict'].includes(marker.state)) {
         try {
           await validateReadyResult(result, repo);
@@ -753,6 +754,14 @@ function createWorktreeManager(opts = {}) {
       let marker = await readMarker(root);
       if (!marker || marker.projectIdentity !== repo.projectIdentity) continue;
       const checkout = path.join(root, 'checkout');
+      if (['pr_update_preparing', 'pr_update_pushing'].includes(marker.state)) {
+        const result = await resultById(repo.projectRoot, marker.id);
+        if (result) {
+          await updateState(result, 'pr_update_uncertain', { errorCode: 'PR_UPDATE_UNCERTAIN', error: '上次更新结果待确认' });
+          recovered.push(publicSummary(result.marker));
+        }
+        continue;
+      }
       if (marker.state === 'applying') {
         const result = await resultById(repo.projectRoot, marker.id);
         if (!result) {
@@ -861,7 +870,7 @@ function createWorktreeManager(opts = {}) {
     return listed.ok ? { ...listed, recovered, warnings: [...(listed.warnings || []), ...warnings] } : listed;
   }
 
-  async function create({ project, sessionId, subagentId, goal }) {
+  async function createInternal({ project, sessionId, subagentId, goal, baseHead, baseKind = 'local_head', originKind = 'default', remoteCiRef, deliveryKind = 'default' }) {
     let repo;
     try { repo = await resolveRepo(project?.path); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
     return withProjectLock(repo.projectIdentity, async () => {
@@ -898,6 +907,10 @@ function createWorktreeManager(opts = {}) {
         await assertSafeExistingPath(artifactsRoot, { directory: true });
         await fsp.mkdir(resultRoot, { recursive: false, mode: 0o700 });
         const checkout = path.join(resultRoot, 'checkout');
+        const requestedBase = baseHead == null ? repo.baseHead : String(baseHead || '').toLowerCase();
+        if (!/^[a-f0-9]{40}$/.test(requestedBase)) return worktreeError('WORKTREE_CREATE_FAILED', '隔离基线 commit 无效');
+        const commit = await git(repo.repoRoot, ['cat-file', '-e', `${requestedBase}^{commit}`]);
+        if (!commit.ok) return worktreeError('WORKTREE_CREATE_FAILED', '隔离基线 commit 不存在');
         const marker = createMarker({
           id,
           sessionId: String(sessionId || ''),
@@ -907,13 +920,17 @@ function createWorktreeManager(opts = {}) {
           projectRoot: repo.projectRoot,
           projectIdentity: repo.projectIdentity,
           projectRel: repo.projectRel,
-          baseHead: repo.baseHead,
+          baseHead: requestedBase,
+          baseKind,
+          originKind,
+          ...(remoteCiRef ? { remoteCiRef } : {}),
+          deliveryKind,
           worktreeGitDir: '',
         });
         if (!marker) return worktreeError('PATH_UNSAFE', '无法创建 worktree marker');
         await writeMarker(resultRoot, marker);
         const added = await git(repo.repoRoot, [
-          'worktree', 'add', '--detach', '--lock', '--reason', `codex-qq:${id}`, checkout, repo.baseHead,
+          'worktree', 'add', '--detach', '--lock', '--reason', `codex-qq:${id}`, checkout, requestedBase,
         ]);
         if (!added.ok) {
           const current = await resultById(repo.projectRoot, id);
@@ -951,7 +968,7 @@ function createWorktreeManager(opts = {}) {
             resultRoot,
             checkout,
             childProjectPath,
-            baseHead: repo.baseHead,
+            baseHead: requestedBase,
           },
         };
       } catch (err) {
@@ -960,6 +977,36 @@ function createWorktreeManager(opts = {}) {
         }
         return worktreeError(err.code || 'WORKTREE_CREATE_FAILED', err.message || '创建隔离 worktree 失败');
       }
+    });
+  }
+
+  async function create(args) {
+    return createInternal({ ...args, baseKind: 'local_head', originKind: 'default', deliveryKind: 'default' });
+  }
+
+  async function preflightRemoteCreate({ projectPath }) {
+    try {
+      const repo = await resolveRepo(projectPath);
+      await validateScopedModes(repo.repoRoot, repo.projectRel);
+      if (!await statusIsClean(repo.repoRoot)) return worktreeError('DIRTY_BASE', 'Git 工作区存在未提交变更');
+      let pending = 0;
+      for (const root of await listResultRoots(repo.projectRoot)) {
+        const marker = await readMarker(root);
+        if (marker && marker.projectIdentity === repo.projectIdentity && isUnresolved(marker)) pending++;
+      }
+      return pending >= PENDING_LIMIT ? worktreeError('PENDING_LIMIT', '请先处理已有隔离结果') : { ok: true };
+    } catch (cause) { return worktreeError(cause.code || 'WORKTREE_CREATE_FAILED', '隔离基线检查失败'); }
+  }
+
+  async function createAtCommit({ project, baseHead, sessionId, subagentId, goal, origin, delivery }) {
+    const remoteCiRef = origin?.kind === 'remote_ci' ? String(origin.remoteCiRef || '') : '';
+    if (!/^rci_[a-f0-9]{24}$/.test(remoteCiRef) || delivery !== 'github_pr_update') {
+      return worktreeError('WORKTREE_CREATE_FAILED', '远程隔离来源无效');
+    }
+    return createInternal({
+      project, baseHead, sessionId, subagentId, goal,
+      baseKind: 'remote_commit', originKind: 'remote_ci', remoteCiRef,
+      deliveryKind: 'github_pr_update',
     });
   }
 
@@ -1101,6 +1148,7 @@ function createWorktreeManager(opts = {}) {
     const result = await resultById(repo.projectRoot, resultId);
     if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
     const summary = publicSummary(result.marker);
+    if (summary?.deliveryKind === 'github_pr_update') summary.canApply = summary.canApply && repo.baseHead === result.marker.baseHead;
     if (!preview || !summary.canPreview) return { ok: true, result: summary };
     try {
       const validated = await validateReadyResult(result, repo);
@@ -1459,6 +1507,125 @@ function createWorktreeManager(opts = {}) {
 
   async function retryPr(args) { return createPr(args); }
 
+  function normalizeUpdateSubject(value) {
+    const subject = String(value || '').trim().replace(/[\r\n]+/g, ' ').slice(0, 300);
+    return subject || '';
+  }
+
+  async function inspectRemoteResult({ projectPath, resultId }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    const result = await resultById(repo.projectRoot, resultId);
+    if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+    if (result.marker.deliveryKind !== 'github_pr_update' || !result.marker.remoteCiRef) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不属于远程 CI PR');
+    return { ok: true, repo, result, marker: result.marker, summary: publicSummary(result.marker) };
+  }
+
+  async function verifyPrUpdate({ projectPath, resultId }) {
+    const found = await inspectRemoteResult({ projectPath, resultId });
+    if (!found.ok) return found;
+    const { marker, repo } = found;
+    const update = marker.prUpdate;
+    if (!update?.newCommit || update.oldHead !== marker.baseHead || update.expectedTree !== marker.expectedTree) return worktreeError('PR_UPDATE_TREE_MISMATCH', '提交元数据不一致');
+    const parents = await git(repo.repoRoot, ['rev-list', '--parents', '-n', '1', update.newCommit]);
+    const tree = await git(repo.repoRoot, ['rev-parse', `${update.newCommit}^{tree}`]);
+    if (!parents.ok || parents.stdout.toString('utf8').trim() !== `${update.newCommit} ${marker.baseHead}`
+      || !tree.ok || tree.stdout.toString('utf8').trim() !== marker.expectedTree) return worktreeError('PR_UPDATE_TREE_MISMATCH', '提交 parent/tree 不一致');
+    return { ok: true };
+  }
+
+  async function preparePrUpdate({ projectPath, resultId, subject }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const result = await resultById(repo.projectRoot, resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+      if (result.marker.deliveryKind !== 'github_pr_update' || !result.marker.remoteCiRef) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不属于远程 CI PR');
+      if (!['ready', 'conflict', 'pr_update_failed', 'pr_update_uncertain'].includes(result.marker.state)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不能更新 PR');
+      const title = normalizeUpdateSubject(subject);
+      if (!title) return worktreeError('PR_UPDATE_UNAVAILABLE', 'commit subject 不能为空');
+      try {
+        await updateState(result, 'pr_update_preparing', { errorCode: null, error: null });
+        await validateStoredPatch(result, repo);
+        let commitSha = result.marker.prUpdate?.newCommit || '';
+        if (commitSha) {
+          const parent = await git(repo.repoRoot, ['rev-parse', `${commitSha}^`]);
+          const tree = await git(repo.repoRoot, ['rev-parse', `${commitSha}^{tree}`]);
+          if (!parent.ok || !tree.ok || parent.stdout.toString('utf8').trim().toLowerCase() !== result.marker.baseHead
+            || tree.stdout.toString('utf8').trim().toLowerCase() !== result.marker.expectedTree) {
+            throw Object.assign(new Error('已保存的 PR update commit 无法验证'), { code: 'PR_UPDATE_TREE_MISMATCH' });
+          }
+        } else {
+          const commit = await git(repo.repoRoot, ['commit-tree', result.marker.expectedTree, '-p', result.marker.baseHead, '-m', title]);
+          commitSha = commit.ok ? commit.stdout.toString('utf8').trim().toLowerCase() : '';
+          if (!/^[a-f0-9]{40}$/.test(commitSha)) {
+            const message = /identity|user\.name|user\.email/i.test(String(commit.error || '')) ? 'Git 身份未配置' : (commit.error || '无法创建 PR update commit');
+            throw Object.assign(new Error(message), { code: /身份|identity/i.test(message) ? 'PR_UPDATE_IDENTITY_MISSING' : 'PR_UPDATE_UNAVAILABLE' });
+          }
+          const parent = await git(repo.repoRoot, ['rev-parse', `${commitSha}^`]);
+          const tree = await git(repo.repoRoot, ['rev-parse', `${commitSha}^{tree}`]);
+          if (!parent.ok || !tree.ok || parent.stdout.toString('utf8').trim().toLowerCase() !== result.marker.baseHead
+            || tree.stdout.toString('utf8').trim().toLowerCase() !== result.marker.expectedTree) {
+            throw Object.assign(new Error('PR update commit parent/tree 不一致'), { code: 'PR_UPDATE_TREE_MISMATCH' });
+          }
+        }
+        await updateState(result, 'pr_update_pushing', {
+          prUpdate: {
+            oldHead: result.marker.baseHead,
+            newCommit: commitSha,
+            expectedTree: result.marker.expectedTree,
+            subject: result.marker.prUpdate?.subject || title,
+            prNumber: result.marker.prUpdate?.prNumber || 0,
+            updatedAt: Date.now(),
+          },
+        });
+        return { ok: true, commit: commitSha, oldHead: result.marker.baseHead, expectedTree: result.marker.expectedTree, remoteCiRef: result.marker.remoteCiRef, result: publicSummary(result.marker) };
+      } catch (err) {
+        try { await updateState(result, 'pr_update_failed', { errorCode: err.code || 'PR_UPDATE_UNAVAILABLE', error: shortError(err.message) }); } catch {}
+        return worktreeError(err.code || 'PR_UPDATE_UNAVAILABLE', shortError(err.message || err), { result: publicSummary(result.marker) });
+      }
+    });
+  }
+
+  async function failPrUpdate({ projectPath, resultId, code, error, uncertain = false }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const result = await resultById(repo.projectRoot, resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+      const target = uncertain ? 'pr_update_uncertain' : 'pr_update_failed';
+      if (result.marker.state !== target) {
+        try { await updateState(result, target, { errorCode: String(code || (uncertain ? 'PR_UPDATE_UNCERTAIN' : 'PR_UPDATE_PUSH_FAILED')).slice(0, 80), error: shortError(error) }); } catch {}
+      }
+      return { ok: false, code: String(code || (uncertain ? 'PR_UPDATE_UNCERTAIN' : 'PR_UPDATE_PUSH_FAILED')), error: shortError(error), result: publicSummary(result.marker) };
+    });
+  }
+
+  async function completePrUpdate({ projectPath, resultId, prNumber }) {
+    let repo;
+    try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
+    return withProjectLock(repo.projectIdentity, async () => {
+      const result = await resultById(repo.projectRoot, resultId);
+      if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
+      if (result.marker.state === 'pr_updated') return { ok: true, updated: true, result: publicSummary(result.marker) };
+      if (!['pr_update_pushing', 'pr_update_uncertain', 'pr_update_cleanup_pending'].includes(result.marker.state)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不能完成 PR update');
+      try {
+        if (result.marker.state !== 'pr_update_cleanup_pending') await updateState(result, 'pr_update_cleanup_pending', { errorCode: null, error: null, prUpdate: { ...result.marker.prUpdate, prNumber: normalizePrNumber(prNumber), updatedAt: Date.now() } });
+        const registered = await worktreeRegistration(result.checkout, repo.repoRoot);
+        if (registered) {
+          await git(repo.repoRoot, ['worktree', 'unlock', result.checkout], { allowNonZero: true });
+          const removed = await git(repo.repoRoot, ['worktree', 'remove', '--force', result.checkout]);
+          if (!removed.ok || await worktreeRegistration(result.checkout, repo.repoRoot)) throw Object.assign(new Error(removed.error || '无法清理 PR update worktree'), { code: 'PR_UPDATE_CLEANUP_FAILED' });
+        }
+        try { await fsp.unlink(result.patch); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+        await updateState(result, 'pr_updated');
+        return { ok: true, updated: true, result: publicSummary(result.marker) };
+      } catch (err) {
+        return worktreeError('PR_UPDATE_CLEANUP_FAILED', shortError(err.message || err), { result: publicSummary(result.marker) });
+      }
+    });
+  }
+
   async function cleanupPr({ projectPath, resultId }) {
     let repo;
     try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
@@ -1697,8 +1864,9 @@ function createWorktreeManager(opts = {}) {
   }
 
   return {
-    create, collect, retryCollect, validateFrozenProfile, list, recover, get, open, apply, discard, cleanup,
+    create, createAtCommit, preflightRemoteCreate, collect, retryCollect, validateFrozenProfile, list, recover, get, open, apply, discard, cleanup,
     preflightPr, createPr, retryPr, cleanupPr,
+    inspectRemoteResult, verifyPrUpdate, preparePrUpdate, failPrUpdate, completePrUpdate,
     listPrs, getPr, editPr, commentPr, closePr, reopenPr, readyPr, mergePr,
   };
 }

@@ -405,13 +405,13 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
   }
 
   async function runIsolatedImplement(ctx, {
-    goal, maxTurns, subagentId: requestedId, markerGoal,
+    goal, maxTurns, subagentId: requestedId, markerGoal, createWorktree,
   } = {}) {
     const early = precheckChild(ctx, { kind: 'implement', goal });
     if (early) return early;
     return withImplementLock(ctx, async () => {
       const manager = worktreeManager || ctx.extensions?.worktreeManager;
-      if (!manager || typeof manager.create !== 'function') {
+      if (!manager || (typeof createWorktree !== 'function' && typeof manager.create !== 'function')) {
         return {
           ok: false,
           kind: 'implement',
@@ -421,7 +421,8 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
         };
       }
       const subagentId = String(requestedId || nextId()).slice(0, 200);
-      const created = await manager.create({
+      const create = typeof createWorktree === 'function' ? createWorktree : (input) => manager.create(input);
+      const created = await create({
         project: ctx.project,
         projectBindingId: ctx.projectBindingId,
         sessionId: ctx.sessionKey,

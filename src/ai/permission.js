@@ -10,6 +10,7 @@ const READ_TOOLS = new Set([
   'verification_get', 'verification_result',
   'engineering_workflows', 'workflow_get', 'workflow_result',
   'engineering_repairs', 'repair_get', 'repair_result',
+  'remote_ci_sources', 'remote_ci_get',
 ]);
 const WRITE_TOOLS = new Set([
   'write_file', 'search_replace', 'git_commit', 'spawn_implement', 'run_skill',
@@ -215,6 +216,13 @@ function createPermissionGate({
     // Terminal disabled always denies terminal tools
     if (effectiveRisk === 'terminal' && terminalEnabled === false) {
       return { allowed: false, reason: '终端未启用，不允许执行终端命令' };
+    }
+
+    // Remote mutations always require one explicit, single-use decision.
+    if (effectiveRisk === 'remote-mutation') {
+      if (mode === 'plan' || permissionMode === 'read-only') return { allowed: false, reason: '当前模式不允许远端操作' };
+      const answer = await waitForApproval({ tool, risk: effectiveRisk, summary, detail, source }, signal);
+      return answer.decision === 'allow' ? allowedWithDecision('allow') : { allowed: false, reason: '需要单次确认' };
     }
 
     // MCP sampling is an explicit, host-controlled capability. Never let

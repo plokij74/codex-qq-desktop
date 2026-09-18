@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const REPAIR_REF_RE = /^rpr_[a-f0-9]{24}$/;
 const JOB_REF_RE = /^vfy_job_[a-f0-9]{24}$/;
 const WORKFLOW_RUN_REF_RE = /^wf_run_[a-f0-9]{24}$/;
+const REMOTE_CI_REF_RE = /^rci_[a-f0-9]{24}$/;
 const PROFILE_ID_RE = /^vfy_[a-f0-9]{8,64}$/;
 const FINGERPRINT_RE = /^[a-f0-9]{32,128}$/i;
 
@@ -59,6 +60,15 @@ const FIXED_ERROR_CODES = new Set([
   'REPAIR_PATCH_CHANGED', 'REPAIR_VALIDATION_RUNNING', 'REPAIR_VALIDATION_UNAVAILABLE',
   'REPAIR_VALIDATION_CANCEL_FAILED', 'REPAIR_TERMINAL_DISABLED', 'REPAIR_STORE_CORRUPT',
   'REPAIR_STORE_UNAVAILABLE',
+  'REMOTE_CI_PROJECT_BINDING_INVALID', 'REMOTE_CI_INVALID', 'REMOTE_CI_NOT_FOUND',
+  'REMOTE_CI_UNSUPPORTED_REPOSITORY', 'REMOTE_CI_GH_UNAVAILABLE',
+  'REMOTE_CI_PR_NOT_FOUND', 'REMOTE_CI_PR_NOT_OPEN', 'REMOTE_CI_FORK_UNSUPPORTED',
+  'REMOTE_CI_HEAD_INVALID', 'REMOTE_CI_HEAD_CHANGED', 'REMOTE_CI_CHECK_NOT_FOUND',
+  'REMOTE_CI_CHECK_UNSUPPORTED', 'REMOTE_CI_CHECK_NOT_FAILED',
+  'REMOTE_CI_ATTEMPT_CHANGED', 'REMOTE_CI_RESULT_UNAVAILABLE',
+  'REMOTE_CI_FETCH_FAILED', 'REMOTE_CI_FETCH_MISMATCH',
+  'REMOTE_CI_STORE_CORRUPT', 'REMOTE_CI_STORE_UNAVAILABLE',
+  'REMOTE_CI_VALIDATION_PROFILE_NOT_FOUND', 'REMOTE_CI_VALIDATION_PROFILE_CHANGED',
 ]);
 
 function repairError(code, message) {
@@ -90,6 +100,7 @@ function normalizeNote(value) { return cleanText(value, MAX_NOTE); }
 function isRepairRef(value) { return REPAIR_REF_RE.test(String(value || '')); }
 function isJobRef(value) { return JOB_REF_RE.test(String(value || '')); }
 function isWorkflowRunRef(value) { return WORKFLOW_RUN_REF_RE.test(String(value || '')); }
+function isRemoteCiRef(value) { return REMOTE_CI_REF_RE.test(String(value || '')); }
 function isProfileId(value) { return PROFILE_ID_RE.test(String(value || '')); }
 function isFingerprint(value) { return FINGERPRINT_RE.test(String(value || '')); }
 function createRepairRef() { return `rpr_${crypto.randomBytes(12).toString('hex')}`; }
@@ -97,9 +108,15 @@ function createRepairRef() { return `rpr_${crypto.randomBytes(12).toString('hex'
 function normalizeSource(raw, { rejectUnknown = true } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw repairError('REPAIR_SOURCE_INVALID', '修复来源无效');
   const keys = Object.keys(raw);
-  const allowed = raw.kind === 'verification' ? new Set(['kind', 'jobRef']) : new Set(['kind', 'workflowRunRef', 'nodeId']);
-  if (rejectUnknown && keys.some((key) => !allowed.has(key))) throw repairError('REPAIR_SOURCE_INVALID', '修复来源字段无效');
   const kind = String(raw.kind || '');
+  const allowed = kind === 'verification'
+    ? new Set(['kind', 'jobRef'])
+    : kind === 'workflow'
+      ? new Set(['kind', 'workflowRunRef', 'nodeId'])
+      : kind === 'remote_ci'
+        ? new Set(['kind', 'remoteCiRef'])
+        : new Set(['kind']);
+  if (rejectUnknown && keys.some((key) => !allowed.has(key))) throw repairError('REPAIR_SOURCE_INVALID', '修复来源字段无效');
   if (kind === 'verification') {
     if (!isJobRef(raw.jobRef)) throw repairError('REPAIR_SOURCE_INVALID', '验证作业引用无效');
     return { kind, jobRef: String(raw.jobRef) };
@@ -110,6 +127,10 @@ function normalizeSource(raw, { rejectUnknown = true } = {}) {
       throw repairError('REPAIR_SOURCE_INVALID', 'workflow 节点来源无效');
     }
     return { kind, workflowRunRef: String(raw.workflowRunRef), nodeId };
+  }
+  if (kind === 'remote_ci') {
+    if (!isRemoteCiRef(raw.remoteCiRef)) throw repairError('REPAIR_SOURCE_INVALID', '远程 CI 来源引用无效');
+    return { kind, remoteCiRef: String(raw.remoteCiRef) };
   }
   throw repairError('REPAIR_SOURCE_INVALID', '修复来源类型无效');
 }
@@ -156,7 +177,8 @@ function normalizeValidation(raw, { rejectUnknown = true } = {}) {
 function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw repairError('REPAIR_INVALID', '修复记录无效');
   const allowed = new Set([
-    'repairRef', 'projectKey', 'source', 'profileId', 'profileFingerprint', 'sourceWorkspaceFingerprint',
+    'repairRef', 'projectKey', 'source', 'sourceFingerprint', 'validationProfile',
+    'profileId', 'profileFingerprint', 'sourceWorkspaceFingerprint',
     'status', 'resultId', 'rootRepairRef', 'retryOf', 'attempt', 'incomplete', 'diagnosticCount',
     'outputExcerpted', 'createdAt', 'startedAt', 'finishedAt', 'errorCode', 'statusMessage', 'validation',
   ]);
@@ -166,11 +188,35 @@ function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
   const source = normalizeSource(raw.source, { rejectUnknown });
   const projectKey = String(raw.projectKey || '');
   if (!/^[a-f0-9]{32,128}$/i.test(projectKey)) throw repairError('REPAIR_INVALID', '项目引用无效');
-  const profileId = String(raw.profileId || '');
-  if (!isProfileId(profileId)) throw repairError('REPAIR_INVALID', 'profile 引用无效');
-  const profileFingerprint = String(raw.profileFingerprint || '').toLowerCase();
-  const sourceWorkspaceFingerprint = String(raw.sourceWorkspaceFingerprint || '').toLowerCase();
-  if (!isFingerprint(profileFingerprint) || !isFingerprint(sourceWorkspaceFingerprint)) throw repairError('REPAIR_INVALID', 'fingerprint 无效');
+  let validationProfile;
+  if (raw.validationProfile != null) {
+    if (!raw.validationProfile || typeof raw.validationProfile !== 'object' || Array.isArray(raw.validationProfile)
+      || (rejectUnknown && Object.keys(raw.validationProfile).some((key) => !['profileId', 'profileFingerprint'].includes(key)))) {
+      throw repairError('REPAIR_INVALID', 'validation profile 无效');
+    }
+    const profileId = String(raw.validationProfile.profileId || '');
+    const profileFingerprint = String(raw.validationProfile.profileFingerprint || '').toLowerCase();
+    if (!isProfileId(profileId) || !isFingerprint(profileFingerprint)) throw repairError('REPAIR_INVALID', 'validation profile 无效');
+    validationProfile = { profileId, profileFingerprint };
+  } else if (raw.profileId != null || raw.profileFingerprint != null) {
+    const profileId = String(raw.profileId || '');
+    const profileFingerprint = String(raw.profileFingerprint || '').toLowerCase();
+    if (!isProfileId(profileId) || !isFingerprint(profileFingerprint)) throw repairError('REPAIR_INVALID', 'profile 引用无效');
+    validationProfile = { profileId, profileFingerprint };
+  }
+  let sourceFingerprint = String(raw.sourceFingerprint || '').toLowerCase();
+  if (!sourceFingerprint && source.kind !== 'remote_ci') {
+    const workspace = String(raw.sourceWorkspaceFingerprint || '').toLowerCase();
+    if (!validationProfile || !isFingerprint(workspace)) throw repairError('REPAIR_INVALID', 'fingerprint 无效');
+    sourceFingerprint = crypto.createHash('sha256').update(JSON.stringify({
+      source,
+      profileId: validationProfile.profileId,
+      profileFingerprint: validationProfile.profileFingerprint,
+      workspaceFingerprint: workspace,
+    })).digest('hex');
+  }
+  if (!isFingerprint(sourceFingerprint)) throw repairError('REPAIR_INVALID', 'source fingerprint 无效');
+  if (source.kind !== 'remote_ci' && !validationProfile) throw repairError('REPAIR_INVALID', 'validation profile 缺失');
   const status = String(raw.status || '');
   if (!REPAIR_STATES.includes(status)) throw repairError('REPAIR_INVALID', '修复状态无效');
   if (raw.resultId != null && !/^wt_[A-Za-z0-9]{6,80}$/.test(String(raw.resultId))) throw repairError('REPAIR_INVALID', 'worktree 结果引用无效');
@@ -180,7 +226,8 @@ function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
   const createdAt = raw.createdAt == null ? new Date(now).toISOString() : normalizeTimestamp(raw.createdAt);
   if (!createdAt) throw repairError('REPAIR_INVALID', '修复时间无效');
   const out = {
-    repairRef, projectKey, source, profileId, profileFingerprint, sourceWorkspaceFingerprint, status,
+    repairRef, projectKey, source, sourceFingerprint, status,
+    ...(validationProfile ? { validationProfile } : {}),
     ...(raw.resultId != null ? { resultId: String(raw.resultId) } : {}),
     rootRepairRef: String(raw.rootRepairRef || repairRef),
     ...(raw.retryOf != null ? { retryOf: String(raw.retryOf) } : {}),
@@ -234,7 +281,10 @@ function publicRepairSummary(raw) {
   return {
     repairRef: repair.repairRef,
     source: { ...repair.source },
-    profileId: repair.profileId,
+    ...(repair.validationProfile ? {
+      validationProfile: { ...repair.validationProfile },
+      profileId: repair.validationProfile.profileId,
+    } : {}),
     status: repair.status,
     ...(repair.resultId ? { resultId: repair.resultId } : {}),
     rootRepairRef: repair.rootRepairRef,
@@ -289,13 +339,13 @@ function publicRepairResult(raw, { validationResult } = {}) {
 }
 
 module.exports = {
-  REPAIR_REF_RE, JOB_REF_RE, WORKFLOW_RUN_REF_RE, PROFILE_ID_RE,
+  REPAIR_REF_RE, JOB_REF_RE, WORKFLOW_RUN_REF_RE, REMOTE_CI_REF_RE, PROFILE_ID_RE,
   MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_PATH, MAX_DIAGNOSTIC_MESSAGE,
   MAX_OUTPUT_EXCERPT_BYTES, MAX_NOTE, MAX_CONTEXT_BYTES, MAX_ERROR, MAX_NODE_ID,
   REPAIR_STATES, VALIDATION_STATES, TERMINAL_REPAIR_STATES, ACTIVE_REPAIR_STATES,
   REPAIR_TRANSITIONS, VALIDATION_TRANSITIONS, FIXED_ERROR_CODES,
   repairError, cleanText, boundedUtf8, normalizeNote, normalizeTimestamp, normalizeErrorCode,
-  isRepairRef, isJobRef, isWorkflowRunRef,
+  isRepairRef, isJobRef, isWorkflowRunRef, isRemoteCiRef,
   isProfileId, isFingerprint, createRepairRef, normalizeSource, normalizeValidation,
   normalizeRepair, canTransition, canValidationTransition, transitionRepair,
   transitionValidation, publicValidation, publicRepairSummary, publicSummary: publicRepairSummary,

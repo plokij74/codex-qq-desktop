@@ -391,6 +391,10 @@ function handleTerminalPanelEvent(ev) {
   }
   // Verification approvals use a dedicated ephemeral panel. They must never
   // fall through to renderApprovalCard, which would attach them to chatRun.
+  if (type === 'approval-needed' && (ev.source === 'remote-ci' || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
+    void appConfirm([ev.summary, ev.detail].filter(Boolean).join('\n')).then((allowed) => window.codex.approveChat({ approvalId: ev.approvalId, decision: allowed ? 'allow' : 'deny' })).catch(() => {});
+    return true;
+  }
   if (type === 'approval-needed' && ev.source === 'verification') {
     renderEngineeringApprovalCard(ev);
     return true;
@@ -1296,6 +1300,9 @@ function worktreeStateLabel(state) {
     pr_preparing: '检查 GitHub', pr_committing: '创建提交', pr_pushing: '推送分支',
     pr_creating: '创建 Draft PR', pr_failed: 'PR 创建失败',
     pr_cleanup_pending: 'PR 已创建，待清理', pr_created: 'Draft PR 已创建',
+    pr_update_preparing: '准备更新 PR', pr_update_pushing: '正在更新 PR',
+    pr_update_failed: 'PR 更新失败', pr_update_uncertain: 'PR 更新结果待确认',
+    pr_update_cleanup_pending: 'PR 已更新，待清理', pr_updated: 'PR 已更新',
   })[state] || state;
 }
 
@@ -1372,6 +1379,12 @@ async function worktreeAction(session, ref, action) {
           prDraftBody: ref.prDraftBody || defaultWorktreePrBody(ref),
         });
       }
+    } else if (action === 'updatePr') {
+      const subject = await appPrompt('提交说明（重试将复用上次提交）', ref.prUpdate?.subject || 'Fix GitHub Actions failure', '更新此 PR');
+      if (subject == null) return;
+      response = await window.codex.updateRemoteCiPr({ projectBindingId: token, resultId: ref.id, subject });
+      if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
+      if (response?.ok) toast('PR 已更新，请手动刷新 checks');
     } else if (action === 'createPr') {
       const method = ref.canRetryPr ? window.codex.retryWorktreePr : window.codex.createWorktreePr;
       response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true, ...workflowGatePayload(project, 'create_pr', gateScope) });
@@ -1510,6 +1523,7 @@ function renderWorktreeCards(root, session) {
     };
     if (ref.canApply) addButton(`应用全部（${fileCount} 个文件）`, 'apply', true, true, true);
     if (ref.canCreatePr) addButton(ref.canRetryPr ? '重试 PR' : '创建 Draft PR', 'prForm', true, false, true);
+    if (ref.canUpdatePr) addButton(ref.canRetryPrUpdate ? '重试更新此 PR' : '更新此 PR', 'updatePr', true, false, true);
     if (ref.canPreview) addButton('查看 diff', 'preview', true);
     if (ref.canDiscard) addButton('丢弃', 'discard', true, false, true);
     if (ref.canRetryCollect) addButton('重试收集', 'retryCollect', true, false, true);
@@ -3377,6 +3391,8 @@ function resetPullRequestView(project) {
   pullRequestView.selectedNumber = 0;
   pullRequestView.resultId = '';
   pullRequestView.detail = null;
+  pullRequestView.remoteCi = null;
+  pullRequestView.remoteProfiles = [];
   pullRequestView.error = '';
 }
 
@@ -3457,6 +3473,7 @@ function renderPullRequestView() {
       </div>
       <section class="pr-detail-section">
         <h2>Checks</h2><div class="pr-check-summary">${escapeHtml(checkText)}</div><ul class="pr-check-list">${checksHtml}</ul>
+        ${remoteCiPanelHtml(blocked)}
       </section>
       <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
       <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
@@ -3499,6 +3516,7 @@ function renderPullRequestView() {
     loadPullRequestDetail(Number(button.dataset.prNumber));
   }));
   body.querySelectorAll('[data-pr-action]').forEach((button) => button.addEventListener('click', () => runPullRequestAction(button.dataset.prAction)));
+  body.querySelectorAll('[data-remote-ci-action]').forEach((button) => button.addEventListener('click', () => runRemoteCiAction(button.dataset.remoteCiAction, button.dataset.checkId)));
   body.querySelectorAll('[data-workflow-gate-select]').forEach((select) => select.addEventListener('change', () => {
     if (select.value) workflowGateSelections.set(select.dataset.workflowGateSelect, select.value);
     else workflowGateSelections.delete(select.dataset.workflowGateSelect);
@@ -3541,6 +3559,45 @@ async function loadPullRequests({ keepDetail = false } = {}) {
   }
 }
 
+function remoteCiPanelHtml(blocked) {
+  const ci = pullRequestView.remoteCi;
+  if (!ci) return '<div class="work-card-meta">正在读取 Actions jobs…</div>';
+  if (!ci.ok) return `<div class="work-card-notice">Actions 修复不可用：${escapeHtml(ci.code || '读取失败')}</div>`;
+  const rows = [...(ci.failures || []), ...(ci.unsupported || [])];
+  const profiles = (pullRequestView.remoteProfiles || []).map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
+  return `<div class="remote-ci-panel"><h3>GitHub Actions</h3><label>本地复验（可选，仅供参考） <select id="remote-ci-profile" ${blocked ? 'disabled' : ''}><option value="">不选择</option>${profiles}</select></label><ul class="pr-check-list">${rows.map((job) => `<li><div><strong>${escapeHtml(job.workflowName || job.name)} / ${escapeHtml(job.jobName || job.name)}</strong><div class="work-card-meta">${escapeHtml(job.conclusion || job.status)}${job.runAttempt ? ` · attempt ${job.runAttempt}` : ''}${job.reasonCode ? ` · ${escapeHtml(job.reasonCode)}` : ''}</div></div>${job.importable ? `<div class="work-card-actions"><button type="button" class="ghost-btn" data-remote-ci-action="repair" data-check-id="${escapeHtml(job.checkRunId)}" ${blocked ? 'disabled' : ''}>生成修复</button><button type="button" class="ghost-btn" data-remote-ci-action="rerun" data-check-id="${escapeHtml(job.checkRunId)}" ${blocked ? 'disabled' : ''}>重新运行</button></div>` : ''}</li>`).join('') || '<li>没有 Actions jobs</li>'}</ul></div>`;
+}
+
+async function runRemoteCiAction(action, checkRunId) {
+  const project = sessionProject();
+  const pr = pullRequestView.detail;
+  if (!project?.path || !pr || pullRequestView.busy) return;
+  const profileId = document.getElementById('remote-ci-profile')?.value || '';
+  const sessionId = activeSessionId;
+  const sequence = pullRequestView.detailSeq;
+  pullRequestView.busy = true;
+  renderPullRequestView();
+  try {
+    const token = await bindWorktreeProject(project);
+    const snapshot = await window.codex.snapshotRemoteCi({ projectBindingId: token, prNumber: pr.number, checkRunId });
+    if (!snapshot?.ok) throw new Error(snapshot?.code || '来源不可用');
+    if (sessionProject()?.id !== project.id || sequence !== pullRequestView.detailSeq) return;
+    const item = snapshot.snapshot;
+    let result;
+    if (action === 'rerun') {
+      result = await window.codex.rerunRemoteCi({ projectBindingId: token, remoteCiRef: snapshot.remoteCiRef });
+      if (result?.ok) toast('已请求重新运行，请手动刷新。新失败需重新生成来源。');
+    } else {
+      const note = await appPrompt(`PR #${item.prNumber} · ${item.headSha.slice(0, 12)}\n${item.workflowName} / ${item.jobName} · attempt ${item.runAttempt}\n诊断 ${item.annotationCount} 条 · ${item.logsAvailable ? '日志可用' : '日志不可用'}\n可选：补充失败现象`, '', '生成隔离修复');
+      if (note == null || sessionProject()?.id !== project.id || sequence !== pullRequestView.detailSeq) return;
+      result = await window.codex.startEngineeringRepair({ projectBindingId: token, source: { kind: 'remote_ci', remoteCiRef: snapshot.remoteCiRef }, ...(profileId ? { validationProfileId: profileId } : {}), note, sessionId });
+      if (result?.ok) toast('修复已启动，可在工程中心查看进度');
+    }
+    if (!result?.ok) throw new Error(result?.code || '操作失败');
+  } catch (error) { toast(error?.message || '远程 CI 操作失败'); }
+  finally { pullRequestView.busy = false; renderPullRequestView(); }
+}
+
 async function loadPullRequestDetail(number, { resultId = '' } = {}) {
   const project = sessionProject();
   if (!project?.path || !window.codex?.getPullRequest) return;
@@ -3548,6 +3605,8 @@ async function loadPullRequestDetail(number, { resultId = '' } = {}) {
   pullRequestView.selectedNumber = Number(number) || 0;
   pullRequestView.resultId = String(resultId || '');
   pullRequestView.detail = null;
+  pullRequestView.remoteCi = null;
+  pullRequestView.remoteProfiles = [];
   pullRequestView.error = '';
   renderPullRequestView();
   try {
@@ -3562,6 +3621,16 @@ async function loadPullRequestDetail(number, { resultId = '' } = {}) {
     pullRequestView.selectedNumber = pullRequestView.detail?.number || pullRequestView.selectedNumber;
     if (response.result) attachWorktreeResult(response.result, project.id, response.result.sessionId);
     if (response.checksError) pullRequestView.error = response.checksError;
+    renderPullRequestView();
+    if (window.codex.getRemoteCiFailures) {
+      const [ci, profiles] = await Promise.all([
+        window.codex.getRemoteCiFailures({ projectBindingId: token, prNumber: pullRequestView.selectedNumber }),
+        window.codex.listVerificationProfiles({ projectBindingId: token }),
+      ]);
+      if (sequence !== pullRequestView.detailSeq || sessionProject()?.id !== project.id) return;
+      pullRequestView.remoteCi = ci;
+      pullRequestView.remoteProfiles = (profiles?.profiles || []).filter((profile) => profile.enabled !== false).map((profile) => ({ id: profile.id, name: profile.name }));
+    }
   } catch (error) {
     if (sequence === pullRequestView.detailSeq) pullRequestView.error = error?.message || String(error);
   } finally {
