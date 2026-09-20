@@ -13,6 +13,7 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - AI：**本地模拟** 或 **OpenAI 兼容 API**
 - **Phase A Agent 核心**：权限三档、内联审批、grep/glob/search_replace、流式正文 + 工具轨迹
 - **Phase B 工程闭环**：写盘 unified diff 审批、`git_status` / `git_diff` / `git_commit`、底部终端面板、输入框 `@文件` 引用
+- **Phase D.15 CI 跟踪**：手动跟踪 PR 当前提交的 GitHub Actions，后台运行、应用内未读提醒、可选 Windows 通知
 
 ## 开发
 
@@ -852,3 +853,18 @@ D12 把 D11 profile 组合成受控 DAG 工作流。用户可以显式运行 `ty
 
 - `docs/superpowers/specs/2026-09-04-phase-d12-engineering-workflows-design.md`
 - `docs/superpowers/plans/2026-09-04-phase-d12-engineering-workflows.md`
+
+## Phase D.15：后台 CI 跟踪
+
+在已绑定项目的「拉取请求」详情中点击「跟踪 CI」，选择最长 15 / 30 / 60 分钟（默认 30）。D14 更新 PR 后也有「跟踪 CI（30 分钟）」快捷按钮；重跑后仍需显式开始跟踪，不会自动执行下一步。
+
+- 使用现有 `gh` 登录，只读取 origin 同仓库 PR 当前提交的 Actions 元数据，不读取日志。
+- 切换页面、项目、会话或最小化后继续运行；系统休眠暂停查询，恢复后按原期限继续或结束。
+- 每轮结束后间隔 15 秒查询，单轮总预算 15 秒；全部已发现工作流完成并稳定 30 秒后，再确认 PR head 未变化。
+- PR 出现新提交即结束本次跟踪；空列表、全跳过、取消和未知结论不会被当作通过。应用每项目最多 1 条、总共最多 3 条活动跟踪。
+- 工程中心查看当前项目历史，工具栏「CI 结果」查看跨项目未读提醒。失败结果可手动「查看失败」，仍使用 D14 的新鲜度检查与独立审批。
+- 设置中可开启 Windows 通知，默认关闭。应用内未读结果始终保留；停止跟踪不会取消远端 Actions。
+
+记录仅在本次应用进程中存在，最多保留 50 条已结束记录；刷新 renderer 可恢复内存记录，退出 / 重启应用则清空。跟踪不自动修复、重跑、push 或合并；「已发现的 Actions 通过」不等于满足 PR 合并条件。
+
+设计与验收状态见 [D15 设计](docs/superpowers/specs/2026-09-20-phase-d15-ci-watch-design.md) 和 [实施记录](docs/superpowers/plans/2026-09-20-phase-d15-ci-watch.md)。离线桌面冒烟：`node scripts/smoke-ci-watch.cjs`（临时独立配置、假 GitHub、无网络和系统通知）。

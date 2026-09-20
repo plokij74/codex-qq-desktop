@@ -8,6 +8,8 @@ const { isRepairRef } = require('./repair-state');
 const { createRemoteCiManager } = require('./remote-ci-manager');
 const { createRemoteCiStore } = require('./remote-ci-store');
 const { createGithubCli } = require('./github-cli');
+const { createCiWatchManager } = require('./ci-watch-manager');
+const { validWatchRef, error: ciWatchError } = require('./ci-watch-state');
 
 function error(code, message) {
   return { ok: false, code, error: String(message || code).slice(0, 500) };
@@ -48,14 +50,36 @@ function createEngineeringIpcHandlers(options = {}) {
   let workflows = null;
   let repairs = null;
   let remoteCi = null;
+  let ciWatches = null;
   const remoteProtected = new Set();
   const remoteOwners = new Map();
+
+  function getCiWatches() {
+    if (!ciWatches) ciWatches = options.ciWatchManager || createCiWatchManager({
+      githubCli: options.githubCli,
+      onEvent: (event) => options.onCiWatchEvent?.(event, [...(projectOwners.get(event.projectKey) || [])]),
+    });
+    return ciWatches;
+  }
+
+  function ciWatchRequest(event, payload, fields, fn) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || Object.keys(payload).some((key) => !['projectBindingId', ...fields].includes(key))) return Promise.resolve(ciWatchError('CI_WATCH_INVALID'));
+    const binding = getBinding(event, payload);
+    if (!binding || event.sender?.isDestroyed?.()) return Promise.resolve(ciWatchError('CI_WATCH_PROJECT_BINDING_INVALID'));
+    if (fields.includes('watchRef') && !validWatchRef(payload.watchRef)) return Promise.resolve(ciWatchError('CI_WATCH_INVALID'));
+    return Promise.resolve().then(() => {
+      if (event.sender?.isDestroyed?.() || getBinding(event, payload)?.projectPath !== binding.projectPath) return ciWatchError('CI_WATCH_PROJECT_BINDING_INVALID');
+      return fn(getCiWatches(), binding.projectPath);
+    });
+  }
 
   function getRemoteCi() {
     if (!remoteCi) remoteCi = options.remoteCiManager || createRemoteCiManager({
       githubCli: options.githubCli || createGithubCli(),
       worktreeManager: options.worktreeManager,
       mutationLock: options.withMutation,
+      onRerunEvent: (event) => getCiWatches().noteRerun(event),
       store: createRemoteCiStore({ userDataPath: options.userDataPath, safeStorage: options.safeStorage,
         // Until a project has been scanned, conservatively retain its sources.
         isProtected: (ref, item) => !remoteProtected.has(item.projectKey) || remoteProtected.has(ref),
@@ -118,7 +142,10 @@ function createEngineeringIpcHandlers(options = {}) {
 
   function forgetOwnerProject(owner, projectPath) {
     if (owner == null || !projectPath) return;
-    const key = projectKey(projectPath);
+    forgetOwnerKey(owner, projectKey(projectPath));
+  }
+
+  function forgetOwnerKey(owner, key) {
     const projects = ownerProjects.get(owner);
     projects?.delete(key);
     if (projects?.size) {
@@ -300,6 +327,15 @@ function createEngineeringIpcHandlers(options = {}) {
   }
 
   return {
+    ciWatchStart: (event, payload) => ciWatchRequest(event, payload, ['prNumber', 'durationMinutes'], (m, root) => m.start(root, payload.prNumber, payload.durationMinutes)),
+    ciWatchList: (event, payload) => ciWatchRequest(event, payload, [], (m, root) => m.list(root)),
+    ciWatchGet: (event, payload) => ciWatchRequest(event, payload, ['watchRef'], (m, root) => m.get(root, payload.watchRef)),
+    ciWatchStop: (event, payload) => ciWatchRequest(event, payload, ['watchRef'], (m, root) => m.stop(root, payload.watchRef)),
+    ciWatchAck: (event, payload) => ciWatchRequest(event, payload, ['watchRef'], (m, root) => m.ack(root, payload.watchRef)),
+    ciWatchOwnerIds: (key) => [...(projectOwners.get(key) || [])],
+    ciWatchNavigation: (owner, key, ref) => projectOwners.get(key)?.has(owner) ? ciWatches?.navigation(key, ref) || null : null,
+    suspendCiWatches: () => ciWatches?.suspend(),
+    resumeCiWatches: () => ciWatches?.resume(),
     remoteCiFailures: (event, payload) => remoteRequest(event, payload, ['prNumber'], (m, b) => m.failures(b.projectPath, payload.prNumber)),
     remoteCiSnapshot: (event, payload) => remoteRequest(event, payload, ['prNumber', 'checkRunId'], async (m, b) => {
       const key = projectKey(b.projectPath);
@@ -393,9 +429,11 @@ function createEngineeringIpcHandlers(options = {}) {
     unbind: (event, payload = {}) => {
       const owner = ownerId(event);
       const own = localBindings.get(owner);
+      const binding = own?.get(String(payload.projectBindingId || ''));
       if (!own?.delete(String(payload.projectBindingId || ''))) return error('ENGINEERING_PROJECT_BINDING_INVALID', '项目绑定已失效');
       if (own.size === 0) localBindings.delete(owner);
-      forgetOwner(owner);
+      forgetOwnerProject(owner, binding.projectPath);
+      if (!projectOwners.has(projectKey(binding.projectPath))) ciWatches?.dropProject(binding.projectPath);
       return { ok: true };
     },
 
@@ -582,8 +620,10 @@ function createEngineeringIpcHandlers(options = {}) {
     syncOwnerBindings: (eventOrId, projectPaths = []) => {
       const owner = typeof eventOrId === 'number' ? eventOrId : ownerId(eventOrId);
       if (owner == null) return;
-      forgetOwner(owner);
-      for (const projectPath of projectPaths) rememberOwner(owner, projectPath);
+      const roots = projectPaths.map(canonicalProjectPath).filter(Boolean);
+      const retained = new Set(roots.map(projectKey));
+      for (const key of ownerProjects.get(owner) || []) if (!retained.has(key)) forgetOwnerKey(owner, key);
+      for (const root of roots) rememberOwner(owner, root);
     },
     dropSender: (eventOrId) => {
       const owner = typeof eventOrId === 'number' ? eventOrId : ownerId(eventOrId);
@@ -601,6 +641,7 @@ function createEngineeringIpcHandlers(options = {}) {
       const binding = getBinding(event, payload);
       if (!binding) return false;
       forgetOwnerProject(ownerId(event), binding.projectPath);
+      if (!projectOwners.has(projectKey(binding.projectPath))) ciWatches?.dropProject(binding.projectPath);
       return true;
     },
     dropProject: (eventOrId, projectPath) => {
@@ -608,6 +649,7 @@ function createEngineeringIpcHandlers(options = {}) {
       const root = canonicalProjectPath(projectPath);
       if (owner == null || !root) return false;
       forgetOwnerProject(owner, root);
+      if (!projectOwners.has(projectKey(root))) ciWatches?.dropProject(root);
       return true;
     },
     // Constructing the manager decrypts the job/grant stores and rewrites any
@@ -629,6 +671,7 @@ function createEngineeringIpcHandlers(options = {}) {
       };
     },
     close: () => {
+      ciWatches?.close();
       for (const active of remoteOwners.values()) for (const abort of active) abort.abort();
       remoteCi?.store?.close();
       for (const index of indexes.values()) index.close();

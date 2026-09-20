@@ -67,11 +67,42 @@ html, body {
 /* Toolbar */
 .qq-toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 2px;
   padding: 4px 8px;
   background: linear-gradient(#eaf4fc, #d5e8f8);
   border-bottom: 1px solid #9db8d4;
 }
+/* D15 metadata-only CI tracking, independent from PR editing and chat. */
+.ci-watch-toolbar-btn {
+  margin-left: auto;
+  padding: 4px 10px;
+  border: 1px solid #91b4d3;
+  border-radius: 3px;
+  background: linear-gradient(#fff, #dfedfa);
+  color: #24517b;
+  font: inherit;
+  cursor: pointer;
+}
+.ci-watch-toolbar-btn.has-unread { border-color: #d4a43b; background: #fff3c9; color: #694400; }
+.ci-watch-panel { margin-top: 12px; padding: 10px; border: 1px solid #b7d0e4; border-radius: 4px; background: #f3f8fd; }
+.ci-watch-panel h3 { margin: 0 0 6px; font-size: 13px; color: #24517b; }
+.ci-watch-controls, .ci-watch-record-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; }
+.ci-watch-controls { margin: 8px 0; }
+.ci-watch-controls label { display: flex; align-items: center; gap: 5px; }
+.ci-watch-controls select { border: 1px solid #91b4d3; padding: 3px; background: #fff; font: inherit; }
+.ci-watch-record { min-width: 0; margin: 8px 0; padding: 9px; border: 1px solid #c8dae9; border-radius: 3px; background: #fff; overflow-wrap: anywhere; }
+.ci-watch-record.is-unread { border-left: 3px solid #d4a43b; }
+.ci-watch-record .work-card-actions { flex-wrap: wrap; }
+.ci-watch-status { color: #425e79; font-size: 12px; }
+.ci-watch-status.passed { color: #217149; }
+.ci-watch-status.failed { color: #ab3030; }
+.ci-watch-status.attention { color: #865500; }
+.ci-watch-runs { list-style: none; padding: 0; max-height: 250px; overflow: auto; user-select: text; }
+.ci-watch-runs li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 5px 0; border-bottom: 1px solid #e0eaf2; }
+.ci-watch-runs li > span { min-width: 0; overflow-wrap: anywhere; }
+.ci-watch-inbox { position: fixed; z-index: 90; right: 12px; top: 68px; width: min(480px, calc(100vw - 24px)); max-height: calc(100vh - 86px); padding: 12px; overflow: auto; background: #eef6fd; border: 1px solid #739fc4; border-radius: 5px; box-shadow: 0 5px 24px #234c7940; }
+.ci-watch-inbox-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: #24517b; }
 .tb-btn {
   border: 1px solid transparent;
   background: transparent;

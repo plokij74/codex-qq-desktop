@@ -9,8 +9,11 @@ const {
   MAX_RAW_LOG_BYTES,
   normalizeDecimalId,
   normalizeSha,
+  normalizeHeadRef,
+  repositoryKey,
   redactRemoteText,
 } = require('./remote-ci-state');
+const { MAX_RUNS: MAX_WATCH_RUNS, normalizeRuns: normalizeWatchRuns } = require('./ci-watch-state');
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const OUTPUT_MAX = 256 * 1024;
@@ -151,19 +154,27 @@ function runCommand(command, args, opts = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
       resolve(result);
     };
     let child;
+    const onAbort = () => {
+      try { child?.kill?.(); } catch {}
+      finish({ ok: false, code: -1, stdout: '', stderr: '', error: '请求已取消', aborted: true });
+    };
+    if (opts.signal?.aborted) { onAbort(); return; }
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
     try {
       child = impl(command, args, {
         cwd: opts.cwd,
         encoding: 'utf8',
         windowsHide: true,
+        shell: false,
         timeout: timeoutMs,
         maxBuffer: OUTPUT_MAX,
       }, (err, stdout, stderr) => {
         if (err && err.code === 'ENOENT') {
-          finish({ ok: false, code: -1, stdout: '', stderr: '', error: `${command} 未安装或无法执行` });
+          finish({ ok: false, code: -1, stdout: '', stderr: '', error: `${command} 未安装或无法执行`, commandMissing: true });
           return;
         }
         const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
@@ -173,7 +184,8 @@ function runCommand(command, args, opts = {}) {
         finish({
           ok: !err,
           code,
-          stdout: clip(stdout, OUTPUT_MAX),
+          // Raw metadata is parsed privately by apiWatchJson, never sent to IPC.
+          stdout: opts.rawOutput === true ? String(stdout || '').slice(0, OUTPUT_MAX) : clip(stdout, OUTPUT_MAX),
           stderr: clip(stderr, OUTPUT_MAX),
           error,
         });
@@ -185,7 +197,7 @@ function runCommand(command, args, opts = {}) {
     if (!settled) {
       timer = setTimeout(() => {
         try { child?.kill?.(); } catch { /* ignore */ }
-        finish({ ok: false, code: -1, stdout: '', stderr: '', error: `${command} 超时` });
+        finish({ ok: false, code: -1, stdout: '', stderr: '', error: `${command} 超时`, timedOut: true });
       }, timeoutMs + 100);
     }
   });
@@ -433,6 +445,120 @@ function createGithubCli(opts = {}) {
     const parsed = parseJson(result.stdout);
     if (!result.ok || parsed == null) return { ok: false, code: 'GH_API_FAILED', error: clip(result.error || 'GitHub API 返回无效结果'), uncertain: result.code === -1 };
     return { ok: true, value: parsed };
+  }
+
+  // D15 GET-only metadata path. Keep headers until status/rate-limit parsing;
+  // the old command formatter intentionally flattens lines for other callers.
+  async function apiWatchJson({ repoRoot, host, endpoint, jq, signal, timeoutMs: queryTimeout }) {
+    const result = await command('gh', ['api', '--hostname', host, '--method', 'GET', '--include', endpoint, '--jq', jq], {
+      cwd: repoRoot, signal, timeoutMs: queryTimeout, rawOutput: true,
+    });
+    const failure = (code, extra = {}) => ({ ok: false, code, error: code, ...extra });
+    if (result.aborted) return failure('CI_WATCH_ABORTED');
+    if (result.commandMissing) return failure('CI_WATCH_GH_UNAVAILABLE');
+    if (result.timedOut) return failure('CI_WATCH_QUERY_TIMEOUT', { transient: true });
+    let body = result.stdout;
+    let status = 0;
+    let headers = {};
+    for (let i = 0; i < 5 && /^HTTP\//i.test(body); i++) {
+      const split = body.match(/\r?\n\r?\n/);
+      if (!split) break;
+      const lines = body.slice(0, split.index).split(/\r?\n/);
+      status = Number(lines.shift().match(/^HTTP\/[\d.]+\s+(\d{3})/i)?.[1]) || 0;
+      headers = {};
+      for (const line of lines) {
+        const pair = line.match(/^([a-z0-9-]+):\s*(.*)$/i);
+        if (pair && ['retry-after', 'x-ratelimit-remaining', 'x-ratelimit-reset'].includes(pair[1].toLowerCase())) headers[pair[1].toLowerCase()] = pair[2];
+      }
+      body = body.slice(split.index + split[0].length);
+    }
+    if (status === 429 || (status === 403 && (headers['x-ratelimit-remaining'] === '0' || headers['retry-after'] || /rate limit/i.test(result.error)))) {
+      const now = opts.now ? opts.now() : Date.now();
+      const retry = headers['retry-after'];
+      const retryMs = retry && /^\d+(?:\.\d+)?$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry || '') - now;
+      const resetMs = Number(headers['x-ratelimit-reset']) * 1000 - now;
+      const retryAfterMs = Math.max(Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 0,
+        headers['x-ratelimit-remaining'] === '0' && Number.isFinite(resetMs) && resetMs > 0 ? resetMs : 0) || 60_000;
+      return failure('CI_WATCH_RATE_LIMITED', { rateLimited: true, retryAfterMs, host });
+    }
+    if (status === 401) return failure('CI_WATCH_AUTH_REQUIRED');
+    if (status === 403) return failure('CI_WATCH_FORBIDDEN');
+    if (status === 404 || status === 410) return failure('CI_WATCH_TARGET_NOT_FOUND');
+    if (status >= 500 || (!status && !result.ok)) return failure('CI_WATCH_NETWORK', { transient: true });
+    if (!result.ok || status !== 200) return failure('CI_WATCH_INCOMPLETE');
+    const value = parseJson(body);
+    return value ? { ok: true, value } : failure('CI_WATCH_INCOMPLETE');
+  }
+
+  function validWatchRepo(host, owner, repo) {
+    return /^[a-z0-9][a-z0-9.-]*(?::\d{1,5})?$/i.test(String(host || ''))
+      && [owner, repo].every((part) => typeof part === 'string' && part.length <= 255 && /^[a-z0-9][a-z0-9_.-]*$/i.test(part));
+  }
+
+  async function getCiWatchOrigin({ repoRoot, signal, timeoutMs: queryTimeout }) {
+    const out = await git(repoRoot, ['config', '--get', 'remote.origin.url'], { signal, timeoutMs: queryTimeout });
+    const remote = out.ok ? parseRemote(out.stdout) : null;
+    if (!remote || !validWatchRepo(remote.host, remote.owner, remote.repo)) return { ok: false, code: 'CI_WATCH_REPOSITORY_INVALID' };
+    return { ok: true, remote, repoKey: repositoryKey(remote.host, remote.nameWithOwner) };
+  }
+
+  async function getCiWatchRepository({ projectPath, signal, timeoutMs: queryTimeout, getHostCooldownMs }) {
+    const top = await git(projectPath, ['rev-parse', '--show-toplevel'], { signal, timeoutMs: queryTimeout });
+    if (!top.ok || !top.stdout) return { ok: false, code: 'CI_WATCH_REPOSITORY_INVALID' };
+    const repoRoot = path.resolve(top.stdout.trim());
+    const origin = await getCiWatchOrigin({ repoRoot, signal, timeoutMs: queryTimeout });
+    if (!origin.ok) return origin;
+    const { host, owner, repo, nameWithOwner } = origin.remote;
+    const cooldown = getHostCooldownMs?.(host);
+    if (Number.isFinite(cooldown) && cooldown > 0) {
+      return { ok: false, code: 'CI_WATCH_RATE_LIMITED', rateLimited: true, retryAfterMs: cooldown, host };
+    }
+    const result = await apiWatchJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}`, jq: '{full_name}', signal, timeoutMs: queryTimeout });
+    if (!result.ok) return result;
+    if (String(result.value.full_name || '').toLowerCase() !== nameWithOwner.toLowerCase()) return { ok: false, code: 'CI_WATCH_REPOSITORY_INVALID' };
+    return { ok: true, repository: { repoRoot, host, owner, repo, nameWithOwner, repoKey: origin.repoKey } };
+  }
+
+  async function getCiPrStatus({ repoRoot, host, owner, repo, number, signal, timeoutMs: queryTimeout }) {
+    const n = prNumber(number);
+    if (!n || !validWatchRepo(host, owner, repo)) return { ok: false, code: 'CI_WATCH_INVALID' };
+    const result = await apiWatchJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/pulls/${n}`,
+      jq: '{number,state,merged,head_sha:.head.sha,head_ref:.head.ref,head_repo:.head.repo.full_name,base_repo:.base.repo.full_name}', signal, timeoutMs: queryTimeout });
+    if (!result.ok) return result;
+    const raw = result.value;
+    if (raw.number !== n || !['open', 'closed'].includes(raw.state)
+      || typeof raw.merged !== 'boolean' || (raw.head_repo !== null && typeof raw.head_repo !== 'string')
+      || String(raw.base_repo || '').toLowerCase() !== `${owner}/${repo}`.toLowerCase()) return { ok: false, code: 'CI_WATCH_PR_INVALID' };
+    return { ok: true, pr: {
+      number: n, state: raw.merged === true ? 'MERGED' : raw.state.toUpperCase(),
+      headSha: normalizeSha(raw.head_sha), headRefName: normalizeHeadRef(raw.head_ref),
+      headRepository: typeof raw.head_repo === 'string' ? raw.head_repo.slice(0, 600) : '',
+      isCrossRepository: !raw.head_repo || raw.head_repo.toLowerCase() !== raw.base_repo.toLowerCase(),
+    } };
+  }
+
+  async function getCiRunsForHead({ repoRoot, host, owner, repo, headSha, signal, timeoutMs: queryTimeout }) {
+    const head = normalizeSha(headSha);
+    if (!head || !validWatchRepo(host, owner, repo)) return { ok: false, code: 'CI_WATCH_INVALID' };
+    const runs = [];
+    let total = null;
+    const jq = '{total_count,workflow_runs:[.workflow_runs[]|{id:(.id|tostring),name,head_sha,run_attempt,status,conclusion}]}';
+    for (let page = 1; page <= 2; page++) {
+      const result = await apiWatchJson({ repoRoot, host, endpoint: `repos/${owner}/${repo}/actions/runs?head_sha=${head}&per_page=100&page=${page}`, jq, signal, timeoutMs: queryTimeout });
+      if (!result.ok) return result;
+      const count = result.value.total_count;
+      const rows = result.value.workflow_runs;
+      if (!Number.isSafeInteger(count) || count < 0 || !Array.isArray(rows) || (total != null && total !== count)) return { ok: false, code: 'CI_WATCH_INCOMPLETE' };
+      total = count;
+      if (total > MAX_WATCH_RUNS) return { ok: true, runs: [], truncated: true };
+      if (rows.length !== Math.min(100, total - runs.length)) return { ok: false, code: 'CI_WATCH_INCOMPLETE' };
+      runs.push(...rows);
+      if (runs.length === total) break;
+    }
+    const normalized = normalizeWatchRuns(runs, head);
+    return normalized && normalized.length === total
+      ? { ok: true, runs: normalized, truncated: false }
+      : { ok: false, code: 'CI_WATCH_INCOMPLETE' };
   }
 
   async function preflight({ repoRoot, baseHead }) {
@@ -749,6 +875,7 @@ function createGithubCli(opts = {}) {
     getCheckRunsForRef, getCheckRun, getCheckRunContent, getCheckAnnotations, getActionsRun, getActionsJob,
     getActionsJobLog, rerunActionsJob, branchTip, exactLeasePush,
     fetchBranchToRef, resolveCommit, deleteInternalRef,
+    getCiWatchRepository, getCiWatchOrigin, getCiPrStatus, getCiRunsForHead,
   };
 }
 

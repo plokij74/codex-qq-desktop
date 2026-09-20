@@ -197,6 +197,8 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
       return binding ? { ...binding } : null;
     },
     hasProjectBinding,
+    // Main-only ownership reconciliation; never expose canonical paths via IPC.
+    listProjectPaths: (event) => [...new Set([...(bindingsBySender.get(senderId(event))?.values() || [])].map((binding) => binding.projectPath))],
     unbind,
     list,
     get,

@@ -121,6 +121,7 @@ class RemoteCiManager {
     this.getProfiles = options.getProfiles;
     this.mutationLock = options.mutationLock;
     this.pendingMutations = new Set();
+    this.onRerunEvent = options.onRerunEvent;
   }
 
   _root(projectPath) {
@@ -536,7 +537,22 @@ class RemoteCiManager {
       if (!approval?.allowed) throw remoteCiError('REMOTE_CI_RERUN_CONFIRM_REQUIRED', '用户拒绝重新运行 job');
       const fresh = await this.resolveMetadata(root, remoteCiRef);
       if (context.isCurrent?.() === false || context.signal?.aborted) throw remoteCiError('REMOTE_CI_RERUN_CONFIRM_REQUIRED');
-      const out = await this.github.rerunActionsJob({ repoRoot: fresh.repo.repoRoot, host: fresh.repo.remote.host, owner: fresh.repo.remote.owner, repo: fresh.repo.remote.repo, jobId: fresh.snapshot.jobId });
+      const rerunEvent = (phase) => {
+        try { this.onRerunEvent?.({
+          projectPath: root, repoKey: fresh.snapshot.repoKey, prNumber: fresh.snapshot.prNumber,
+          headSha: fresh.snapshot.headSha, runId: fresh.snapshot.runId, runAttempt: fresh.snapshot.runAttempt,
+          remoteCiRef, phase,
+        }); } catch {}
+      };
+      rerunEvent('sending');
+      let out;
+      try {
+        out = await this.github.rerunActionsJob({ repoRoot: fresh.repo.repoRoot, host: fresh.repo.remote.host, owner: fresh.repo.remote.owner, repo: fresh.repo.remote.repo, jobId: fresh.snapshot.jobId });
+      } catch (cause) {
+        rerunEvent('uncertain');
+        throw remoteCiError('REMOTE_CI_RERUN_UNCERTAIN');
+      }
+      rerunEvent(out?.ok ? 'requested' : out?.uncertain ? 'uncertain' : 'failed');
       if (!out?.ok) throw remoteCiError(out?.uncertain ? 'REMOTE_CI_RERUN_UNCERTAIN' : 'REMOTE_CI_RERUN_FAILED', out?.error || '重新运行 job 失败');
       return { ok: true, requested: true, remoteCiRef };
     } catch (error) { return resultError(error, 'REMOTE_CI_RERUN_FAILED'); }

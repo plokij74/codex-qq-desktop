@@ -185,6 +185,21 @@ contextBridge.exposeInMainWorld('codex', {
   cancelEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:cancel', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || '') }),
   rerunEngineeringWorkflow: (payload = {}) => ipcRenderer.invoke('engineering:workflow:rerun', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), sessionId: String(payload?.sessionId || '') }),
   checkEngineeringWorkflowGate: (payload = {}) => ipcRenderer.invoke('engineering:workflow:gate-check', { projectBindingId: String(payload?.projectBindingId || ''), workflowRunRef: String(payload?.workflowRunRef || ''), action: String(payload?.action || ''), expectedFingerprint: String(payload?.expectedFingerprint || '') }),
+  startCiWatch: (payload = {}) => ipcRenderer.invoke('engineering:ci-watch:start', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber), ...(payload?.durationMinutes !== undefined ? { durationMinutes: Number(payload.durationMinutes) } : {}) }),
+  listCiWatches: (payload = {}) => ipcRenderer.invoke('engineering:ci-watch:list', { projectBindingId: String(payload?.projectBindingId || '') }),
+  getCiWatch: (payload = {}) => ipcRenderer.invoke('engineering:ci-watch:get', { projectBindingId: String(payload?.projectBindingId || ''), watchRef: String(payload?.watchRef || '') }),
+  stopCiWatch: (payload = {}) => ipcRenderer.invoke('engineering:ci-watch:stop', { projectBindingId: String(payload?.projectBindingId || ''), watchRef: String(payload?.watchRef || '') }),
+  ackCiWatch: (payload = {}) => ipcRenderer.invoke('engineering:ci-watch:ack', { projectBindingId: String(payload?.projectBindingId || ''), watchRef: String(payload?.watchRef || '') }),
+  onCiWatchEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('engineering:ci-watch:event', listener);
+    return () => ipcRenderer.removeListener('engineering:ci-watch:event', listener);
+  },
+  onCiWatchNavigate: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('engineering:ci-watch:navigate', listener);
+    return () => ipcRenderer.removeListener('engineering:ci-watch:navigate', listener);
+  },
   getRemoteCiFailures: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:failures', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber) }),
   snapshotRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:snapshot', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber), checkRunId: String(payload?.checkRunId || '') }),
   listRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),

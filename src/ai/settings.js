@@ -59,6 +59,7 @@ const DEFAULT_SETTINGS = {
   usageCurrency: '$',
   // Phase D.11 engineering
   codeIndexEnabled: true,
+  ciWatchSystemNotifications: false,
   verificationProfiles: [],
 };
 
@@ -199,6 +200,7 @@ function normalizeVerificationProfile(raw, options = {}) {
 }
 function clampVerificationSettings(s) {
   s.codeIndexEnabled = s.codeIndexEnabled !== false;
+  s.ciWatchSystemNotifications = s.ciWatchSystemNotifications === true;
   const list = Array.isArray(s.verificationProfiles) ? s.verificationProfiles : [];
   const seen = new Set(); const counts = new Map(); const projects = new Set(); const out = [];
   for (const item of list) {

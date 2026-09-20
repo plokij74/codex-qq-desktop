@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, safeStorage, Notification, powerMonitor } = require('electron');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
@@ -72,6 +72,7 @@ const { aggregate } = require('./ai/usage');
 const { createWorktreeManager } = require('./ai/worktree');
 const { createWorktreeIpcHandlers } = require('./ai/worktree-ipc');
 const { createEngineeringIpcHandlers } = require('./ai/engineering-ipc');
+const { createCiWatchNotifier } = require('./ai/ci-watch-notifications');
 const { createSubagentRuntime } = require('./ai/subagent-runtime');
 const { projectKey } = require('./ai/project-index');
 const {
@@ -138,6 +139,7 @@ let mcpTaskManager = null;
 let mcpElicitationController = null;
 let mcpTaskRecoveryHub = null;
 let engineeringIpc = null;
+let ciWatchNotifier = null;
 let quitting = false;
 const oauthFlowOwners = new Map();
 const oauthPendingOwnersByName = new Map();
@@ -197,6 +199,12 @@ function getEngineeringIpc() {
       });
     },
     getSettings: () => loadSettings(userDataPath()),
+    onCiWatchEvent: (event, ownerIds) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (ownerIds.includes(win.webContents.id)) safeSend(win.webContents, 'engineering:ci-watch:event', event);
+      }
+      if (event.notify) getCiWatchNotifier().publish(event);
+    },
     isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
     createPermissionGate: (event, settings) => createPermissionGate({
       permissionMode: PERMISSION_MODES.has(settings.permissionMode) ? settings.permissionMode : 'confirm-writes',
@@ -227,6 +235,18 @@ function getEngineeringIpc() {
     },
   });
   return engineeringIpc;
+}
+
+function getCiWatchNotifier() {
+  if (!ciWatchNotifier) ciWatchNotifier = createCiWatchNotifier({
+    Notification,
+    getWindows: () => BrowserWindow.getAllWindows(),
+    getOwnerIds: (key) => engineeringIpc?.ciWatchOwnerIds(key) || [],
+    canNavigate: (owner, key, ref) => engineeringIpc?.ciWatchNavigation(owner, key, ref),
+    navigate: (win, target) => safeSend(win.webContents, 'engineering:ci-watch:navigate', target),
+    isEnabled: () => !quitting && loadSettings(userDataPath()).ciWatchSystemNotifications === true,
+  });
+  return ciWatchNotifier;
 }
 
 function userDataPath() {
@@ -504,6 +524,7 @@ function toPublicSettings(s, senderId) {
     usagePricing: sanitizePricing(s.usagePricing),
     usageCurrency: String(s.usageCurrency ?? '$').slice(0, 4) || '$',
     codeIndexEnabled: s.codeIndexEnabled !== false,
+    ciWatchSystemNotifications: s.ciWatchSystemNotifications === true,
     // Generic settings expose only bounded summaries. Commands are available
     // solely through a sender-owned project binding in engineering IPC.
     verificationProfiles: (Array.isArray(s.verificationProfiles) ? s.verificationProfiles : []).slice(0, 100).map((p) => ({
@@ -615,6 +636,9 @@ if (!hasSingleInstanceLock) {
     // such before any window asks for it. This never re-runs a command.
     try { getEngineeringIpc().restoreAtStartup(); } catch {}
     createWindow();
+    if (process.platform === 'win32') app.setAppUserModelId?.('com.codex.qqdesktop');
+    powerMonitor?.on?.('suspend', () => engineeringIpc?.suspendCiWatches());
+    powerMonitor?.on?.('resume', () => engineeringIpc?.resumeCiWatches());
     restoreMcpTasksAtStartup().catch(() => {});
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -630,6 +654,7 @@ app.on('before-quit', (event) => {
   if (quitting) return;
   event.preventDefault();
   quitting = true;
+  ciWatchNotifier?.close();
   Promise.all([
     Promise.resolve().then(() => mcpOAuthManager?.closeAll?.()),
     Promise.resolve().then(() => mcpSessionManager?.closeAll?.()),
@@ -686,6 +711,7 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
     'webEnabled',
     'usageEnabled',
     'codeIndexEnabled',
+    'ciWatchSystemNotifications',
   ]) {
     if (k in nextPartial) nextPartial[k] = Boolean(nextPartial[k]);
   }
@@ -1248,7 +1274,18 @@ ipcMain.handle('memory:update', async (_e, payload = {}) => memoryUpdate({
 
 // Phase D.5 worktree results. Only bind accepts a project path; every later
 // call routes through the sender-scoped opaque binding token.
-ipcMain.handle('worktree:bind', async (event, payload = {}) => worktreeIpc.bind(event, payload));
+ipcMain.handle('worktree:bind', async (event, payload = {}) => {
+  const previousPaths = worktreeIpc.listProjectPaths(event);
+  const result = worktreeIpc.bind(event, payload);
+  if (result?.ok) {
+    const engineering = getEngineeringIpc();
+    for (const root of previousPaths) {
+      if (!worktreeIpc.hasProjectBinding(event, root)) engineering.dropProject(event, root);
+    }
+    engineering.syncOwnerBindings(event, worktreeIpc.listProjectPaths(event));
+  }
+  return result;
+});
 ipcMain.handle('worktree:unbind', async (event, payload = {}) => {
   const binding = worktreeIpc.resolveBinding(event, payload);
   const result = worktreeIpc.unbind(event, payload);
@@ -1307,6 +1344,11 @@ ipcMain.handle('engineering:workflow:cancel', async (event, payload = {}) => get
 ipcMain.handle('engineering:workflow:rerun', async (event, payload = {}) => getEngineeringIpc().workflowRerun(event, payload));
 ipcMain.handle('engineering:workflow:gate-check', async (event, payload = {}) => getEngineeringIpc().workflowGateCheck(event, payload));
 ipcMain.handle('engineering:repair:list', async (event, payload = {}) => getEngineeringIpc().repairList(event, payload));
+ipcMain.handle('engineering:ci-watch:start', (event, payload = {}) => getEngineeringIpc().ciWatchStart(event, payload));
+ipcMain.handle('engineering:ci-watch:list', (event, payload = {}) => getEngineeringIpc().ciWatchList(event, payload));
+ipcMain.handle('engineering:ci-watch:get', (event, payload = {}) => getEngineeringIpc().ciWatchGet(event, payload));
+ipcMain.handle('engineering:ci-watch:stop', (event, payload = {}) => getEngineeringIpc().ciWatchStop(event, payload));
+ipcMain.handle('engineering:ci-watch:ack', (event, payload = {}) => getEngineeringIpc().ciWatchAck(event, payload));
 ipcMain.handle('engineering:remote-ci:failures', (event, payload = {}) => getEngineeringIpc().remoteCiFailures(event, payload));
 ipcMain.handle('engineering:remote-ci:snapshot', (event, payload = {}) => getEngineeringIpc().remoteCiSnapshot(event, payload));
 ipcMain.handle('engineering:remote-ci:list', (event, payload = {}) => getEngineeringIpc().remoteCiList(event, payload));

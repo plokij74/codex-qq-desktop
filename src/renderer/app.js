@@ -41,6 +41,7 @@ const FRIENDS = [
 let sessions = [];
 let projects = [];
 const worktreeBindings = new Map();
+let ciWatchUi = null;
 const worktreePreviews = new Map();
 const worktreeActionBusy = new Set();
 const worktreeReconcileSeq = new Map();
@@ -665,11 +666,12 @@ function replaceProjectWorktreeResults(projectId, rawResults) {
 async function bindWorktreeProject(project, force = false) {
   if (force) worktreeBindings.delete(project.id);
   let token = worktreeBindings.get(project.id);
-  if (token) return token;
+  if (token) { ciWatchUi?.bindProject(project, token); return token; }
   const bound = await window.codex.bindWorktreeProject({ projectId: project.id, projectPath: project.path });
   if (!bound?.ok || !bound.projectBindingId) return '';
   token = bound.projectBindingId;
   worktreeBindings.set(project.id, token);
+  ciWatchUi?.bindProject(project, token);
   return token;
 }
 
@@ -1352,6 +1354,11 @@ async function worktreeAction(session, ref, action) {
     openPullRequestManager(ref);
     return;
   }
+  if (action === 'watchCi') {
+    await ciWatchUi?.bindProject(project, token);
+    await ciWatchUi?.start(project.id, ref.prUpdate?.prNumber, 30);
+    return;
+  }
   if (action === 'discard') {
     const remoteNote = ref.pr?.pushed ? '已推送的远端分支不会删除。' : '';
     if (!(await appConfirm(`确定丢弃这批隔离改动？主项目不会被修改。${remoteNote}`))) return;
@@ -1384,7 +1391,7 @@ async function worktreeAction(session, ref, action) {
       if (subject == null) return;
       response = await window.codex.updateRemoteCiPr({ projectBindingId: token, resultId: ref.id, subject });
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
-      if (response?.ok) toast('PR 已更新，请手动刷新 checks');
+      if (response?.ok) toast('PR 已更新，可点击「跟踪 CI」观察新提交');
     } else if (action === 'createPr') {
       const method = ref.canRetryPr ? window.codex.retryWorktreePr : window.codex.createWorktreePr;
       response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true, ...workflowGatePayload(project, 'create_pr', gateScope) });
@@ -1524,6 +1531,7 @@ function renderWorktreeCards(root, session) {
     if (ref.canApply) addButton(`应用全部（${fileCount} 个文件）`, 'apply', true, true, true);
     if (ref.canCreatePr) addButton(ref.canRetryPr ? '重试 PR' : '创建 Draft PR', 'prForm', true, false, true);
     if (ref.canUpdatePr) addButton(ref.canRetryPrUpdate ? '重试更新此 PR' : '更新此 PR', 'updatePr', true, false, true);
+    if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state) && ref.prUpdate?.prNumber) addButton('跟踪 CI（30 分钟）', 'watchCi');
     if (ref.canPreview) addButton('查看 diff', 'preview', true);
     if (ref.canDiscard) addButton('丢弃', 'discard', true, false, true);
     if (ref.canRetryCollect) addButton('重试收集', 'retryCollect', true, false, true);
@@ -2438,6 +2446,8 @@ async function renderEngineeringCenter() {
     else renderEngineeringApprovalCard(engineeringPendingApproval);
   }
   const refresh = () => refreshEngineeringIndexStatus(token);
+  body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div class="work-card-title">CI 跟踪</div><div id="engineering-ci-watches"></div></section>');
+  ciWatchUi?.mountCenter(document.getElementById('engineering-ci-watches'), sessionProject()?.id);
   document.getElementById('engineering-index-rebuild')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexRebuild({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引重建失败'); await refresh(); });
   document.getElementById('engineering-index-clear')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexClear({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引清除失败'); await refresh(); });
   document.getElementById('engineering-search-run')?.addEventListener('click', async () => {
@@ -2867,6 +2877,7 @@ async function deleteProject(id) {
   if (running) return toast('生成中无法删除该项目，请先停止');
   if (!(await appConfirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）'))) return;
   const worktreeBindingId = worktreeBindings.get(id);
+  ciWatchUi?.forgetProject(id);
   if (worktreeBindingId) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
     worktreeBindings.delete(id);
@@ -2896,6 +2907,11 @@ async function bindProjectPath(id) {
     return;
   }
   worktreeBindings.set(p.id, bound.projectBindingId);
+  ciWatchUi?.bindProject(p, bound.projectBindingId);
+  if (previous !== dir) {
+    resetPullRequestView(null);
+    pullRequestView.seq++; pullRequestView.detailSeq++;
+  }
   saveState(); renderLeftDynamic(); toast('已绑定：' + dir);
   reconcileWorktreeResults(p);
   if (sessionProject()?.id === id) updateHeader();
@@ -2928,6 +2944,7 @@ async function createProjectFromModal() {
   }
   projects.unshift(p);
   worktreeBindings.set(p.id, bound.projectBindingId);
+  ciWatchUi?.bindProject(p, bound.projectBindingId);
   saveState(); closeProjectModal(); openProjectChat(p.id); toast('项目已添加并绑定目录');
 }
 
@@ -3474,6 +3491,7 @@ function renderPullRequestView() {
       <section class="pr-detail-section">
         <h2>Checks</h2><div class="pr-check-summary">${escapeHtml(checkText)}</div><ul class="pr-check-list">${checksHtml}</ul>
         ${remoteCiPanelHtml(blocked)}
+        <div id="pr-ci-watch"></div>
       </section>
       <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
       <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
@@ -3498,6 +3516,7 @@ function renderPullRequestView() {
       <div class="pr-list">${listHtml || `<div class="pr-empty-small">${pullRequestView.loading ? '正在读取 GitHub…' : '没有匹配的 PR'}</div>`}${pullRequestView.truncated ? '<div class="pr-truncated">仅显示前 50 条</div>' : ''}</div>
       <div class="pr-detail">${detailHtml}</div>
     </div>`;
+  ciWatchUi?.mountPr(document.getElementById('pr-ci-watch'), { projectId: project.id, prNumber: pr?.number, state: pr?.state });
   document.getElementById('pr-state-filter')?.addEventListener('change', (event) => {
     pullRequestView.filter = event.target.value;
     pullRequestView.selectedNumber = 0;
@@ -3586,7 +3605,10 @@ async function runRemoteCiAction(action, checkRunId) {
     let result;
     if (action === 'rerun') {
       result = await window.codex.rerunRemoteCi({ projectBindingId: token, remoteCiRef: snapshot.remoteCiRef });
-      if (result?.ok) toast('已请求重新运行，请手动刷新。新失败需重新生成来源。');
+      if (result?.ok) {
+        toast('已请求重新运行，可点击「跟踪 CI」等待结果。新失败需重新生成来源。');
+        ciWatchUi?.offer(project.id, pr.number, '已请求重新运行。点击「跟踪 CI」后会等待新的 attempt，不会把旧失败当作重跑结果。');
+      }
     } else {
       const note = await appPrompt(`PR #${item.prNumber} · ${item.headSha.slice(0, 12)}\n${item.workflowName} / ${item.jobName} · attempt ${item.runAttempt}\n诊断 ${item.annotationCount} 条 · ${item.logsAvailable ? '日志可用' : '日志不可用'}\n可选：补充失败现象`, '', '生成隔离修复');
       if (note == null || sessionProject()?.id !== project.id || sequence !== pullRequestView.detailSeq) return;
@@ -4915,6 +4937,8 @@ async function openSettings() {
   if (tc) tc.checked = settings.terminalRequireConfirm !== false;
   const ci = document.getElementById('set-code-index-enabled');
   if (ci) ci.checked = settings.codeIndexEnabled !== false;
+  const ciNotifications = document.getElementById('set-ci-watch-notifications');
+  if (ciNotifications) ciNotifications.checked = settings.ciWatchSystemNotifications === true;
   const dam = document.getElementById('set-default-agent-mode');
   if (dam) dam.value = settings.defaultAgentMode === 'plan' ? 'plan' : 'agent';
   const vc = document.getElementById('set-verify-command');
@@ -5178,6 +5202,7 @@ async function saveSettingsFromForm() {
     terminalEnabled: Boolean(document.getElementById('set-terminal-enabled')?.checked),
     terminalRequireConfirm: document.getElementById('set-terminal-confirm')?.checked !== false,
     codeIndexEnabled: document.getElementById('set-code-index-enabled')?.checked !== false,
+    ciWatchSystemNotifications: document.getElementById('set-ci-watch-notifications')?.checked === true,
     defaultAgentMode: document.getElementById('set-default-agent-mode')?.value === 'plan' ? 'plan' : 'agent',
     verifyCommand: document.getElementById('set-verify-command')?.value?.trim() || '',
     verifyBeforeDone: document.getElementById('set-verify-before-done')?.checked !== false,
@@ -5497,6 +5522,27 @@ function bindEvents() {
 }
 function boot() {
   loadState();
+  ciWatchUi = window.CiWatchUi?.create({
+    api: window.codex, document, getProject, getToken: (id) => worktreeBindings.get(id), toast,
+    isVisible: (view, projectId) => currentView === view && sessionProject()?.id === projectId,
+    navigateToPr: async ({ projectId, prNumber, headSha, showFailures }) => {
+      if (!getProject(projectId)?.path) return false;
+      if (sessionProject()?.id !== projectId) openProjectChat(projectId);
+      resetPullRequestView(sessionProject());
+      pullRequestView.selectedNumber = prNumber;
+      pullRequestView.resultId = '';
+      setView('prs');
+      await loadPullRequestDetail(prNumber);
+      if (sessionProject()?.id !== projectId || pullRequestView.detail?.number !== prNumber || currentView !== 'prs') return false;
+      if (showFailures) {
+        if (headSha && pullRequestView.detail.headSha !== headSha) toast('PR 已有新提交，请在当前提交的 Actions 列表重新选择失败');
+        document.querySelector('.remote-ci-panel')?.scrollIntoView({ block: 'center' });
+      } else document.getElementById('pr-ci-watch')?.scrollIntoView({ block: 'center' });
+      return true;
+    },
+  });
+  const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);
+  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); }, { once: true });
   renderEmojiPanel();
   bindEvents();
   bindTerminalPanel();

@@ -6,6 +6,17 @@ const path = require('path');
 const { DEFAULT_SETTINGS, getSettingsPath, loadSettings, saveSettings } = require('../src/ai/settings');
 
 describe('settings', () => {
+  it('keeps CI watch system notifications opt-in and requires a literal boolean', (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d15-settings-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    assert.equal(loadSettings(dir).ciWatchSystemNotifications, false);
+    saveSettings(dir, { ciWatchSystemNotifications: true });
+    assert.equal(loadSettings(dir).ciWatchSystemNotifications, true);
+    for (const value of ['true', 1, {}, false]) {
+      saveSettings(dir, { ciWatchSystemNotifications: value });
+      assert.equal(loadSettings(dir).ciWatchSystemNotifications, false);
+    }
+  });
   it('getSettingsPath joins settings.json', () => {
     assert.equal(getSettingsPath(path.join('tmp', 'data')), path.join('tmp', 'data', 'settings.json'));
   });

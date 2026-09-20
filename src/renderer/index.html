@@ -30,6 +30,7 @@
       <button type="button" class="tb-btn" data-view="sites">站点</button>
       <button type="button" class="tb-btn" data-view="prs">拉取请求</button>
       <button type="button" class="tb-btn active" data-view="chat">聊天</button>
+      <button type="button" class="ci-watch-toolbar-btn" id="btn-ci-watch" aria-controls="ci-watch-inbox" aria-expanded="false">CI 结果</button>
     </nav>
 
     <div class="qq-body">
@@ -218,6 +219,7 @@
         <label class="switch-row"><input type="checkbox" id="set-terminal-enabled" /> <span>允许终端命令（默认关）</span></label>
         <label class="switch-row"><input type="checkbox" id="set-terminal-confirm" checked /> <span>全自动时终端仍需确认</span></label>
         <label class="switch-row"><input type="checkbox" id="set-code-index-enabled" checked /> <span>启用代码索引（词法近似定位）</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-ci-watch-notifications" /> <span>CI 跟踪结束时发送 Windows 通知（应用内提醒始终保留）</span></label>
         <label class="field">
           <span>新建会话默认模式</span>
           <select id="set-default-agent-mode">
@@ -376,11 +378,14 @@
   </div>
 
   <div id="ctx-menu" class="ctx-menu hidden"></div>
+  <div id="ci-watch-inbox" class="ci-watch-inbox hidden" role="dialog" aria-label="CI 跟踪结果"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="memory-commands.js"></script>
   <script src="memory-candidate-state.js"></script>
   <script src="worktree-result-state.js"></script>
   <script src="pr-state.js"></script>
+  <script src="ci-watch-state.js"></script>
+  <script src="ci-watch-ui.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

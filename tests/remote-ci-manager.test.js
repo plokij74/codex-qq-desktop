@@ -31,12 +31,13 @@ function fakeGithub(overrides = {}) {
   return api;
 }
 
-function fixture(github = fakeGithub()) {
+function fixture(github = fakeGithub(), onRerunEvent) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rci-manager-'));
   const store = createRemoteCiStore({ safeStorage: null });
   const worktrees = [];
   const manager = createRemoteCiManager({
     githubCli: github,
+    onRerunEvent,
     store,
     projectKey: () => 'a'.repeat(32),
     resolveRepo: () => ({ repoRoot: root }),
@@ -47,6 +48,31 @@ function fixture(github = fakeGithub()) {
 }
 
 describe('D14 remote CI manager', () => {
+  it('D15 emits trusted attempt barriers only after approval and before the rerun POST', async () => {
+    for (const disposition of ['requested', 'failed', 'uncertain', 'throw']) {
+      const events = [];
+      const f = fixture(fakeGithub(), (event) => events.push(event));
+      try {
+        const created = await f.manager.snapshot(f.root, 7, '101');
+        await f.manager.rerun(f.root, created.remoteCiRef);
+        assert.equal(events.length, 0);
+        f.github.rerunActionsJob = async () => {
+          assert.equal(events.at(-1).phase, 'sending');
+          if (disposition === 'throw') throw new Error('network');
+          return { ok: disposition === 'requested', uncertain: disposition === 'uncertain' };
+        };
+        await f.manager.rerun(f.root, created.remoteCiRef, { gate: { authorize: async () => ({ allowed: true }) } });
+        assert.deepEqual(events.map((event) => event.phase), ['sending', disposition === 'throw' ? 'uncertain' : disposition]);
+        assert.equal(events[0].headSha, head);
+        assert.equal(events[0].runId, '201');
+        assert.equal(events[0].runAttempt, 2);
+        assert.equal(events[0].prNumber, 7);
+        assert.equal(events[0].remoteCiRef, created.remoteCiRef);
+        assert.ok(events[0].repoKey);
+        assert.doesNotMatch(JSON.stringify(events), /private|log|command|annotation/);
+      } finally { f.cleanup(); }
+    }
+  });
   it('rejects missing same-repository proof, mismatched job names, and changed check content', async () => {
     const f = fixture();
     try {
