@@ -868,3 +868,16 @@ D12 把 D11 profile 组合成受控 DAG 工作流。用户可以显式运行 `ty
 记录仅在本次应用进程中存在，最多保留 50 条已结束记录；刷新 renderer 可恢复内存记录，退出 / 重启应用则清空。跟踪不自动修复、重跑、push 或合并；「已发现的 Actions 通过」不等于满足 PR 合并条件。
 
 设计与验收状态见 [D15 设计](docs/superpowers/specs/2026-09-20-phase-d15-ci-watch-design.md) 和 [实施记录](docs/superpowers/plans/2026-09-20-phase-d15-ci-watch.md)。离线桌面冒烟：`node scripts/smoke-ci-watch.cjs`（临时独立配置、假 GitHub、无网络和系统通知）。
+
+## Phase D.16：PR 审查反馈闭环
+
+在已绑定项目的「拉取请求」详情中使用「代码审查」面板，按线程查看讨论、生成隔离修复、回复或解决反馈。支持 origin 同仓库的 OPEN PR（包括 Draft），沿用 `gh` 登录，可连接支持相应 GraphQL 接口的 GitHub Enterprise。
+
+- 未解决、未过期且能定位到当前项目文件或 RIGHT 行的线程，可生成一次 D13 隔离修复。根评论来自旧提交也可以，只要当前锚点仍有效。
+- 每次只处理一个线程。工程中心查看进度、取消或运行可选本地复验；审阅 D5 diff 后单独确认「更新此 PR」，更新后可返回原线程或点击「跟踪 CI」。
+- 回复与解决互相独立，也不要求先修复。每个远端写动作都需一次性确认，`full-auto` 不会跳过。旧位置或删除文件的线程仍可按权限处理讨论。
+- 新评论、内容编辑、解决状态、位置或 PR head 变化会使旧修复来源失效。结果不确定时手动刷新核对；不自动重发。不确定的推送使用「核对更新状态」只读核对远端，暂时仍是旧 head 也不会重复推送。
+- 列表最多 200 个线程；详情最多 50 条评论，不完整时禁用修复与写入。回复最多 5000 字，补充说明最多 2000 字，完整修复提示超过 32 KiB 时拒绝生成。
+- 面板局部刷新，保留未提交的 PR 编辑和各线程草稿。草稿、讨论和提示不写入聊天、导出、记忆、usage 或 Hooks；快照仅加密保存必要元数据，加密不可用时仅保留在内存中。
+
+设计与验收状态见 [D16 设计](docs/superpowers/specs/2026-09-24-phase-d16-pr-review-feedback-design.md) 和 [实施记录](docs/superpowers/plans/2026-09-24-phase-d16-pr-review-feedback.md)。离线桌面冒烟：`node scripts/smoke-pr-review.cjs`，覆盖 1100×720 和 900×580。真实 GitHub.com / Enterprise 远端写入尚待指定测试仓库验收。

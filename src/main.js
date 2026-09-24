@@ -1349,6 +1349,13 @@ ipcMain.handle('engineering:ci-watch:list', (event, payload = {}) => getEngineer
 ipcMain.handle('engineering:ci-watch:get', (event, payload = {}) => getEngineeringIpc().ciWatchGet(event, payload));
 ipcMain.handle('engineering:ci-watch:stop', (event, payload = {}) => getEngineeringIpc().ciWatchStop(event, payload));
 ipcMain.handle('engineering:ci-watch:ack', (event, payload = {}) => getEngineeringIpc().ciWatchAck(event, payload));
+ipcMain.handle('engineering:pr-review:threads', (event, payload = {}) => getEngineeringIpc().prReviewThreads(event, payload));
+ipcMain.handle('engineering:pr-review:get', (event, payload = {}) => getEngineeringIpc().prReviewGet(event, payload));
+ipcMain.handle('engineering:pr-review:snapshot', (event, payload = {}) => getEngineeringIpc().prReviewSnapshot(event, payload));
+ipcMain.handle('engineering:pr-review:source', (event, payload = {}) => getEngineeringIpc().prReviewSource(event, payload));
+ipcMain.handle('engineering:pr-review:reply', (event, payload = {}) => getEngineeringIpc().prReviewReply(event, payload));
+ipcMain.handle('engineering:pr-review:resolve', (event, payload = {}) => getEngineeringIpc().prReviewResolve(event, payload));
+ipcMain.handle('engineering:pr-review:update-pr', (event, payload = {}) => getEngineeringIpc().prReviewUpdatePr(event, payload));
 ipcMain.handle('engineering:remote-ci:failures', (event, payload = {}) => getEngineeringIpc().remoteCiFailures(event, payload));
 ipcMain.handle('engineering:remote-ci:snapshot', (event, payload = {}) => getEngineeringIpc().remoteCiSnapshot(event, payload));
 ipcMain.handle('engineering:remote-ci:list', (event, payload = {}) => getEngineeringIpc().remoteCiList(event, payload));

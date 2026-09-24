@@ -200,6 +200,13 @@ contextBridge.exposeInMainWorld('codex', {
     ipcRenderer.on('engineering:ci-watch:navigate', listener);
     return () => ipcRenderer.removeListener('engineering:ci-watch:navigate', listener);
   },
+  getPrReviewThreads: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:threads', { projectBindingId: payload?.projectBindingId, prNumber: payload?.prNumber }),
+  getPrReviewThread: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:get', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef }),
+  snapshotPrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:snapshot', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision }),
+  getPrReviewSource: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:source', { projectBindingId: payload?.projectBindingId, reviewRef: payload?.reviewRef }),
+  replyPrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:reply', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision, body: payload?.body }),
+  resolvePrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:resolve', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision }),
+  updatePrReviewPr: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:update-pr', { projectBindingId: payload?.projectBindingId, resultId: payload?.resultId, subject: payload?.subject }),
   getRemoteCiFailures: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:failures', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber) }),
   snapshotRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:snapshot', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber), checkRunId: String(payload?.checkRunId || '') }),
   listRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),
@@ -213,9 +220,10 @@ contextBridge.exposeInMainWorld('codex', {
     const source = payload?.source && typeof payload.source === 'object' ? payload.source : {};
     const normalizedSource = source.kind === 'verification'
       ? { kind: 'verification', jobRef: String(source.jobRef || '') }
+      : source.kind === 'pr_review' ? { kind: 'pr_review', reviewRef: String(source.reviewRef || '') }
       : source.kind === 'remote_ci' ? { kind: 'remote_ci', remoteCiRef: String(source.remoteCiRef || '') }
         : { kind: 'workflow', workflowRunRef: String(source.workflowRunRef || ''), nodeId: String(source.nodeId || '').slice(0, 120) };
-    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || ''), ...(normalizedSource.kind === 'remote_ci' && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
+    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || ''), ...(['remote_ci', 'pr_review'].includes(normalizedSource.kind) && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
   },
   retryEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:retry', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || '') }),
   cancelEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),

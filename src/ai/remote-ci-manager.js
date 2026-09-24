@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('node:path');
+const { createRemoteWorktree, updatePr } = require('./pr-delivery');
 const {
   MAX_ANNOTATIONS,
   MAX_ANNOTATION_PATH,
@@ -415,30 +416,7 @@ class RemoteCiManager {
       outputTruncated: context.truncated || logTruncated,
     };
     const metadata = await this.resolveMetadata(root, remoteCiRef);
-    const createWorktree = async ({ project, sessionId, subagentId, goal, signal } = {}) => {
-      const fresh = await this.resolveMetadata(root, remoteCiRef);
-      const targetRef = `refs/codex/remote-ci/${createRemoteCiRef()}`;
-      if (!this.github.fetchBranchToRef || !this.github.resolveCommit || !this.github.deleteInternalRef || !this.worktree?.createAtCommit) {
-        return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程基线 worktree 能力不可用' };
-      }
-      let fetched = false;
-      try {
-        if (signal?.aborted) return { ok: false, code: 'REMOTE_CI_FETCH_FAILED' };
-        if (this.worktree.preflightRemoteCreate) {
-          const check = await this.worktree.preflightRemoteCreate({ projectPath: root });
-          if (!check?.ok) return check;
-        }
-        fetched = true;
-        const got = await this.github.fetchBranchToRef({ repoRoot: fresh.repo.repoRoot, branch: fresh.pr.headRefName, targetRef });
-        if (!got?.ok) return got;
-        fetched = true;
-        const commit = await this.github.resolveCommit({ repoRoot: fresh.repo.repoRoot, ref: targetRef });
-        if (!commit?.ok || !same(commit.head, fresh.baseHead)) return { ok: false, code: 'REMOTE_CI_FETCH_MISMATCH', error: '获取的 PR head 与来源不一致' };
-        return await this.worktree.createAtCommit({ project, baseHead: fresh.baseHead, sessionId, subagentId, goal, origin: { kind: 'remote_ci', remoteCiRef }, delivery: 'github_pr_update', signal });
-      } finally {
-        if (fetched) { try { await this.github.deleteInternalRef({ repoRoot: fresh.repo.repoRoot, ref: targetRef }); } catch {} }
-      }
-    };
+    const createWorktree = (args) => createRemoteWorktree(this, remoteCiRef, args);
     return {
       source: metadata.source,
       sourceFingerprint: metadata.sourceFingerprint,
@@ -459,67 +437,7 @@ class RemoteCiManager {
   }
 
   async updatePr(projectPath, resultId, subject, context = {}) {
-    const root = this._root(projectPath);
-    if (!root) return resultError({ code: 'REMOTE_CI_PROJECT_BINDING_INVALID' });
-    return this._exclusive(`${root}:${resultId}`, async () => {
-      let prepared = false;
-      let pushStarted = false;
-      try {
-        const inspect = async () => {
-          const found = await this.worktree.inspectRemoteResult({ projectPath: root, resultId });
-          if (!found?.ok) throw remoteCiError('PR_UPDATE_UNAVAILABLE');
-          const item = this.store?.get(found.marker.remoteCiRef, this.projectKey(root));
-          if (!item || item.headSha !== found.marker.baseHead) throw remoteCiError('PR_UPDATE_UNAVAILABLE');
-          const repo = await this._repository(root);
-          const pr = await this._pr(repo, item.prNumber);
-          if (repo.repoKey !== item.repoKey || pr.headRefName !== item.headRefName) throw remoteCiError('PR_UPDATE_HEAD_CHANGED');
-          return { found, item, repo, pr };
-        };
-        const initial = await inspect();
-        const frozenSubject = initial.found.marker.prUpdate?.subject || cleanText(subject, 300) || `Fix CI for PR #${initial.item.prNumber}`;
-        const gate = context.permissionGate || context.gate;
-        if (!gate?.authorize) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');
-        const decision = await gate.authorize({ tool: 'remote_ci_update_pr', risk: 'remote-mutation', source: 'remote-ci',
-          summary: `更新 PR #${initial.item.prNumber} · ${initial.item.headRefName}`,
-          detail: `${initial.item.headSha.slice(0, 12)} · ${initial.found.marker.stats?.files || 0} 个文件 · ${frozenSubject}`, signal: context.signal });
-        if (!decision?.allowed || context.isCurrent?.() === false) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');
-        const mutate = async () => {
-          const fresh = await inspect();
-          const prior = fresh.found.marker.prUpdate;
-          const tip = await this.github.branchTip({ repoRoot: fresh.repo.repoRoot, branch: fresh.item.headRefName });
-          if (!tip?.ok) throw remoteCiError('PR_UPDATE_UNCERTAIN');
-          if (prior?.newCommit && fresh.pr.headSha === prior.newCommit && tip.head === prior.newCommit) {
-            const verified = await this.worktree.verifyPrUpdate({ projectPath: root, resultId });
-            if (!verified?.ok) throw remoteCiError('PR_UPDATE_TREE_MISMATCH');
-            return this.worktree.completePrUpdate({ projectPath: root, resultId, prNumber: fresh.item.prNumber });
-          }
-          if (fresh.pr.headSha !== fresh.item.headSha || tip.head !== fresh.item.headSha) throw remoteCiError('PR_UPDATE_HEAD_CHANGED');
-          await this.resolveMetadata(root, fresh.item.remoteCiRef);
-          if (context.isCurrent?.() === false || context.signal?.aborted) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');
-          const ready = await this.worktree.preparePrUpdate({ projectPath: root, resultId, subject: frozenSubject });
-          if (!ready?.ok) return ready;
-          prepared = true;
-          const last = await inspect();
-          const lastTip = await this.github.branchTip({ repoRoot: last.repo.repoRoot, branch: last.item.headRefName });
-          if (!lastTip?.ok || lastTip.head !== ready.oldHead || last.pr.headSha !== ready.oldHead) throw remoteCiError('PR_UPDATE_HEAD_CHANGED');
-          if (context.isCurrent?.() === false || context.signal?.aborted) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');
-          pushStarted = true;
-          const pushed = await this.github.exactLeasePush({ repoRoot: last.repo.repoRoot, branch: last.item.headRefName, oldHead: ready.oldHead, newCommit: ready.commit });
-          if (!pushed?.ok) {
-            pushStarted = pushed?.uncertain !== false;
-            throw remoteCiError(pushStarted ? 'PR_UPDATE_UNCERTAIN' : 'PR_UPDATE_PUSH_FAILED');
-          }
-          const after = await this._pr(last.repo, last.item.prNumber);
-          if (after.headSha !== ready.commit) throw remoteCiError('PR_UPDATE_UNCERTAIN');
-          return this.worktree.completePrUpdate({ projectPath: root, resultId, prNumber: last.item.prNumber });
-        };
-        return await (this.mutationLock ? this.mutationLock(mutate) : mutate());
-      } catch (cause) {
-        const out = pushStarted ? resultError({ code: 'PR_UPDATE_UNCERTAIN' }) : resultError(cause, 'PR_UPDATE_UNAVAILABLE');
-        if (prepared) return this.worktree.failPrUpdate({ projectPath: root, resultId, code: out.code, error: out.error, uncertain: pushStarted });
-        return out;
-      }
-    });
+    return updatePr(this, projectPath, resultId, subject, context);
   }
 
   async rerun(projectPath, remoteCiRef, context = {}) {

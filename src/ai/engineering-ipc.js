@@ -6,6 +6,9 @@ const { createWorkflowManager, validWorkflowRunRef } = require('./workflow-manag
 const { createRepairManager } = require('./repair-manager');
 const { isRepairRef } = require('./repair-state');
 const { createRemoteCiManager } = require('./remote-ci-manager');
+const { createPrReviewManager } = require('./pr-review-manager');
+const { createPrReviewStore } = require('./pr-review-store');
+const ReviewState = require('./pr-review-state');
 const { createRemoteCiStore } = require('./remote-ci-store');
 const { createGithubCli } = require('./github-cli');
 const { createCiWatchManager } = require('./ci-watch-manager');
@@ -50,6 +53,8 @@ function createEngineeringIpcHandlers(options = {}) {
   let workflows = null;
   let repairs = null;
   let remoteCi = null;
+  let prReviews = null;
+  const reviewProtected = new Set();
   let ciWatches = null;
   const remoteProtected = new Set();
   const remoteOwners = new Map();
@@ -88,6 +93,47 @@ function createEngineeringIpcHandlers(options = {}) {
     return remoteCi;
   }
 
+  function getPrReviews() {
+    if (!prReviews) prReviews = options.prReviewManager || createPrReviewManager({
+      githubCli: options.githubCli || createGithubCli(), worktreeManager: options.worktreeManager,
+      mutationLock: options.withMutation,
+      store: createPrReviewStore({ userDataPath: options.userDataPath, safeStorage: options.safeStorage,
+        isProtected: (ref, item) => !reviewProtected.has(item.projectKey) || reviewProtected.has(ref),
+      }),
+    });
+    return prReviews;
+  }
+
+  async function reviewRequest(event, payload, fields, fn, mutation = false) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || Object.keys(payload).some((key) => !['projectBindingId', ...fields].includes(key))) return ReviewState.error(ReviewState.fail());
+    const binding = getBinding(event, payload);
+    if (!binding || event.sender?.isDestroyed?.()) return ReviewState.error(ReviewState.fail('PR_REVIEW_PROJECT_BINDING_INVALID'));
+    const owner = ownerId(event); const abort = new AbortController();
+    abort.projectKey = projectKey(binding.projectPath);
+    const active = remoteOwners.get(owner) || new Set(); active.add(abort); remoteOwners.set(owner, active);
+    const authorization = mutation ? permissionContext(event, payload, options.getSettings?.() || {}) : null;
+    let retained = false;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      active.delete(abort); if (!active.size) remoteOwners.delete(owner);
+      if (authorization) unregisterGate(owner, authorization.gate);
+    };
+    const context = { ...authorization?.options, signal: abort.signal, projectBindingId: payload.projectBindingId,
+      retainUntilFinished: () => { retained = true; }, release,
+      isCurrent: () => !abort.signal.aborted && !event.sender?.isDestroyed?.() && getBinding(event, payload)?.projectPath === binding.projectPath };
+    try {
+      await Promise.resolve();
+      if (!context.isCurrent()) throw ReviewState.fail('PR_REVIEW_PROJECT_BINDING_INVALID');
+      const result = await fn(getPrReviews(), binding, context);
+      if (!context.isCurrent() && result?.ok) throw ReviewState.fail('PR_REVIEW_PROJECT_BINDING_INVALID');
+      return result;
+    } catch (cause) { return ReviewState.error(cause); }
+    finally { if (!retained) release(); }
+  }
+
   async function remoteRequest(event, payload, fields, fn, mutation = false) {
     if (!payload || typeof payload !== 'object' || Object.keys(payload).some((key) => !['projectBindingId', ...fields].includes(key))) return error('REMOTE_CI_INVALID', '远程 CI 参数无效');
     return withBinding(event, payload, async (binding) => {
@@ -95,6 +141,7 @@ function createEngineeringIpcHandlers(options = {}) {
       if (!mutation) return fn(manager, binding, {});
       const context = permissionContext(event, payload, options.getSettings?.() || {});
       const abort = new AbortController();
+      abort.projectKey = projectKey(binding.projectPath);
       const owner = ownerId(event);
       const active = remoteOwners.get(owner) || new Set();
       active.add(abort); remoteOwners.set(owner, active);
@@ -146,6 +193,7 @@ function createEngineeringIpcHandlers(options = {}) {
   }
 
   function forgetOwnerKey(owner, key) {
+    for (const abort of remoteOwners.get(owner) || []) if (abort.projectKey === key) abort.abort();
     const projects = ownerProjects.get(owner);
     projects?.delete(key);
     if (projects?.size) {
@@ -253,6 +301,7 @@ function createEngineeringIpcHandlers(options = {}) {
         workflowManager: getWorkflows(),
         worktreeManager: options.worktreeManager,
         remoteCiManager: getRemoteCi(),
+        prReviewManager: getPrReviews(),
         subagentRuntime: options.subagentRuntime,
         runLoop: options.runLoop,
         getProfiles: options.getProfiles,
@@ -336,6 +385,23 @@ function createEngineeringIpcHandlers(options = {}) {
     ciWatchNavigation: (owner, key, ref) => projectOwners.get(key)?.has(owner) ? ciWatches?.navigation(key, ref) || null : null,
     suspendCiWatches: () => ciWatches?.suspend(),
     resumeCiWatches: () => ciWatches?.resume(),
+    prReviewThreads: (event, payload) => reviewRequest(event, payload, ['prNumber'], (m, b, c) => m.threads(b.projectPath, payload.prNumber, c)),
+    prReviewGet: (event, payload) => reviewRequest(event, payload, ['threadRef'], (m, b, c) => m.get(b.projectPath, payload.threadRef, c)),
+    prReviewSource: (event, payload) => reviewRequest(event, payload, ['reviewRef'], (m, b, c) => m.source(b.projectPath, payload.reviewRef, c)),
+    prReviewSnapshot: (event, payload) => reviewRequest(event, payload, ['threadRef', 'revision'], async (m, b, c) => {
+      const key = projectKey(b.projectPath);
+      const results = await options.worktreeManager?.list?.({ projectPath: b.projectPath });
+      if (results?.ok) {
+        for (const row of m.store.list(key)) reviewProtected.delete(row.reviewRef);
+        for (const row of getRepairs().store.list(key)) if (row.source?.kind === 'pr_review') reviewProtected.add(row.source.reviewRef);
+        for (const row of results.results || []) if (row.reviewRef && !['pr_updated', 'pr_created', 'discarded_cleanup_pending', 'applied_cleanup_pending'].includes(row.state)) reviewProtected.add(row.reviewRef);
+        reviewProtected.add(key);
+      } else reviewProtected.delete(key);
+      return m.snapshot(b.projectPath, payload.threadRef, payload.revision, c);
+    }),
+    prReviewReply: (event, payload) => reviewRequest(event, payload, ['threadRef', 'revision', 'body'], (m, b, c) => m.reply(b.projectPath, payload, c), true),
+    prReviewResolve: (event, payload) => reviewRequest(event, payload, ['threadRef', 'revision'], (m, b, c) => m.resolve(b.projectPath, payload, c), true),
+    prReviewUpdatePr: (event, payload) => reviewRequest(event, payload, ['resultId', 'subject'], (m, b, c) => m.updatePr(b.projectPath, payload.resultId, payload.subject, c), true),
     remoteCiFailures: (event, payload) => remoteRequest(event, payload, ['prNumber'], (m, b) => m.failures(b.projectPath, payload.prNumber)),
     remoteCiSnapshot: (event, payload) => remoteRequest(event, payload, ['prNumber', 'checkRunId'], async (m, b) => {
       const key = projectKey(b.projectPath);
@@ -411,7 +477,8 @@ function createEngineeringIpcHandlers(options = {}) {
     },
     repairGetForAgent: (projectPath, repairRef) => getRepairs().get(projectPath, repairRef),
     repairResultForAgent: (projectPath, repairRef) => getRepairs().result(projectPath, repairRef),
-    repairStartForAgent: (projectPath, payload, context = {}) => getRepairs().start(projectPath, payload, context),
+    repairStartForAgent: (projectPath, payload, context = {}) => payload?.source?.kind === 'pr_review'
+      ? error('REPAIR_SOURCE_INVALID', '审查修复仅由 PR 页面发起') : getRepairs().start(projectPath, payload, context),
     repairCancelForAgent: (projectPath, repairRef, context = {}) => getRepairs().cancel(projectPath, repairRef, context),
 
     // Standalone/test binding support. Production resolves the worktree-owned
@@ -586,6 +653,9 @@ function createEngineeringIpcHandlers(options = {}) {
       return getRepairs().result(binding.projectPath, String(payload.repairRef));
     }),
     repairStart: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (payload.source?.kind === 'pr_review') return reviewRequest(event, payload,
+        ['source', 'note', 'validationProfileId', 'sessionId'], (_m, b, c) => getRepairs().start(b.projectPath,
+          { source: payload.source, note: payload.note, validationProfileId: payload.validationProfileId }, c), true);
       const settings = options.getSettings ? options.getSettings() : {};
       const context = permissionContext(event, payload, settings);
       try {
@@ -595,6 +665,8 @@ function createEngineeringIpcHandlers(options = {}) {
       finally { unregisterGate(context.owner, context.gate); }
     }),
     repairRetry: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (getRepairs().store.get(payload.repairRef, projectKey(binding.projectPath))?.source.kind === 'pr_review') return reviewRequest(event, payload,
+        ['repairRef', 'note', 'sessionId'], (_m, b, c) => getRepairs().retry(b.projectPath, payload.repairRef, { note: payload.note }, c), true);
       if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
       const settings = options.getSettings ? options.getSettings() : {};
       const context = permissionContext(event, payload, settings);
@@ -674,6 +746,7 @@ function createEngineeringIpcHandlers(options = {}) {
       ciWatches?.close();
       for (const active of remoteOwners.values()) for (const abort of active) abort.abort();
       remoteCi?.store?.close();
+      prReviews?.close();
       for (const index of indexes.values()) index.close();
       workflows?.close();
       verification?.close();

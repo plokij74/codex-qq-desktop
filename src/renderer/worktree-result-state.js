@@ -53,7 +53,8 @@
       updatedAt,
       baseHead: /^[a-f0-9]{40}$/i.test(String(raw.baseHead || '')) ? String(raw.baseHead).toLowerCase() : '',
       baseKind: raw.baseKind === 'remote_commit' ? 'remote_commit' : 'local_head',
-      originKind: raw.originKind === 'remote_ci' ? 'remote_ci' : 'default',
+      originKind: ['remote_ci', 'pr_review'].includes(raw.originKind) ? raw.originKind : 'default',
+      reviewRef: /^prv_[a-f0-9]{24}$/.test(String(raw.reviewRef || '')) ? String(raw.reviewRef) : '',
       remoteCiRef: /^rci_[a-f0-9]{24}$/.test(String(raw.remoteCiRef || '')) ? String(raw.remoteCiRef) : '',
       deliveryKind: raw.deliveryKind === 'github_pr_update' ? 'github_pr_update' : 'default',
       prUpdate: {

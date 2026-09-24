@@ -42,6 +42,9 @@ let sessions = [];
 let projects = [];
 const worktreeBindings = new Map();
 let ciWatchUi = null;
+let prReviewUi = null;
+const pullRequestDrafts = new Map();
+let pullRequestForm = null;
 const worktreePreviews = new Map();
 const worktreeActionBusy = new Set();
 const worktreeReconcileSeq = new Map();
@@ -392,7 +395,7 @@ function handleTerminalPanelEvent(ev) {
   }
   // Verification approvals use a dedicated ephemeral panel. They must never
   // fall through to renderApprovalCard, which would attach them to chatRun.
-  if (type === 'approval-needed' && (ev.source === 'remote-ci' || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
+  if (type === 'approval-needed' && (['remote-ci', 'pr-review'].includes(ev.source) || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
     void appConfirm([ev.summary, ev.detail].filter(Boolean).join('\n')).then((allowed) => window.codex.approveChat({ approvalId: ev.approvalId, decision: allowed ? 'allow' : 'deny' })).catch(() => {});
     return true;
   }
@@ -1359,6 +1362,10 @@ async function worktreeAction(session, ref, action) {
     await ciWatchUi?.start(project.id, ref.prUpdate?.prNumber, 30);
     return;
   }
+  if (action === 'reviewThread') {
+    await openPrReviewSource(project.id, ref.reviewRef);
+    return;
+  }
   if (action === 'discard') {
     const remoteNote = ref.pr?.pushed ? '已推送的远端分支不会删除。' : '';
     if (!(await appConfirm(`确定丢弃这批隔离改动？主项目不会被修改。${remoteNote}`))) return;
@@ -1387,9 +1394,11 @@ async function worktreeAction(session, ref, action) {
         });
       }
     } else if (action === 'updatePr') {
-      const subject = await appPrompt('提交说明（重试将复用上次提交）', ref.prUpdate?.subject || 'Fix GitHub Actions failure', '更新此 PR');
+      const reconcileOnly = ['pr_update_uncertain', 'pr_update_cleanup_pending'].includes(ref.state);
+      const subject = reconcileOnly ? ref.prUpdate?.subject || '' : await appPrompt('提交说明（重试将复用上次提交）', ref.prUpdate?.subject || (ref.originKind === 'pr_review' ? 'Address PR review feedback' : 'Fix GitHub Actions failure'), '更新此 PR');
       if (subject == null) return;
-      response = await window.codex.updateRemoteCiPr({ projectBindingId: token, resultId: ref.id, subject });
+      const update = ref.originKind === 'pr_review' ? window.codex.updatePrReviewPr : window.codex.updateRemoteCiPr;
+      response = await update({ projectBindingId: token, resultId: ref.id, subject });
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
       if (response?.ok) toast('PR 已更新，可点击「跟踪 CI」观察新提交');
     } else if (action === 'createPr') {
@@ -1433,7 +1442,7 @@ async function worktreeAction(session, ref, action) {
     }
     if (!response?.ok) {
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
-      toast(response?.error || '隔离改动操作失败');
+      toast(ref.originKind === 'pr_review' && action === 'updatePr' ? window.PrReviewUi.reason(response?.code) : response?.error || '隔离改动操作失败');
       reconcileWorktreeResults(project);
     } else if (action === 'preview') {
       renderMessages();
@@ -1530,7 +1539,8 @@ function renderWorktreeCards(root, session) {
     };
     if (ref.canApply) addButton(`应用全部（${fileCount} 个文件）`, 'apply', true, true, true);
     if (ref.canCreatePr) addButton(ref.canRetryPr ? '重试 PR' : '创建 Draft PR', 'prForm', true, false, true);
-    if (ref.canUpdatePr) addButton(ref.canRetryPrUpdate ? '重试更新此 PR' : '更新此 PR', 'updatePr', true, false, true);
+    if (ref.canUpdatePr) addButton(['pr_update_uncertain', 'pr_update_cleanup_pending'].includes(ref.state) ? '核对更新状态' : ref.canRetryPrUpdate ? '重试更新此 PR' : '更新此 PR', 'updatePr', true, false, true);
+    if (ref.originKind === 'pr_review' && ref.reviewRef) addButton('查看原审查线程', 'reviewThread');
     if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state) && ref.prUpdate?.prNumber) addButton('跟踪 CI（30 分钟）', 'watchCi');
     if (ref.canPreview) addButton('查看 diff', 'preview', true);
     if (ref.canDiscard) addButton('丢弃', 'discard', true, false, true);
@@ -2177,6 +2187,7 @@ const VALIDATION_STATUS_LABELS = {
 
 function engineeringRepairStatusText(status) { return REPAIR_STATUS_LABELS[String(status || '')] || String(status || '未知'); }
 function engineeringValidationStatusText(status) { return VALIDATION_STATUS_LABELS[String(status || '')] || String(status || '未验证'); }
+function engineeringRepairSourceText(source) { return ({ verification: '本地验证', workflow: '工程工作流', remote_ci: 'GitHub Actions', pr_review: 'PR 审查反馈' })[source?.kind] || '未知来源'; }
 
 async function beginEngineeringRepair(token, source) {
   if (!source || !token) return;
@@ -2192,7 +2203,13 @@ async function beginEngineeringRepair(token, source) {
 async function showEngineeringRepair(token, repairRef) {
   const detail = document.getElementById('engineering-repair-detail');
   if (!detail) return;
+  const project = sessionProject(); const projectPath = project?.path;
+  detail.dataset.repairRef = repairRef;
+  const isCurrent = () => currentView === 'scheduled' && engineeringBindingToken() === token
+    && sessionProject()?.id === project?.id && sessionProject()?.path === projectPath
+    && document.getElementById('engineering-repair-detail') === detail && detail.dataset.repairRef === repairRef;
   const result = await window.codex.getEngineeringRepairResult({ projectBindingId: token, repairRef }).catch(() => null);
+  if (!isCurrent()) return;
   if (!result?.ok || !result.repair) {
     detail.innerHTML = `<div class="work-card-error">${escapeHtml(result?.error || '修复结果不可用')}</div>`;
     detail.classList.remove('hidden');
@@ -2205,7 +2222,8 @@ async function showEngineeringRepair(token, repairRef) {
     : '<div class="work-card-notice">尚未运行修复后验证。验证结果不会成为应用或 Draft PR 的门槛。</div>';
   detail.innerHTML = [
     `<div class="engineering-detail-title">修复建议 · ${escapeHtml(engineeringRepairStatusText(repair.status))}</div>`,
-    `<div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · 来源 ${escapeHtml(repair.source?.kind || '')} · ${escapeHtml(repair.profileId || '')}</div>`,
+    `<div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · 来源 ${escapeHtml(engineeringRepairSourceText(repair.source))} · ${escapeHtml(repair.profileId || '')}</div>`,
+    repair.source?.kind === 'pr_review' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-review">查看原审查线程</button>' : '',
     repair.resultId ? `<div class="work-card-meta">D5 隔离结果：<code>${escapeHtml(repair.resultId)}</code></div><div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-repair-open-result">查看 D5 结果卡</button></div>` : '',
     repair.incomplete ? '<div class="work-card-notice">这是未完整结束的隔离结果，仍需用户审阅。</div>' : '',
     repair.errorCode ? `<div class="work-card-error">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : '',
@@ -2216,10 +2234,12 @@ async function showEngineeringRepair(token, repairRef) {
   ].join('');
   detail.classList.remove('hidden');
   document.getElementById('engineering-repair-close-detail')?.addEventListener('click', () => { detail.classList.add('hidden'); detail.innerHTML = ''; });
-  const project = sessionProject();
-  if (project?.path) {
-    await reconcileWorktreeResults(project);
-    document.getElementById('engineering-repair-open-result')?.addEventListener('click', () => {
+  if (projectPath) {
+    document.getElementById('engineering-repair-open-review')?.addEventListener('click', () => openPrReviewSource(project.id, repair.source.reviewRef));
+    const reconciled = repair.resultId ? reconcileWorktreeResults(project) : Promise.resolve();
+    document.getElementById('engineering-repair-open-result')?.addEventListener('click', async () => {
+      await reconciled;
+      if (!isCurrent()) return;
       setView('chat');
       renderMessages();
       setTimeout(() => {
@@ -2228,6 +2248,7 @@ async function showEngineeringRepair(token, repairRef) {
         card?.querySelector('button')?.focus?.();
       }, 0);
     });
+    await reconciled;
   }
 }
 
@@ -2249,7 +2270,7 @@ async function loadEngineeringRepairs(token = engineeringBindingToken()) {
     const actions = active
       ? `<button type="button" class="ghost-btn" data-repair-cancel="${escapeHtml(repair.repairRef)}">取消</button>`
       : `<button type="button" class="ghost-btn" data-repair-view="${escapeHtml(repair.repairRef)}">查看</button>${repair.resultId && validation.status === 'running' ? `<button type="button" class="ghost-btn" data-repair-validate-cancel="${escapeHtml(repair.repairRef)}">取消验证</button>` : repair.resultId ? `<button type="button" class="ghost-btn" data-repair-validate="${escapeHtml(repair.repairRef)}">验证</button>` : ''}<button type="button" class="ghost-btn" data-repair-retry="${escapeHtml(repair.repairRef)}">重试</button>`;
-    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>隔离修复建议</strong><div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · <span class="badge ${escapeHtml(repair.status || '')}">${escapeHtml(engineeringRepairStatusText(repair.status))}</span>${validationLabel} · ${escapeHtml(repair.createdAt || '')}</div>${repair.diagnosticCount ? `<div class="work-card-meta">来源诊断 ${repair.diagnosticCount} 条${repair.outputExcerpted ? ' · 含输出摘录' : ''}</div>` : ''}${repair.errorCode ? `<div class="work-card-notice">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : ''}</div><div class="work-card-actions">${actions}</div></div>`;
+    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(engineeringRepairSourceText(repair.source))} · 隔离修复建议</strong><div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · <span class="badge ${escapeHtml(repair.status || '')}">${escapeHtml(engineeringRepairStatusText(repair.status))}</span>${validationLabel} · ${escapeHtml(repair.createdAt || '')}</div>${repair.diagnosticCount ? `<div class="work-card-meta">来源诊断 ${repair.diagnosticCount} 条${repair.outputExcerpted ? ' · 含输出摘录' : ''}</div>` : ''}${repair.errorCode ? `<div class="work-card-notice">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : ''}</div><div class="work-card-actions">${actions}</div></div>`;
   }).join('') : '<div class="work-empty">暂无隔离修复建议</div>');
   el.querySelectorAll('[data-repair-view]').forEach((button) => button.addEventListener('click', () => showEngineeringRepair(token, button.dataset.repairView)));
   el.querySelectorAll('[data-repair-cancel]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.cancelEngineeringRepair({ projectBindingId: token, repairRef: button.dataset.repairCancel }); if (!result?.ok) toast(result?.error || '取消修复失败'); await loadEngineeringRepairs(token); }));
@@ -2437,6 +2458,7 @@ async function renderEngineeringCenter() {
     return;
   }
   const settings = await window.codex.getSettings().catch(() => null);
+  if (currentView !== 'scheduled' || engineeringBindingToken() !== token) return;
   const terminalNotice = settings && !settings.terminalEnabled
     ? '<div class="work-card-notice">验证作业需要在设置中开启「允许终端命令」后才能启动。</div>'
     : '';
@@ -2878,6 +2900,8 @@ async function deleteProject(id) {
   if (!(await appConfirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）'))) return;
   const worktreeBindingId = worktreeBindings.get(id);
   ciWatchUi?.forgetProject(id);
+  prReviewUi?.forgetProject(id);
+  for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
   if (worktreeBindingId) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
     worktreeBindings.delete(id);
@@ -2909,6 +2933,9 @@ async function bindProjectPath(id) {
   worktreeBindings.set(p.id, bound.projectBindingId);
   ciWatchUi?.bindProject(p, bound.projectBindingId);
   if (previous !== dir) {
+    prReviewUi?.forgetProject(id);
+    for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
+    pullRequestForm = null;
     resetPullRequestView(null);
     pullRequestView.seq++; pullRequestView.detailSeq++;
   }
@@ -3334,6 +3361,8 @@ function updateClock() {
 }
 
 function setView(view) {
+  capturePullRequestDraft();
+  if (view !== 'prs') { pullRequestForm = null; prReviewUi?.unmount(); }
   currentView = view;
   document.querySelectorAll('#main-toolbar .tb-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
   document.querySelectorAll('#left-nav .nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
@@ -3344,7 +3373,7 @@ function setView(view) {
     currentView = 'chat'; showChatView(); return;
   }
   if (view === 'chat') { showChatView(); return; }
-  showWorkView(view);
+  return showWorkView(view);
 }
 function showChatView() {
   document.getElementById('view-chat').classList.remove('hidden');
@@ -3439,13 +3468,32 @@ function pullRequestReference() {
     : { number: pullRequestView.selectedNumber };
 }
 
+function pullRequestDraftKey(project, number) {
+  return JSON.stringify([project.id, project.path, worktreeBindings.get(project.id), number]);
+}
+function capturePullRequestDraft() {
+  if (!pullRequestForm) return;
+  const { key, projectId, fields, defaults } = pullRequestForm;
+  const draft = pullRequestDrafts.get(key) || { projectId };
+  for (const [name, input] of Object.entries(fields)) {
+    if (!input) continue;
+    if (input.value !== defaults[name]) draft[name] = input.value;
+    else delete draft[name];
+  }
+  pullRequestDrafts.set(key, draft);
+  while (pullRequestDrafts.size > 50) pullRequestDrafts.delete(pullRequestDrafts.keys().next().value);
+}
+
 function renderPullRequestView() {
   if (currentView !== 'prs') return;
+  capturePullRequestDraft();
+  pullRequestForm = null;
   const body = document.getElementById('work-body');
   if (!body) return;
   const project = sessionProject();
   resetPullRequestView(project);
   if (!project?.path) {
+    prReviewUi?.unmount();
     body.innerHTML = '<div class="pr-empty"><strong>需要绑定项目</strong><span>先打开一个已绑定真实目录的项目会话，再查看该项目 origin 的拉取请求。</span></div>';
     return;
   }
@@ -3462,6 +3510,7 @@ function renderPullRequestView() {
     </button>`).join('');
   let detailHtml = '<div class="pr-detail-empty">选择一个 PR 查看详情</div>';
   const pr = pullRequestView.detail;
+  const draft = pr ? pullRequestDrafts.get(pullRequestDraftKey(project, pr.number)) || {} : {};
   if (pr) {
     const checks = pr.checksSummary || {};
     const checkText = checks.total
@@ -3484,8 +3533,8 @@ function renderPullRequestView() {
       </div>
       <div class="pr-branches">${escapeHtml(pr.headRefName || '-')} → ${escapeHtml(pr.baseRefName || '-')} ${pr.headSha ? `· ${pr.headSha.slice(0, 8)}` : ''}</div>
       <div class="pr-edit-form">
-        <label>标题<input class="pr-edit-title" maxlength="300" value="${escapeHtml(pr.title)}" ${blocked ? 'disabled' : ''}></label>
-        <label>正文<textarea class="pr-edit-body" maxlength="10000" rows="8" ${blocked ? 'disabled' : ''}>${escapeHtml(pr.body)}</textarea></label>
+        <label>标题<input class="pr-edit-title" maxlength="300" value="${escapeHtml(draft.title ?? pr.title)}" ${blocked ? 'disabled' : ''}></label>
+        <label>正文<textarea class="pr-edit-body" maxlength="10000" rows="8" ${blocked ? 'disabled' : ''}>${escapeHtml(draft.body ?? pr.body)}</textarea></label>
         <button type="button" class="btn-secondary" data-pr-action="edit" ${blocked || pr.state === 'MERGED' ? 'disabled' : ''}>保存标题与正文</button>
       </div>
       <section class="pr-detail-section">
@@ -3493,9 +3542,10 @@ function renderPullRequestView() {
         ${remoteCiPanelHtml(blocked)}
         <div id="pr-ci-watch"></div>
       </section>
+      <div id="pr-review-panel"></div>
       <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
       <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
-        <textarea class="pr-comment-input" rows="4" maxlength="10000" placeholder="发表评论" ${blocked ? 'disabled' : ''}></textarea>
+        <textarea class="pr-comment-input" rows="4" maxlength="10000" placeholder="发表评论" ${blocked ? 'disabled' : ''}>${escapeHtml(draft.comment ?? '')}</textarea>
         <button type="button" class="btn-secondary" data-pr-action="comment" ${blocked ? 'disabled' : ''}>发布评论</button>
       </section>
       <div class="pr-lifecycle-actions">
@@ -3517,6 +3567,14 @@ function renderPullRequestView() {
       <div class="pr-detail">${detailHtml}</div>
     </div>`;
   ciWatchUi?.mountPr(document.getElementById('pr-ci-watch'), { projectId: project.id, prNumber: pr?.number, state: pr?.state });
+  prReviewUi?.mountPr(document.getElementById('pr-review-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha, profiles: pullRequestView.remoteProfiles });
+  if (pr) {
+    const fields = { title: body.querySelector('.pr-edit-title'), body: body.querySelector('.pr-edit-body'), comment: body.querySelector('.pr-comment-input'), merge: body.querySelector('.pr-merge-method') };
+    if (fields.merge && draft.merge) fields.merge.value = draft.merge;
+    pullRequestForm = { key: pullRequestDraftKey(project, pr.number), projectId: project.id, fields,
+      defaults: { title: pr.title, body: pr.body, comment: '', merge: 'squash' } };
+    for (const input of Object.values(fields)) input?.addEventListener(input.tagName === 'SELECT' ? 'change' : 'input', capturePullRequestDraft);
+  }
   document.getElementById('pr-state-filter')?.addEventListener('change', (event) => {
     pullRequestView.filter = event.target.value;
     pullRequestView.selectedNumber = 0;
@@ -3666,6 +3724,9 @@ async function runPullRequestAction(action) {
   if (!project?.path || !pr || pullRequestView.busy) return;
   const token = await bindWorktreeProject(project);
   if (!token) return toast('项目绑定已失效');
+  const sequence = pullRequestView.detailSeq;
+  const projectPath = project.path;
+  const isCurrent = () => sessionProject()?.id === project.id && project.path === projectPath && worktreeBindings.get(project.id) === token && pullRequestView.detailSeq === sequence;
   const reference = pullRequestReference();
   let invoke;
   let payload = { projectBindingId: token, ...reference };
@@ -3699,25 +3760,49 @@ async function runPullRequestAction(action) {
     question = `确定使用 ${payload.method.toUpperCase()} 合并 PR #${pr.number}？远端分支不会删除。`;
     invoke = window.codex.mergePullRequest;
   }
-  if (typeof invoke !== 'function' || !(await appConfirm(question))) return;
+  if (typeof invoke !== 'function' || !(await appConfirm(question)) || !isCurrent()) return;
   pullRequestView.busy = true;
   pullRequestView.error = '';
   renderPullRequestView();
   try {
     const response = await invoke(payload);
+    if (!isCurrent()) return;
     if (!response?.ok) throw new Error(response?.error || 'PR 操作失败');
+    capturePullRequestDraft();
+    const saved = pullRequestDrafts.get(pullRequestDraftKey(project, pr.number));
+    if (saved && action === 'edit') { if (saved.title === payload.title) delete saved.title; if (saved.body === payload.body) delete saved.body; }
+    if (saved && action === 'comment' && saved.comment === payload.body) delete saved.comment;
+    pullRequestForm = null;
     pullRequestView.detail = window.PullRequestState?.normalize(response.pr, { detail: true }) || pullRequestView.detail;
     if (response.result) attachWorktreeResult(response.result, project.id, response.result.sessionId);
     const index = pullRequestView.prs.findIndex((item) => item.number === pullRequestView.detail?.number);
     if (index >= 0 && pullRequestView.detail) pullRequestView.prs[index] = { ...pullRequestView.prs[index], ...pullRequestView.detail, body: '' };
     toast(action === 'comment' ? '评论已发布' : action === 'merge' ? 'PR 已合并' : 'PR 已更新');
   } catch (error) {
+    if (!isCurrent()) return;
     pullRequestView.error = error?.message || String(error);
     toast(pullRequestView.error);
   } finally {
     pullRequestView.busy = false;
     renderPullRequestView();
   }
+}
+
+async function openPrReviewSource(projectId, reviewRef) {
+  const project = getProject(projectId); const token = worktreeBindings.get(projectId); const projectPath = project?.path;
+  if (!projectPath || !token || !reviewRef) return toast('审查来源不可用');
+  const source = await window.codex.getPrReviewSource({ projectBindingId: token, reviewRef }).catch(() => null);
+  if (getProject(projectId)?.path !== projectPath || worktreeBindings.get(projectId) !== token) return;
+  if (!source?.ok) return toast(window.PrReviewUi.reason(source?.code));
+  if (sessionProject()?.id !== projectId) openProjectChat(projectId);
+  resetPullRequestView(project);
+  pullRequestView.selectedNumber = source.source.prNumber;
+  pullRequestView.resultId = '';
+  setView('prs');
+  await loadPullRequestDetail(source.source.prNumber);
+  if (sessionProject()?.id !== projectId || currentView !== 'prs' || pullRequestView.detail?.number !== source.source.prNumber || worktreeBindings.get(projectId) !== token) return;
+  await prReviewUi?.select(source.threadRef);
+  document.getElementById('pr-review-panel')?.scrollIntoView({ block: 'start' });
 }
 
 function openPullRequestManager(ref) {
@@ -3738,8 +3823,8 @@ function showWorkView(view) {
   document.getElementById('work-sub').textContent = '可点击条目执行操作';
   const body = document.getElementById('work-body');
   if (view === 'scheduled') {
-    renderEngineeringCenter().catch(() => {});
     loadMcpTasks().catch(() => {});
+    return renderEngineeringCenter().catch(() => {});
   }
   if (view === 'plugins') {
     body.innerHTML = '<div class="card-list">' + PLUGINS.map((p) => '<div class="work-card"><div class="work-card-title">🧩 ' + escapeHtml(p.name) + '</div><div class="work-card-meta">' + escapeHtml(p.desc) + '</div><label class="switch-row"><input type="checkbox" data-plugin="' + p.id + '" ' + (pluginState[p.id] ? 'checked' : '') + '/><span>' + (pluginState[p.id] ? '已启用' : '已禁用') + '</span></label></div>').join('') + '</div>';
@@ -5522,6 +5607,19 @@ function bindEvents() {
 }
 function boot() {
   loadState();
+  prReviewUi = window.PrReviewUi?.create({
+    api: window.codex, document, getProject, getToken: (id) => worktreeBindings.get(id), getSessionId: () => activeSessionId,
+    isVisible: (projectId, prNumber) => currentView === 'prs' && sessionProject()?.id === projectId && pullRequestView.detail?.number === prNumber,
+    openRepair: async ({ projectId, repairRef }) => {
+      if (sessionProject()?.id !== projectId) openProjectChat(projectId);
+      const token = engineeringBindingToken();
+      await setView('scheduled');
+      if (currentView === 'scheduled' && sessionProject()?.id === projectId && engineeringBindingToken() === token) {
+        await showEngineeringRepair(token, repairRef);
+        document.getElementById('engineering-repair-detail')?.scrollIntoView({ block: 'nearest' });
+      }
+    },
+  });
   ciWatchUi = window.CiWatchUi?.create({
     api: window.codex, document, getProject, getToken: (id) => worktreeBindings.get(id), toast,
     isVisible: (view, projectId) => currentView === view && sessionProject()?.id === projectId,
@@ -5542,7 +5640,7 @@ function boot() {
     },
   });
   const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);
-  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); }, { once: true });
+  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
   renderEmojiPanel();
   bindEvents();
   bindTerminalPanel();

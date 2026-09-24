@@ -4,7 +4,7 @@ const RESULT_ID_RE = /^wt_[A-Za-z0-9]{6,80}$/;
 const SHA1_RE = /^[a-f0-9]{40}$/i;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 
-const MARKER_VERSION = 2;
+const MARKER_VERSION = 3;
 const PENDING_LIMIT = 3;
 const PATCH_MAX_BYTES = 16 * 1024 * 1024;
 const FILE_SUMMARY_LIMIT = 200;
@@ -144,7 +144,7 @@ function normalizePrChecks(raw) {
 function normalizeMarker(raw, { now = Date.now() } = {}) {
   if (!raw || typeof raw !== 'object') return null;
   const inputVersion = Number(raw.version);
-  if (![1, MARKER_VERSION].includes(inputVersion) || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
+  if (![1, 2, MARKER_VERSION].includes(inputVersion) || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
   const repoRoot = normalizePath(raw.repoRoot);
   const projectRoot = normalizePath(raw.projectRoot);
   const projectIdentity = text(raw.projectIdentity, 600);
@@ -198,10 +198,14 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     checksSummary: normalizePrChecks(rawPr.checksSummary),
   };
   const baseKind = raw.baseKind === 'remote_commit' ? 'remote_commit' : 'local_head';
-  const originKind = raw.originKind === 'remote_ci' ? 'remote_ci' : 'default';
+  const originKind = ['remote_ci', 'pr_review'].includes(raw.originKind) ? raw.originKind : 'default';
   const deliveryKind = raw.deliveryKind === 'github_pr_update' ? 'github_pr_update' : 'default';
   const remoteCiRef = /^rci_[a-f0-9]{24}$/.test(String(raw.remoteCiRef || '')) ? String(raw.remoteCiRef) : '';
-  if ((originKind === 'remote_ci' || deliveryKind === 'github_pr_update' || baseKind === 'remote_commit') && !remoteCiRef) return null;
+  const reviewRef = /^prv_[a-f0-9]{24}$/.test(String(raw.reviewRef || '')) ? String(raw.reviewRef) : '';
+  if (originKind === 'pr_review' && (inputVersion < 3 || !reviewRef || remoteCiRef)) return null;
+  if (originKind === 'remote_ci' && (!remoteCiRef || reviewRef)) return null;
+  if (originKind === 'default' && (remoteCiRef || reviewRef || deliveryKind === 'github_pr_update' || baseKind === 'remote_commit')) return null;
+  if (originKind !== 'default' && (deliveryKind !== 'github_pr_update' || baseKind !== 'remote_commit')) return null;
   const rawUpdate = raw.prUpdate && typeof raw.prUpdate === 'object' ? raw.prUpdate : {};
   const prUpdate = {
     oldHead: isSha1(rawUpdate.oldHead) ? String(rawUpdate.oldHead).toLowerCase() : '',
@@ -229,6 +233,7 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     baseKind,
     originKind,
     ...(remoteCiRef ? { remoteCiRef } : {}),
+    ...(reviewRef ? { reviewRef } : {}),
     deliveryKind,
     worktreeGitDir,
     expectedTree,
@@ -321,6 +326,7 @@ function publicSummary(raw) {
     baseKind: marker.baseKind,
     originKind: marker.originKind,
     ...(marker.remoteCiRef ? { remoteCiRef: marker.remoteCiRef } : {}),
+    ...(marker.reviewRef ? { reviewRef: marker.reviewRef } : {}),
     deliveryKind: marker.deliveryKind,
     incomplete: marker.incomplete,
     files: marker.files,

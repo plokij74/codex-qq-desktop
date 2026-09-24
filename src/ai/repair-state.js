@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { REVIEW_REF_RE, ERROR_CODES: REVIEW_ERRORS } = require('./pr-review-state');
 
 const REPAIR_REF_RE = /^rpr_[a-f0-9]{24}$/;
 const JOB_REF_RE = /^vfy_job_[a-f0-9]{24}$/;
@@ -49,6 +50,7 @@ const VALIDATION_TRANSITIONS = Object.freeze({
 });
 
 const FIXED_ERROR_CODES = new Set([
+  ...REVIEW_ERRORS,
   'REPAIR_PROJECT_BINDING_INVALID', 'REPAIR_INVALID', 'REPAIR_NOT_FOUND',
   'REPAIR_ALREADY_RUNNING', 'REPAIR_SOURCE_INVALID', 'REPAIR_SOURCE_NOT_FAILED',
   'REPAIR_SOURCE_CHANGED', 'REPAIR_SOURCE_NOT_FOUND', 'REPAIR_PROFILE_NOT_FOUND',
@@ -113,6 +115,7 @@ function normalizeSource(raw, { rejectUnknown = true } = {}) {
     ? new Set(['kind', 'jobRef'])
     : kind === 'workflow'
       ? new Set(['kind', 'workflowRunRef', 'nodeId'])
+      : kind === 'pr_review' ? new Set(['kind', 'reviewRef'])
       : kind === 'remote_ci'
         ? new Set(['kind', 'remoteCiRef'])
         : new Set(['kind']);
@@ -127,6 +130,10 @@ function normalizeSource(raw, { rejectUnknown = true } = {}) {
       throw repairError('REPAIR_SOURCE_INVALID', 'workflow 节点来源无效');
     }
     return { kind, workflowRunRef: String(raw.workflowRunRef), nodeId };
+  }
+  if (kind === 'pr_review') {
+    if (!REVIEW_REF_RE.test(raw.reviewRef)) throw repairError('REPAIR_SOURCE_INVALID');
+    return { kind, reviewRef: raw.reviewRef };
   }
   if (kind === 'remote_ci') {
     if (!isRemoteCiRef(raw.remoteCiRef)) throw repairError('REPAIR_SOURCE_INVALID', '远程 CI 来源引用无效');
@@ -205,7 +212,7 @@ function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
     validationProfile = { profileId, profileFingerprint };
   }
   let sourceFingerprint = String(raw.sourceFingerprint || '').toLowerCase();
-  if (!sourceFingerprint && source.kind !== 'remote_ci') {
+  if (!sourceFingerprint && !['remote_ci', 'pr_review'].includes(source.kind)) {
     const workspace = String(raw.sourceWorkspaceFingerprint || '').toLowerCase();
     if (!validationProfile || !isFingerprint(workspace)) throw repairError('REPAIR_INVALID', 'fingerprint 无效');
     sourceFingerprint = crypto.createHash('sha256').update(JSON.stringify({
@@ -216,7 +223,7 @@ function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
     })).digest('hex');
   }
   if (!isFingerprint(sourceFingerprint)) throw repairError('REPAIR_INVALID', 'source fingerprint 无效');
-  if (source.kind !== 'remote_ci' && !validationProfile) throw repairError('REPAIR_INVALID', 'validation profile 缺失');
+  if (!['remote_ci', 'pr_review'].includes(source.kind) && !validationProfile) throw repairError('REPAIR_INVALID', 'validation profile 缺失');
   const status = String(raw.status || '');
   if (!REPAIR_STATES.includes(status)) throw repairError('REPAIR_INVALID', '修复状态无效');
   if (raw.resultId != null && !/^wt_[A-Za-z0-9]{6,80}$/.test(String(raw.resultId))) throw repairError('REPAIR_INVALID', 'worktree 结果引用无效');

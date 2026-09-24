@@ -222,6 +222,30 @@ describe('D6 GitHub CLI adapter', () => {
     assert.match(calls[0][1].find((arg) => String(arg).includes('/annotations?')), /per_page=100&page=1/);
   });
 
+  it('treats ambiguous exact-lease transport failures as uncertain even with a nonzero exit code', async () => {
+    const newCommit = 'b'.repeat(40);
+    const target = `${newCommit}:refs/heads/feature`;
+    const cases = [
+      { code: 1, stdout: '', uncertain: true },
+      { code: 128, stdout: 'To https://github.com/acme/widget.git\n', uncertain: true },
+      { code: 1, stdout: `!\t${target}\t[remote failed] (remote did not report status)\n`, uncertain: true },
+      { code: 1, stdout: `!\t${newCommit}:refs/heads/other\t[rejected] (stale info)\n`, uncertain: true },
+      { code: 1, stdout: `!\t${target}\t[rejected] (stale info)\n`, uncertain: false },
+      { code: 1, stdout: `!\t${target}\t[remote rejected] (protected branch hook declined)\n`, uncertain: false },
+      { code: 'ENOENT', stdout: '', uncertain: false },
+    ];
+    for (const scenario of cases) {
+      const cli = createGithubCli({ execFileImpl: (_command, args, _options, callback) => {
+        assert.ok(args.includes('--porcelain'));
+        callback(Object.assign(new Error('push transport failed'), { code: scenario.code }), scenario.stdout, 'connection closed');
+        return { kill() {} };
+      } });
+      const result = await cli.exactLeasePush({ repoRoot: 'D:/repo', branch: 'feature', oldHead: 'a'.repeat(40), newCommit });
+      assert.equal(result.ok, false);
+      assert.equal(result.uncertain, scenario.uncertain, JSON.stringify(scenario));
+    }
+  });
+
   it('uses string-preserving jq projections for check runs, Actions jobs, rerun, and exact lease push', async () => {
     const calls = [];
     const head = 'a'.repeat(40);

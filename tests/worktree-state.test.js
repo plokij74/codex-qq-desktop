@@ -51,7 +51,8 @@ describe('D5 worktree marker state', () => {
     assert.equal(normalized.files[0].path, 'packages/app/a.js');
     assert.equal(normalizeMarker(marker({ id: '../bad' })), null);
     assert.equal(normalizeMarker(marker({ version: 1 })).version, MARKER_VERSION);
-    assert.equal(normalizeMarker(marker({ version: 3 })), null);
+    assert.equal(normalizeMarker(marker({ version: 2 })).version, MARKER_VERSION);
+    assert.equal(normalizeMarker(marker({ version: MARKER_VERSION + 1 })), null);
     assert.equal(normalizeMarker(marker({ projectRel: '../outside' })), null);
     assert.equal(normalizeMarker(marker({ patchSha256: 'nope' })), null);
   });

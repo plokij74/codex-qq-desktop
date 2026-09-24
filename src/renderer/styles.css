@@ -102,6 +102,7 @@ html, body {
 .ci-watch-runs li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 5px 0; border-bottom: 1px solid #e0eaf2; }
 .ci-watch-runs li > span { min-width: 0; overflow-wrap: anywhere; }
 .ci-watch-inbox { position: fixed; z-index: 90; right: 12px; top: 68px; width: min(480px, calc(100vw - 24px)); max-height: calc(100vh - 86px); padding: 12px; overflow: auto; background: #eef6fd; border: 1px solid #739fc4; border-radius: 5px; box-shadow: 0 5px 24px #234c7940; }
+.ci-watch-inbox.hidden { display: none; }
 .ci-watch-inbox-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: #24517b; }
 .tb-btn {
   border: 1px solid transparent;
@@ -868,8 +869,30 @@ html, body {
 .pr-comment-body { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .pr-comment-input { display: block; margin: 8px 0 6px; }
 .pr-lifecycle-actions { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-top: 14px; border-top: 1px solid #b8ccdc; padding-top: 10px; }
+.pr-review-panel { min-width: 0; font-size: 12px; }
+.pr-review-toolbar, .pr-review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 8px; }
+.pr-review-toolbar h2 { margin: 0 auto 0 0; }
+.pr-review-toolbar label { display: flex; align-items: center; gap: 5px; }
+.pr-review-list { max-height: 180px; overflow: auto; margin: 8px 0; }
+.pr-review-row { display: block; width: 100%; padding: 7px; margin-bottom: 4px; border: 1px solid #bdcfdf; border-radius: 3px; background: #fff; color: #234; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.pr-review-row.is-selected { border-color: #558db5; background: #eaf5ff; }
+.pr-review-row span, .pr-review-row small { display: block; }
+.pr-review-row small { color: #5c7487; margin-top: 4px; }
+.pr-review-detail { padding: 9px; border: 1px solid #c3d5e3; background: #f5faff; border-radius: 4px; min-width: 0; }
+.pr-review-location { font-weight: bold; color: #365d79; overflow-wrap: anywhere; }
+.pr-review-discussion { max-height: 290px; overflow: auto; user-select: text; margin: 7px 0; }
+.pr-review-comment { border-left: 3px solid #90b8d3; padding: 7px 8px; margin-bottom: 7px; background: #fff; }
+.pr-review-field { display: grid; gap: 5px; margin: 10px 0; color: #456; }
+.pr-review-field textarea, .pr-review-field select, .pr-review-toolbar select { min-width: 0; max-width: 100%; box-sizing: border-box; border: 1px solid #91abc0; border-radius: 3px; padding: 6px; background: #fff; color: #234; font: inherit; }
+.pr-review-field textarea { width: 100%; resize: vertical; }
+.pr-review-repair { margin-top: 12px; border-top: 1px solid #c8d8e4; padding-top: 9px; }
+.pr-review-repair summary { color: #285780; cursor: pointer; }
+.pr-review-notice, .pr-review-error { margin: 7px 0; padding: 7px 8px; background: #fff9e8; color: #775816; border: 1px solid #dfcc9a; overflow-wrap: anywhere; }
+.pr-review-error { background: #fff1f2; color: #8a2933; border-color: #d7a8ad; }
+.pr-review-panel button:disabled { cursor: default; opacity: .6; }
 @media (max-width: 980px) {
-  .pr-workspace { grid-template-columns: 210px minmax(0, 1fr); }
+  .pr-workspace { grid-template-columns: minmax(0, 1fr); }
+  .pr-list { border-right: 0; border-bottom: 1px solid #bfd1df; padding-right: 0; padding-bottom: 6px; max-height: 160px; overflow: auto; }
 }
 .switch-row {
   display: flex;

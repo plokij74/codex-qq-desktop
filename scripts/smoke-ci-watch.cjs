@@ -80,6 +80,7 @@ if (!process.versions.electron) {
   handlers.set('worktree:pr:list', (_event, payload) => ({ ok: true, repo: repository, prs: [pr(payload.state === 'closed' ? 8 : 7), pr(9)] }));
   handlers.set('worktree:pr:get', (_event, payload) => ({ ok: true, repo: repository, pr: pr(payload.number) }));
   handlers.set('engineering:remote-ci:failures', () => ({ ok: true, failures: [], unsupported: [] }));
+  handlers.set('engineering:pr-review:threads', (_event, payload) => ({ ok: true, prNumber: payload.prNumber, threads: [], total: 0, truncated: false }));
   for (const [channel, result] of [
     ['engineering:index:ensure', { ok: true, state: 'ready' }], ['engineering:index:status', { ok: true, state: 'ready' }],
     ['engineering:verification:profiles', { ok: true, profiles: [], candidates: [] }],

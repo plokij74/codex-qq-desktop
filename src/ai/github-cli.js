@@ -194,6 +194,12 @@ function runCommand(command, args, opts = {}) {
       finish({ ok: false, code: -1, stdout: '', stderr: '', error: clip(err.message || err) });
       return;
     }
+    if (opts.input != null) {
+      // A process may exit before consuming stdin. Consume EPIPE as a failed
+      // request instead of allowing an unhandled stream error to crash main.
+      child?.stdin?.on?.('error', onAbort);
+      try { if (child?.stdin?.end) child.stdin.end(String(opts.input)); else onAbort(); } catch { onAbort(); }
+    }
     if (!settled) {
       timer = setTimeout(() => {
         try { child?.kill?.(); } catch { /* ignore */ }
@@ -581,15 +587,15 @@ function createGithubCli(opts = {}) {
     return { ok: true, remote: parsed, base, remoteHead: head };
   }
 
-  async function repository({ repoRoot }) {
-    const remote = await git(repoRoot, ['config', '--get', 'remote.origin.url']);
+  async function repository({ repoRoot, signal }) {
+    const remote = await git(repoRoot, ['config', '--get', 'remote.origin.url'], { signal });
     if (!remote.ok) return { ok: false, code: 'NO_ORIGIN', error: '未配置 origin 远端' };
     const parsed = parseRemote(remote.stdout);
     if (!parsed) return { ok: false, code: 'REMOTE_UNSUPPORTED', error: 'origin 不是可识别的 GitHub 远端' };
-    const auth = await command('gh', ['auth', 'status', '--hostname', parsed.host], { cwd: repoRoot });
+    const auth = await command('gh', ['auth', 'status', '--hostname', parsed.host], { cwd: repoRoot, signal });
     if (!auth.ok) return { ok: false, code: 'GH_NOT_AUTHENTICATED', error: 'GitHub CLI 未安装或尚未登录，请先运行 gh auth login', remote: parsed };
     const qualified = qualifiedRepo(parsed.host, parsed.owner, parsed.repo);
-    const view = await command('gh', ['repo', 'view', qualified, '--json', 'defaultBranchRef,nameWithOwner'], { cwd: repoRoot });
+    const view = await command('gh', ['repo', 'view', qualified, '--json', 'defaultBranchRef,nameWithOwner'], { cwd: repoRoot, signal });
     const metadata = parseJson(view.stdout);
     const base = shellSafeName(metadata?.defaultBranchRef?.name);
     const nameWithOwner = shellSafeName(metadata?.nameWithOwner, 600);
@@ -783,51 +789,58 @@ function createGithubCli(opts = {}) {
       : { ok: false, code: 'GH_API_FAILED', error: clip(result.error || '重新运行 Actions job 失败'), uncertain: result.code === -1 };
   }
 
-  async function branchTip({ repoRoot, branch }) {
+  async function branchTip({ repoRoot, branch, signal }) {
     const cleanBranch = shellSafeName(branch);
     if (!cleanBranch) return { ok: false, code: 'REMOTE_HEAD_FAILED', error: '远端分支无效' };
-    const result = await git(repoRoot, ['ls-remote', 'origin', `refs/heads/${cleanBranch}`]);
+    const result = await git(repoRoot, ['ls-remote', 'origin', `refs/heads/${cleanBranch}`], { signal });
     const head = result.ok ? sha(String(result.stdout || '').trim().split(/\s+/)[0]) : '';
     return head ? { ok: true, head } : { ok: false, code: 'REMOTE_HEAD_FAILED', error: '无法读取远端分支 HEAD', uncertain: result.code === -1 };
   }
 
-  async function exactLeasePush({ repoRoot, branch, oldHead, newCommit }) {
+  async function exactLeasePush({ repoRoot, branch, oldHead, newCommit, signal }) {
     const cleanBranch = shellSafeName(branch);
     const oldSha = sha(oldHead);
     const nextSha = sha(newCommit);
-    if (!cleanBranch || !oldSha || !nextSha) return { ok: false, code: 'PUSH_FAILED', error: '精确推送参数无效' };
+    if (!cleanBranch || !oldSha || !nextSha) return { ok: false, code: 'PUSH_FAILED', error: '精确推送参数无效', uncertain: false };
     const ref = `refs/heads/${cleanBranch}`;
-    const result = await git(repoRoot, ['push', `--force-with-lease=${ref}:${oldSha}`, 'origin', `${nextSha}:${ref}`]);
-    return result.ok ? { ok: true } : { ok: false, code: 'PUSH_FAILED', error: clip(result.error || '精确推送失败'), uncertain: result.code === -1 };
+    const result = await git(repoRoot, ['push', '--porcelain', `--force-with-lease=${ref}:${oldSha}`, 'origin', `${nextSha}:${ref}`], { signal, rawOutput: true });
+    // A transport failure can exit nonzero after the remote accepted the push.
+    // Only an explicit rejection of this exact ref proves it is safe to retry.
+    const rejected = String(result.stdout || '').split(/\r?\n/).some((line) => {
+      const fields = line.split('\t');
+      return fields[0] === '!' && fields[1] === `${nextSha}:${ref}`
+        && /^\[(?:rejected|remote rejected)\](?: |$)/.test(fields[2] || '');
+    });
+    return result.ok ? { ok: true } : { ok: false, code: 'PUSH_FAILED', error: clip(result.error || '精确推送失败'), uncertain: !result.commandMissing && !rejected };
   }
 
-  async function fetchBranchToRef({ repoRoot, branch, targetRef }) {
+  async function fetchBranchToRef({ repoRoot, branch, targetRef, signal }) {
     const cleanBranch = shellSafeName(branch);
     const cleanRef = String(targetRef || '');
-    if (!cleanBranch || !/^refs\/codex\/remote-ci\/rci_[a-f0-9]{24}$/.test(cleanRef)) {
+    if (!cleanBranch || !/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_)[a-f0-9]{24}$/.test(cleanRef)) {
       return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI fetch 参数无效' };
     }
     // Keep the long-lived fetch tail stable for callers while pinning the
     // submodule/refmap behavior before the existing output-suppression flags.
-    const result = await git(repoRoot, ['fetch', '--no-recurse-submodules', '--refmap=', '--no-tags', '--no-write-fetch-head', 'origin', `refs/heads/${cleanBranch}:${cleanRef}`]);
+    const result = await git(repoRoot, ['fetch', '--no-recurse-submodules', '--refmap=', '--no-tags', '--no-write-fetch-head', 'origin', `refs/heads/${cleanBranch}:${cleanRef}`], { signal });
     return result.ok
       ? { ok: true }
       : { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: clip(result.error || '无法获取 PR head'), uncertain: result.code === -1 };
   }
 
-  async function resolveCommit({ repoRoot, ref }) {
+  async function resolveCommit({ repoRoot, ref, signal }) {
     const cleanRef = String(ref || '');
-    if (!/^refs\/codex\/remote-ci\/rci_[a-f0-9]{24}$/.test(cleanRef)) {
+    if (!/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_)[a-f0-9]{24}$/.test(cleanRef)) {
       return { ok: false, code: 'REMOTE_CI_FETCH_MISMATCH', error: '远程 CI ref 无效' };
     }
-    const result = await git(repoRoot, ['rev-parse', '--verify', `${cleanRef}^{commit}`]);
+    const result = await git(repoRoot, ['rev-parse', '--verify', `${cleanRef}^{commit}`], { signal });
     const head = result.ok ? sha(result.stdout) : '';
     return head ? { ok: true, head } : { ok: false, code: 'REMOTE_CI_FETCH_MISMATCH', error: '无法验证 PR head commit' };
   }
 
   async function deleteInternalRef({ repoRoot, ref }) {
     const cleanRef = String(ref || '');
-    if (!/^refs\/codex\/remote-ci\/rci_[a-f0-9]{24}$/.test(cleanRef)) return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI ref 无效' };
+    if (!/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_)[a-f0-9]{24}$/.test(cleanRef)) return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI ref 无效' };
     const result = await git(repoRoot, ['update-ref', '-d', cleanRef]);
     return result.ok ? { ok: true } : { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: clip(result.error || '无法清理远程 CI ref') };
   }
@@ -870,6 +883,7 @@ function createGithubCli(opts = {}) {
   }
 
   return {
+    ...require('./pr-review-github').createReviewGithub(command, qualifiedRepo),
     parseRemote, runCommand: command, preflight, pushBranch, findExistingPr, createPr,
     repository, listPrs, getPr, getChecks, editPr, commentPr, closePr, reopenPr, readyPr, mergePr,
     getCheckRunsForRef, getCheckRun, getCheckRunContent, getCheckAnnotations, getActionsRun, getActionsJob,
