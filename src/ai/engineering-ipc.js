@@ -9,6 +9,8 @@ const { createRemoteCiManager } = require('./remote-ci-manager');
 const { createPrReviewManager } = require('./pr-review-manager');
 const { createPrReviewStore } = require('./pr-review-store');
 const ReviewState = require('./pr-review-state');
+const { createPrAuditManager } = require('./pr-audit-manager');
+const AuditState = require('./pr-audit-state');
 const { createRemoteCiStore } = require('./remote-ci-store');
 const { createGithubCli } = require('./github-cli');
 const { createCiWatchManager } = require('./ci-watch-manager');
@@ -54,6 +56,7 @@ function createEngineeringIpcHandlers(options = {}) {
   let repairs = null;
   let remoteCi = null;
   let prReviews = null;
+  let prAudits = null;
   const reviewProtected = new Set();
   let ciWatches = null;
   const remoteProtected = new Set();
@@ -102,6 +105,43 @@ function createEngineeringIpcHandlers(options = {}) {
       }),
     });
     return prReviews;
+  }
+
+  function getPrAudits() {
+    if (!prAudits) prAudits = options.prAuditManager || createPrAuditManager({
+      githubCli: options.githubCli, userDataPath: options.userDataPath, safeStorage: options.safeStorage,
+      getSettings: options.getSettings, mutationLock: options.withMutation,
+      onEvent: (event) => options.onPrAuditEvent?.(event, [...(projectOwners.get(event.projectKey) || [])]),
+    });
+    return prAudits;
+  }
+
+  async function auditRequest(event, payload, fields, fn, mutation = false) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || Object.keys(payload).some((key) => !['projectBindingId', ...fields].includes(key))) return AuditState.error(AuditState.fail());
+    const binding = getBinding(event, payload);
+    if (!binding || event.sender?.isDestroyed?.()) return AuditState.error(AuditState.fail('BINDING'));
+    const owner = ownerId(event); const abort = new AbortController();
+    abort.projectKey = projectKey(binding.projectPath);
+    const active = remoteOwners.get(owner) || new Set(); active.add(abort); remoteOwners.set(owner, active);
+    let authorization; let retained = false; let released = false;
+    const release = () => {
+      if (released) return;
+      released = true; active.delete(abort); if (!active.size) remoteOwners.delete(owner);
+      if (authorization) unregisterGate(owner, authorization.gate);
+    };
+    const context = { signal: abort.signal, projectBindingId: payload.projectBindingId, ownerId: owner,
+      retainUntilFinished: () => { retained = true; }, release,
+      isCurrent: () => !abort.signal.aborted && !event.sender?.isDestroyed?.() && getBinding(event, payload)?.projectPath === binding.projectPath };
+    try {
+      if (mutation) { authorization = permissionContext(event, payload, options.getSettings?.() || {}); Object.assign(context, authorization.options); }
+      await Promise.resolve();
+      if (!context.isCurrent()) throw AuditState.fail('BINDING');
+      const result = await fn(getPrAudits(), binding, context);
+      if (!context.isCurrent()) throw AuditState.fail('BINDING');
+      return result;
+    } catch (cause) { return AuditState.error(cause); }
+    finally { if (!retained) release(); }
   }
 
   async function reviewRequest(event, payload, fields, fn, mutation = false) {
@@ -194,6 +234,7 @@ function createEngineeringIpcHandlers(options = {}) {
 
   function forgetOwnerKey(owner, key) {
     for (const abort of remoteOwners.get(owner) || []) if (abort.projectKey === key) abort.abort();
+    prAudits?.forgetDrafts(owner, key);
     const projects = ownerProjects.get(owner);
     projects?.delete(key);
     if (projects?.size) {
@@ -376,6 +417,14 @@ function createEngineeringIpcHandlers(options = {}) {
   }
 
   return {
+    prAuditStart: (event, payload) => auditRequest(event, payload, ['prNumber', 'note'], (m, b, c) => m.start(b.projectPath, payload.prNumber, payload.note, c)),
+    prAuditList: (event, payload) => auditRequest(event, payload, ['prNumber'], (m, b) => m.list(b.projectPath, payload.prNumber)),
+    prAuditGet: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b) => m.get(b.projectPath, payload.auditRef)),
+    prAuditCancel: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b) => m.cancel(b.projectPath, payload.auditRef)),
+    prAuditContext: (event, payload) => auditRequest(event, payload, ['auditRef', 'findingId'], (m, b, c) => m.context(b.projectPath, payload.auditRef, payload.findingId, c)),
+    prAuditPrepare: (event, payload) => auditRequest(event, payload, ['auditRef', 'revision', 'summary', 'selections'], (m, b, c) => m.prepare(b.projectPath, payload, c)),
+    prAuditPublish: (event, payload) => auditRequest(event, payload, ['draftRef'], (m, b, c) => m.publish(b.projectPath, payload.draftRef, c), true),
+    prAuditReconcile: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b, c) => m.reconcile(b.projectPath, payload.auditRef, c)),
     ciWatchStart: (event, payload) => ciWatchRequest(event, payload, ['prNumber', 'durationMinutes'], (m, root) => m.start(root, payload.prNumber, payload.durationMinutes)),
     ciWatchList: (event, payload) => ciWatchRequest(event, payload, [], (m, root) => m.list(root)),
     ciWatchGet: (event, payload) => ciWatchRequest(event, payload, ['watchRef'], (m, root) => m.get(root, payload.watchRef)),
@@ -701,6 +750,7 @@ function createEngineeringIpcHandlers(options = {}) {
       const owner = typeof eventOrId === 'number' ? eventOrId : ownerId(eventOrId);
       if (owner == null) return;
       for (const abort of remoteOwners.get(owner) || []) abort.abort();
+      prAudits?.forgetDrafts(owner);
       for (const gate of approvalGates.get(owner) || []) gate.cancelPending?.();
       approvalGates.delete(owner);
       for (const [ref, held] of workflowGates) if (held.owner === owner) workflowGates.delete(ref);
@@ -733,6 +783,7 @@ function createEngineeringIpcHandlers(options = {}) {
       const jobs = manager.list().jobs || [];
       const workflowState = getWorkflows().restoreAtStartup();
       const repairState = getRepairs().restoreAtStartup();
+      const auditState = getPrAudits().store?.persistenceStatus?.() ?? null;
       return {
         ok: true,
         persistence: manager.persistenceStatus?.() ?? null,
@@ -740,6 +791,7 @@ function createEngineeringIpcHandlers(options = {}) {
         jobs: jobs.length,
         workflows: workflowState,
         repairs: repairState,
+        prAudits: auditState,
       };
     },
     close: () => {
@@ -747,6 +799,7 @@ function createEngineeringIpcHandlers(options = {}) {
       for (const active of remoteOwners.values()) for (const abort of active) abort.abort();
       remoteCi?.store?.close();
       prReviews?.close();
+      prAudits?.close();
       for (const index of indexes.values()) index.close();
       workflows?.close();
       verification?.close();

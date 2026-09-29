@@ -14,6 +14,8 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - **Phase A Agent 核心**：权限三档、内联审批、grep/glob/search_replace、流式正文 + 工具轨迹
 - **Phase B 工程闭环**：写盘 unified diff 审批、`git_status` / `git_diff` / `git_commit`、底部终端面板、输入框 `@文件` 引用
 - **Phase D.15 CI 跟踪**：手动跟踪 PR 当前提交的 GitHub Actions，后台运行、应用内未读提醒、可选 Windows 通知
+- **Phase D.16 PR 审查反馈**：PR 详情按线程查看讨论、生成隔离修复、回复与解决，支持只读核对与更新 PR
+- **Phase D.17 主动 AI PR 审查**：PR 详情手动发起只读 AI 代码审查，分析 diff 与快照代码；编辑勾选后一次确认发布 COMMENT Review，无缝衔接 D16 反馈闭环
 
 ## 开发
 
@@ -881,3 +883,17 @@ D12 把 D11 profile 组合成受控 DAG 工作流。用户可以显式运行 `ty
 - 面板局部刷新，保留未提交的 PR 编辑和各线程草稿。草稿、讨论和提示不写入聊天、导出、记忆、usage 或 Hooks；快照仅加密保存必要元数据，加密不可用时仅保留在内存中。
 
 设计与验收状态见 [D16 设计](docs/superpowers/specs/2026-09-24-phase-d16-pr-review-feedback-design.md) 和 [实施记录](docs/superpowers/plans/2026-09-24-phase-d16-pr-review-feedback.md)。离线桌面冒烟：`node scripts/smoke-pr-review.cjs`，覆盖 1100×720 和 900×580。真实 GitHub.com / Enterprise 远端写入尚待指定测试仓库验收。
+
+## Phase D.17：主动 AI PR 代码审查
+
+在已绑定项目的「拉取请求」详情中使用「AI 代码审查」面板，对 PR 变更发起只读、多轮工具调用的 AI 审查，生成结构化审查报告，审阅编辑后发布为 GitHub PR 的 COMMENT Review，并无缝衔接 Phase D.16 的审查反馈回路。
+
+- **快照隔离与只读安全**：审查开始时获取 PR head 与 base 的 Git 提交对象并存入 `refs/codex/pr-audit/<auditRef>/` 内部命名空间，不检出分支、不改动工作区或暂存区。审查过程只读调用 `review_read_file`、`review_list_files`、`review_search` 及最终 `submit_review`。即使模型产生写意图，工具集也无法写入工作区。审查完成后自动清理临时 refs。
+- **差异锚点与行范围校验**：行级发现必须严格落在 PR 的 diff hunk 内，支持指定 `LEFT`（base）或 `RIGHT`（head）及单行/多行范围。发现超出 diff 范围或与补丁不符时由 runtime 自动驳回并要求修正。
+- **人在回路与可编辑发布**：审查完成生成包含摘要与按优先级（P0/P1/P2/P3）划分的结构化报告。用户可自由展开查看差异上下文代码片段、勾选拟发布项、就地编辑审查摘要、各发现标题与说明。
+- **发布草稿冻结与一次性确认**：点击「预览发布内容」后冻结发布草稿，显示精确的 JSON/Markdown 预览。发布操作走一次性权限审批（`permissionGate`，`full-auto` 模式亦强制弹窗确认）。发布通过 GitHub CLI 标准输入传输参数，杜绝命令行参数注入。
+- **幂等性与零原子性防护**：每次发布注入唯一特征指纹。远端超时或网络中断导致状态不确定（`uncertain`）时，禁止盲目重试；用户可通过「核对远端发布状态」只读查询 GitHub Review API，按指纹匹配幂等恢复为已发布状态。
+- **后台运行与工程中心历史**：审查在后台异步执行，用户可自由切换标签页、项目或会话，审查继续推进。工程中心「AI 代码审查」集中展示当前项目的审查报告历史，支持一键定位回 PR 详情。审查结果持久化使用 `safeStorage` 加密存储（`engineering-pr-audits.json`），加密不可用时降级为内存会话存储，不落盘明文。
+- **D16 无缝衔接**：发布成功后自动通知 PR 审查面板（Phase D.16），立即将其渲染为可继续讨论、回复、解决和隔离修复的 GitHub Review 线程。
+
+设计与验收状态见 [D17 设计](docs/superpowers/specs/2026-09-29-phase-d17-ai-pr-review-design.md) 和 [实施记录](docs/superpowers/plans/2026-09-29-phase-d17-ai-pr-review.md)。离线桌面冒烟：`node scripts/smoke-pr-audit.cjs`，覆盖真实 Electron 进程中的启动审查、查看代码上下文、草稿编辑、冻结预览、审批发布、工程中心历史与 PR 回溯。真实 GitHub.com / Enterprise 远端写入尚待指定测试仓库验收。

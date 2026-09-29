@@ -147,6 +147,7 @@ function parseRemote(raw) {
 function runCommand(command, args, opts = {}) {
   const impl = typeof opts.execFileImpl === 'function' ? opts.execFileImpl : execFile;
   const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT_MS;
+  const outputMax = Number.isSafeInteger(opts.maxBytes) && opts.maxBytes > 0 ? Math.min(opts.maxBytes, 2 * 1024 * 1024) : OUTPUT_MAX;
   return new Promise((resolve) => {
     let settled = false;
     let timer;
@@ -171,7 +172,7 @@ function runCommand(command, args, opts = {}) {
         windowsHide: true,
         shell: false,
         timeout: timeoutMs,
-        maxBuffer: OUTPUT_MAX,
+        maxBuffer: outputMax,
       }, (err, stdout, stderr) => {
         if (err && err.code === 'ENOENT') {
           finish({ ok: false, code: -1, stdout: '', stderr: '', error: `${command} 未安装或无法执行`, commandMissing: true });
@@ -185,7 +186,7 @@ function runCommand(command, args, opts = {}) {
           ok: !err,
           code,
           // Raw metadata is parsed privately by apiWatchJson, never sent to IPC.
-          stdout: opts.rawOutput === true ? String(stdout || '').slice(0, OUTPUT_MAX) : clip(stdout, OUTPUT_MAX),
+          stdout: opts.rawOutput === true ? String(stdout || '').slice(0, outputMax) : clip(stdout, outputMax),
           stderr: clip(stderr, OUTPUT_MAX),
           error,
         });
@@ -884,6 +885,7 @@ function createGithubCli(opts = {}) {
 
   return {
     ...require('./pr-review-github').createReviewGithub(command, qualifiedRepo),
+    ...require('./pr-audit-github').createAuditGithub(command, qualifiedRepo),
     parseRemote, runCommand: command, preflight, pushBranch, findExistingPr, createPr,
     repository, listPrs, getPr, getChecks, editPr, commentPr, closePr, reopenPr, readyPr, mergePr,
     getCheckRunsForRef, getCheckRun, getCheckRunContent, getCheckAnnotations, getActionsRun, getActionsJob,

@@ -2353,6 +2353,7 @@ function appendAgentFooter(content, agentLog, applied, turns) {
 }
 
 module.exports = {
+  callModelTurn,
   runAgentLoop,
   parseTextToolCalls,
   toolsForSettings,

@@ -43,6 +43,7 @@ let projects = [];
 const worktreeBindings = new Map();
 let ciWatchUi = null;
 let prReviewUi = null;
+let prAuditUi = null;
 const pullRequestDrafts = new Map();
 let pullRequestForm = null;
 const worktreePreviews = new Map();
@@ -395,7 +396,7 @@ function handleTerminalPanelEvent(ev) {
   }
   // Verification approvals use a dedicated ephemeral panel. They must never
   // fall through to renderApprovalCard, which would attach them to chatRun.
-  if (type === 'approval-needed' && (['remote-ci', 'pr-review'].includes(ev.source) || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
+  if (type === 'approval-needed' && (['remote-ci', 'pr-review', 'pr-audit'].includes(ev.source) || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
     void appConfirm([ev.summary, ev.detail].filter(Boolean).join('\n')).then((allowed) => window.codex.approveChat({ approvalId: ev.approvalId, decision: allowed ? 'allow' : 'deny' })).catch(() => {});
     return true;
   }
@@ -2468,6 +2469,8 @@ async function renderEngineeringCenter() {
     else renderEngineeringApprovalCard(engineeringPendingApproval);
   }
   const refresh = () => refreshEngineeringIndexStatus(token);
+  body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div class="work-card-title">AI 代码审查</div><div id="engineering-pr-audits"></div></section>');
+  prAuditUi?.mountCenter(document.getElementById('engineering-pr-audits'), sessionProject()?.id);
   body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div class="work-card-title">CI 跟踪</div><div id="engineering-ci-watches"></div></section>');
   ciWatchUi?.mountCenter(document.getElementById('engineering-ci-watches'), sessionProject()?.id);
   document.getElementById('engineering-index-rebuild')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexRebuild({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引重建失败'); await refresh(); });
@@ -2901,6 +2904,7 @@ async function deleteProject(id) {
   const worktreeBindingId = worktreeBindings.get(id);
   ciWatchUi?.forgetProject(id);
   prReviewUi?.forgetProject(id);
+  prAuditUi?.forgetProject(id);
   for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
   if (worktreeBindingId) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
@@ -2934,6 +2938,7 @@ async function bindProjectPath(id) {
   ciWatchUi?.bindProject(p, bound.projectBindingId);
   if (previous !== dir) {
     prReviewUi?.forgetProject(id);
+    prAuditUi?.forgetProject(id);
     for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
     pullRequestForm = null;
     resetPullRequestView(null);
@@ -3362,7 +3367,7 @@ function updateClock() {
 
 function setView(view) {
   capturePullRequestDraft();
-  if (view !== 'prs') { pullRequestForm = null; prReviewUi?.unmount(); }
+  if (view !== 'prs') { pullRequestForm = null; prReviewUi?.unmount(); prAuditUi?.unmount(); }
   currentView = view;
   document.querySelectorAll('#main-toolbar .tb-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
   document.querySelectorAll('#left-nav .nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
@@ -3494,6 +3499,7 @@ function renderPullRequestView() {
   resetPullRequestView(project);
   if (!project?.path) {
     prReviewUi?.unmount();
+    prAuditUi?.unmount();
     body.innerHTML = '<div class="pr-empty"><strong>需要绑定项目</strong><span>先打开一个已绑定真实目录的项目会话，再查看该项目 origin 的拉取请求。</span></div>';
     return;
   }
@@ -3542,6 +3548,7 @@ function renderPullRequestView() {
         ${remoteCiPanelHtml(blocked)}
         <div id="pr-ci-watch"></div>
       </section>
+      <div id="pr-audit-panel"></div>
       <div id="pr-review-panel"></div>
       <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
       <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
@@ -3567,6 +3574,7 @@ function renderPullRequestView() {
       <div class="pr-detail">${detailHtml}</div>
     </div>`;
   ciWatchUi?.mountPr(document.getElementById('pr-ci-watch'), { projectId: project.id, prNumber: pr?.number, state: pr?.state });
+  prAuditUi?.mountPr(document.getElementById('pr-audit-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha });
   prReviewUi?.mountPr(document.getElementById('pr-review-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha, profiles: pullRequestView.remoteProfiles });
   if (pr) {
     const fields = { title: body.querySelector('.pr-edit-title'), body: body.querySelector('.pr-edit-body'), comment: body.querySelector('.pr-comment-input'), merge: body.querySelector('.pr-merge-method') };
@@ -5639,8 +5647,34 @@ function boot() {
       return true;
     },
   });
+  prAuditUi = window.PrAuditUi?.create({
+    api: window.codex, document, getProject, getToken: (id) => worktreeBindings.get(id),
+    isVisible: (view, projectId, prNumber) => {
+      if (view === 'prs') return currentView === 'prs' && sessionProject()?.id === projectId && pullRequestView.detail?.number === prNumber;
+      if (view === 'scheduled') return currentView === 'scheduled' && sessionProject()?.id === projectId;
+      return false;
+    },
+    onPublished: async ({ projectId, prNumber }) => {
+      if (sessionProject()?.id === projectId && pullRequestView.detail?.number === prNumber) {
+        await prReviewUi?.refresh();
+      }
+    },
+    navigateToPr: async ({ projectId, prNumber, auditRef }) => {
+      if (!getProject(projectId)?.path) return false;
+      if (sessionProject()?.id !== projectId) openProjectChat(projectId);
+      resetPullRequestView(sessionProject());
+      pullRequestView.selectedNumber = prNumber;
+      pullRequestView.resultId = '';
+      setView('prs');
+      await loadPullRequestDetail(prNumber);
+      if (sessionProject()?.id !== projectId || pullRequestView.detail?.number !== prNumber || currentView !== 'prs') return false;
+      if (auditRef) await prAuditUi?.select(auditRef);
+      document.getElementById('pr-audit-panel')?.scrollIntoView({ block: 'center' });
+      return true;
+    },
+  });
   const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);
-  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
+  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
   renderEmojiPanel();
   bindEvents();
   bindTerminalPanel();

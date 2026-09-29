@@ -205,6 +205,11 @@ function getEngineeringIpc() {
       }
       if (event.notify) getCiWatchNotifier().publish(event);
     },
+    onPrAuditEvent: (event, ownerIds) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (ownerIds.includes(win.webContents.id)) safeSend(win.webContents, 'engineering:pr-audit:event', event);
+      }
+    },
     isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
     createPermissionGate: (event, settings) => createPermissionGate({
       permissionMode: PERMISSION_MODES.has(settings.permissionMode) ? settings.permissionMode : 'confirm-writes',
@@ -1356,6 +1361,14 @@ ipcMain.handle('engineering:pr-review:source', (event, payload = {}) => getEngin
 ipcMain.handle('engineering:pr-review:reply', (event, payload = {}) => getEngineeringIpc().prReviewReply(event, payload));
 ipcMain.handle('engineering:pr-review:resolve', (event, payload = {}) => getEngineeringIpc().prReviewResolve(event, payload));
 ipcMain.handle('engineering:pr-review:update-pr', (event, payload = {}) => getEngineeringIpc().prReviewUpdatePr(event, payload));
+ipcMain.handle('engineering:pr-audit:start', (event, payload = {}) => getEngineeringIpc().prAuditStart(event, payload));
+ipcMain.handle('engineering:pr-audit:list', (event, payload = {}) => getEngineeringIpc().prAuditList(event, payload));
+ipcMain.handle('engineering:pr-audit:get', (event, payload = {}) => getEngineeringIpc().prAuditGet(event, payload));
+ipcMain.handle('engineering:pr-audit:cancel', (event, payload = {}) => getEngineeringIpc().prAuditCancel(event, payload));
+ipcMain.handle('engineering:pr-audit:context', (event, payload = {}) => getEngineeringIpc().prAuditContext(event, payload));
+ipcMain.handle('engineering:pr-audit:prepare', (event, payload = {}) => getEngineeringIpc().prAuditPrepare(event, payload));
+ipcMain.handle('engineering:pr-audit:publish', (event, payload = {}) => getEngineeringIpc().prAuditPublish(event, payload));
+ipcMain.handle('engineering:pr-audit:reconcile', (event, payload = {}) => getEngineeringIpc().prAuditReconcile(event, payload));
 ipcMain.handle('engineering:remote-ci:failures', (event, payload = {}) => getEngineeringIpc().remoteCiFailures(event, payload));
 ipcMain.handle('engineering:remote-ci:snapshot', (event, payload = {}) => getEngineeringIpc().remoteCiSnapshot(event, payload));
 ipcMain.handle('engineering:remote-ci:list', (event, payload = {}) => getEngineeringIpc().remoteCiList(event, payload));

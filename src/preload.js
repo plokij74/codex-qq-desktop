@@ -207,6 +207,22 @@ contextBridge.exposeInMainWorld('codex', {
   replyPrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:reply', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision, body: payload?.body }),
   resolvePrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:resolve', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision }),
   updatePrReviewPr: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:update-pr', { projectBindingId: payload?.projectBindingId, resultId: payload?.resultId, subject: payload?.subject }),
+  startPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:start', { projectBindingId: payload?.projectBindingId, prNumber: payload?.prNumber, note: payload?.note }),
+  listPrAudits: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:list', { projectBindingId: payload?.projectBindingId, prNumber: payload?.prNumber }),
+  getPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:get', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef }),
+  cancelPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:cancel', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef }),
+  getPrAuditContext: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:context', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef, findingId: payload?.findingId }),
+  preparePrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:prepare', {
+    projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef, revision: payload?.revision, summary: payload?.summary,
+    selections: Array.isArray(payload?.selections) ? payload.selections.map((item) => ({ findingId: item?.findingId, title: item?.title, body: item?.body })) : payload?.selections,
+  }),
+  publishPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:publish', { projectBindingId: payload?.projectBindingId, draftRef: payload?.draftRef }),
+  reconcilePrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:reconcile', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef }),
+  onPrAuditEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('engineering:pr-audit:event', listener);
+    return () => ipcRenderer.removeListener('engineering:pr-audit:event', listener);
+  },
   getRemoteCiFailures: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:failures', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber) }),
   snapshotRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:snapshot', { projectBindingId: String(payload?.projectBindingId || ''), prNumber: Number(payload?.prNumber), checkRunId: String(payload?.checkRunId || '') }),
   listRemoteCi: (payload = {}) => ipcRenderer.invoke('engineering:remote-ci:list', { projectBindingId: String(payload?.projectBindingId || ''), limit: payload?.limit }),

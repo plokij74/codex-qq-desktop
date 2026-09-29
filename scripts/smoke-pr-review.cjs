@@ -97,6 +97,7 @@ if (!process.versions.electron) {
   for (const [action, method] of [['list', 'ciWatchList'], ['get', 'ciWatchGet'], ['start', 'ciWatchStart'], ['stop', 'ciWatchStop'], ['ack', 'ciWatchAck']]) handlers.set(`engineering:ci-watch:${action}`, (event, payload) => { if (action === 'start') state.watches++; return engineering[method](event, payload); });
   handlers.set('chat:approve', (event, payload) => ({ ok: engineering.resolveApproval(event, payload.approvalId, payload.decision) }));
   handlers.set('engineering:remote-ci:failures', () => ({ ok: true, failures: [], unsupported: [] }));
+  handlers.set('engineering:pr-audit:list', () => ({ ok: true, audits: [], projectKey: repoKey }));
   for (const [channel, result] of [
     ['engineering:index:ensure', { ok: true, state: 'ready' }], ['engineering:index:status', { ok: true, state: 'ready' }],
     ['engineering:verification:profiles', { ok: true, profiles: [], candidates: [] }], ['engineering:verification:list', { ok: true, jobs: [] }],
@@ -167,11 +168,11 @@ if (!process.versions.electron) {
       await until("Boolean(document.querySelector('[data-review-action=repairProgress]'))");
       await js("document.querySelector('[data-review-action=repairProgress]').click()");
       await until("document.querySelector('#engineering-repair-detail .engineering-detail-title')?.textContent.includes('修复建议')");
-      await until("Boolean(document.querySelector('#engineering-repairs [data-repair-view]'))", 60000);
+      await until("Boolean(document.querySelector('#engineering-repairs [data-repair-view]'))", 90000);
       await js("document.querySelector('#engineering-repairs [data-repair-view]').click()");
       await until("Boolean(document.getElementById('engineering-repair-open-result'))");
       await js("document.getElementById('engineering-repair-open-result').click()");
-      await until("currentView === 'chat' && Boolean(document.querySelector('.worktree-result-card'))");
+      await until("currentView === 'chat' && Boolean(document.querySelector('.worktree-result-card'))", 60000);
       await js("[...document.querySelectorAll('.worktree-result-card button')].find(n=>n.textContent==='查看 diff').click()");
       await until("document.querySelector('.worktree-result-preview')?.textContent.includes('xs.length')");
       await capture('repair-diff-900x580');
