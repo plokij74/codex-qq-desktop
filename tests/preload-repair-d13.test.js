@@ -46,6 +46,7 @@ describe('D13 repair IPC and preload contract', () => {
       'engineering:repair:list', 'engineering:repair:get', 'engineering:repair:result',
       'engineering:repair:start', 'engineering:repair:retry', 'engineering:repair:cancel',
       'engineering:repair:validate', 'engineering:repair:validate-cancel',
+      'engineering:pr-audit:repair-snapshot', 'engineering:pr-audit:repair-source', 'engineering:pr-audit:update-pr',
     ]) assert.match(main, new RegExp(`ipcMain\\.handle\\('${channel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`));
   });
 
@@ -71,10 +72,25 @@ describe('D13 repair IPC and preload contract', () => {
       ['engineering:repair:result', { projectBindingId: '7', repairRef: '8' }],
       ['engineering:repair:start', { projectBindingId: '7', source: { kind: 'verification', jobRef: '10' }, note: 'n'.repeat(2000), sessionId: '9' }],
       ['engineering:repair:start', { projectBindingId: '7', source: { kind: 'workflow', workflowRunRef: '11', nodeId: 'x'.repeat(120) }, note: 'n'.repeat(2000), sessionId: '9' }],
-      ['engineering:repair:retry', { projectBindingId: '7', repairRef: '8', note: 'n'.repeat(2000), sessionId: '9' }],
+      ['engineering:repair:retry', { projectBindingId: '7', repairRef: '8', note: 'n'.repeat(2001), sessionId: '9' }],
       ['engineering:repair:cancel', { projectBindingId: '7', repairRef: '8' }],
       ['engineering:repair:validate', { projectBindingId: '7', repairRef: '8', sessionId: '9' }],
       ['engineering:repair:validate-cancel', { projectBindingId: '7', repairRef: '8' }],
     ]);
+  });
+
+  it('D18 preserves the opaque source and optional profile while rejecting over-limit input in main', async () => {
+    const injected = { projectBindingId: 'pb_test', auditRef: 'pra_test', auditRepairRef: 'par_test', repairRevision: 'abc', findingIds: ['paf_1', 'paf_2'],
+      resultId: 'wt_test', subject: 'Fix originals', title: 'edited publication', body: 'private body', headSha: 'forged', repo: 'other/repo', approval: true };
+    await exposed.snapshotPrAuditRepair(injected);
+    assert.deepEqual(calls.at(-1), ['engineering:pr-audit:repair-snapshot', { projectBindingId: 'pb_test', auditRef: 'pra_test', repairRevision: 'abc', findingIds: ['paf_1', 'paf_2'] }]);
+    await exposed.getPrAuditRepairSource(injected);
+    assert.deepEqual(calls.at(-1), ['engineering:pr-audit:repair-source', { projectBindingId: 'pb_test', auditRepairRef: 'par_test' }]);
+    await exposed.updatePrAuditPr(injected);
+    assert.deepEqual(calls.at(-1), ['engineering:pr-audit:update-pr', { projectBindingId: 'pb_test', resultId: 'wt_test', subject: 'Fix originals' }]);
+    await exposed.startEngineeringRepair({ ...injected, source: { kind: 'pr_audit', auditRepairRef: 'par_test', path: '/forged', body: 'edited' }, validationProfileId: 'vfy_test', note: 'x'.repeat(2100) });
+    assert.deepEqual(calls.at(-1)[1], { projectBindingId: 'pb_test', source: { kind: 'pr_audit', auditRepairRef: 'par_test' }, note: 'x'.repeat(2001), validationProfileId: 'vfy_test', sessionId: '' });
+    await exposed.snapshotPrAuditRepair({ ...injected, findingIds: Array(100).fill('paf_1') });
+    assert.equal(calls.at(-1)[1].findingIds.length, 6, 'retain an over-limit sentinel, never silently accept five');
   });
 });

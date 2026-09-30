@@ -894,7 +894,7 @@ html, body {
 .pr-audit-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 8px; }
 .pr-audit-actions h2 { margin: 0 auto 0 0; }
 .pr-audit-field { display: grid; gap: 5px; margin: 8px 0; color: #456; }
-.pr-audit-field input, .pr-audit-field textarea { min-width: 0; max-width: 100%; box-sizing: border-box; border: 1px solid #91abc0; border-radius: 3px; padding: 6px; background: #fff; color: #234; font: inherit; }
+.pr-audit-field input, .pr-audit-field textarea, .pr-audit-field select { min-width: 0; max-width: 100%; box-sizing: border-box; border: 1px solid #91abc0; border-radius: 3px; padding: 6px; background: #fff; color: #234; font: inherit; }
 .pr-audit-field textarea { width: 100%; resize: vertical; }
 .pr-audit-history { max-height: 150px; overflow: auto; margin: 8px 0; }
 .pr-audit-history-row { display: block; width: 100%; padding: 6px 8px; margin-bottom: 4px; border: 1px solid #bdcfdf; border-radius: 3px; background: #fff; color: #234; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
@@ -906,6 +906,10 @@ html, body {
 .pr-audit-coverage details { margin-top: 4px; padding: 4px 6px; background: #f0f4f8; border-radius: 3px; }
 .pr-audit-findings { max-height: 380px; overflow: auto; margin: 8px 0; }
 .pr-audit-finding { border: 1px solid #c3d5e3; border-radius: 4px; background: #f5faff; padding: 8px; margin-bottom: 8px; }
+.pr-audit-finding.is-highlighted { border-color: #477fa8; box-shadow: inset 3px 0 #477fa8; }
+.pr-audit-repair { border-top: 1px solid #c3d5e3; margin-top: 14px; padding-top: 12px; }
+.pr-audit-repair-originals { max-height: 300px; overflow: auto; margin: 8px 0; overflow-wrap: anywhere; }
+.pr-audit-repair-originals article { margin: 8px 0; }
 .pr-audit-priority { padding: 1px 6px; border-radius: 3px; background: #e2ecf5; color: #1f4f78; font-size: 11px; margin-left: auto; }
 .pr-audit-location { font-weight: bold; color: #285780; background: none; border: none; padding: 0; cursor: pointer; text-align: left; font: inherit; text-decoration: underline; margin: 4px 0; }
 .pr-audit-code { background: #f0f4f8; border: 1px solid #ccd9e5; padding: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; white-space: pre; margin: 4px 0; max-height: 200px; }

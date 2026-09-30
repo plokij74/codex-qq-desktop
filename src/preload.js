@@ -218,6 +218,12 @@ contextBridge.exposeInMainWorld('codex', {
   }),
   publishPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:publish', { projectBindingId: payload?.projectBindingId, draftRef: payload?.draftRef }),
   reconcilePrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:reconcile', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef }),
+  snapshotPrAuditRepair: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:repair-snapshot', {
+    projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef, repairRevision: payload?.repairRevision,
+    findingIds: Array.isArray(payload?.findingIds) ? payload.findingIds.slice(0, 6) : payload?.findingIds,
+  }),
+  getPrAuditRepairSource: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:repair-source', { projectBindingId: payload?.projectBindingId, auditRepairRef: payload?.auditRepairRef }),
+  updatePrAuditPr: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:update-pr', { projectBindingId: payload?.projectBindingId, resultId: payload?.resultId, subject: payload?.subject }),
   onPrAuditEvent: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('engineering:pr-audit:event', listener);
@@ -236,12 +242,13 @@ contextBridge.exposeInMainWorld('codex', {
     const source = payload?.source && typeof payload.source === 'object' ? payload.source : {};
     const normalizedSource = source.kind === 'verification'
       ? { kind: 'verification', jobRef: String(source.jobRef || '') }
+      : source.kind === 'pr_audit' ? { kind: 'pr_audit', auditRepairRef: String(source.auditRepairRef || '') }
       : source.kind === 'pr_review' ? { kind: 'pr_review', reviewRef: String(source.reviewRef || '') }
       : source.kind === 'remote_ci' ? { kind: 'remote_ci', remoteCiRef: String(source.remoteCiRef || '') }
         : { kind: 'workflow', workflowRunRef: String(source.workflowRunRef || ''), nodeId: String(source.nodeId || '').slice(0, 120) };
-    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || ''), ...(['remote_ci', 'pr_review'].includes(normalizedSource.kind) && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
+    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, normalizedSource.kind === 'pr_audit' ? 2001 : 2000), sessionId: String(payload?.sessionId || ''), ...(['remote_ci', 'pr_review', 'pr_audit'].includes(normalizedSource.kind) && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
   },
-  retryEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:retry', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), note: String(payload?.note || '').slice(0, 2000), sessionId: String(payload?.sessionId || '') }),
+  retryEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:retry', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), note: String(payload?.note || '').slice(0, 2001), sessionId: String(payload?.sessionId || '') }),
   cancelEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),
   validateEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:validate', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), sessionId: String(payload?.sessionId || '') }),
   cancelEngineeringRepairValidation: (payload = {}) => ipcRenderer.invoke('engineering:repair:validate-cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),

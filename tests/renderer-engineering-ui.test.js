@@ -94,7 +94,7 @@ describe('D11 renderer engineering center contract', () => {
   it('shows failed verification and workflow repair entry points with advisory validation controls', () => {
     assert.match(app, /j\.status === 'failed'[\s\S]{0,180}data-vfy-repair/);
     assert.match(app, /node\.status === 'failed'[\s\S]{0,180}data-workflow-repair-node/);
-    assert.match(app, /仅供参考，不影响应用或 Draft PR/);
+    assert.match(app, /仅供参考，不影响改动交付/);
     assert.match(app, /data-repair-validate-cancel/);
     assert.match(app, /cancelEngineeringRepairValidation/);
   });

@@ -283,7 +283,7 @@ function createPermissionGate({
     // manager owns the persistent project+profile grant.
     if (tool === 'verification_start') {
       const decision = await waitForApproval(
-        { tool, risk: effectiveRisk, summary, detail, path, diff },
+        { tool, risk: effectiveRisk, summary, detail, path, diff, source },
         signal,
       );
       if (decision.decision === 'allow_session') return allowedWithDecision('allow_session');

@@ -20,6 +20,7 @@ class PrAuditStore {
     this.fs = options.fs || fs; this.safeStorage = options.safeStorage;
     this.file = options.storePath || (options.userDataPath ? path.join(options.userDataPath, 'engineering-pr-audits.json') : '');
     this.records = new Map(); this.mode = 'memory'; this.error = null; this.corrupt = false;
+    this.isProtected = options.isProtected || (() => false);
     try { if (this.file && this.safeStorage?.isEncryptionAvailable?.()) this.mode = 'encrypted'; } catch {}
     this.requiresDurableIntents = this.mode === 'encrypted' || !!(this.file && this.fs.existsSync(this.file));
     if (this.mode === 'encrypted' && this.fs.existsSync(this.file)) {
@@ -56,7 +57,7 @@ class PrAuditStore {
       if (temp) { try { this.fs.unlinkSync(temp); } catch {} } return false;
     }
   }
-  protected(row) { return S.ACTIVE.has(row.status) || ['publishing', 'uncertain'].includes(row.publication?.status); }
+  protected(row) { return S.ACTIVE.has(row.status) || ['publishing', 'uncertain'].includes(row.publication?.status) || this.isProtected(row.auditRef, row); }
   put(raw, { intent = false } = {}) {
     const row = durableRecord(raw); const next = new Map(this.records);
     if (!next.has(row.auditRef)) {

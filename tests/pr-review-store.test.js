@@ -17,7 +17,7 @@ function snapshot(index = 1, project = 'a'.repeat(32)) {
     path: 'src/app.js', line: 2, subjectType: 'LINE', createdAt: new Date(Date.parse(DATE) + index).toISOString() };
 }
 function dir(t) { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d16-store-')); t.after(() => fs.rmSync(root, { recursive: true, force: true })); return root; }
-describe('D16 encrypted snapshots and v3 migration', () => {
+describe('D16 encrypted snapshots and legacy migration', () => {
   it('stores only immutable metadata, reuses equivalent snapshots and supports restart navigation', async (t) => {
     const root = dir(t); const options = { userDataPath: root, safeStorage };
     const store = createPrReviewStore(options); const f = fixture(t, { store });
@@ -57,30 +57,31 @@ describe('D16 encrypted snapshots and v3 migration', () => {
     assert.equal(store.list().length, 200);
     for (const ref of protectedRefs) assert.ok(store.list().some((item) => item.reviewRef === ref));
   });
-  it('migrates encrypted v1/v2 repair stores and writes v3 with optional review validation', (t) => {
+  it('migrates encrypted v1–v3 repair stores and writes v4 with optional review validation', (t) => {
     const root = dir(t); const file = path.join(root, 'engineering-repairs.json');
     const old = { repairRef: 'rpr_' + 'a'.repeat(24), projectKey: 'b'.repeat(32), source: { kind: 'verification', jobRef: 'vfy_job_' + 'c'.repeat(24) },
       profileId: 'vfy_' + 'd'.repeat(8), profileFingerprint: 'e'.repeat(64), sourceWorkspaceFingerprint: 'f'.repeat(64), status: 'ready', createdAt: DATE };
-    for (const version of [1, 2]) {
+    for (const version of [1, 2, 3]) {
       fs.writeFileSync(file, JSON.stringify({ version, cipher: 'electron-safeStorage', payload: Buffer.from(JSON.stringify([old])).toString('base64') }));
       const store = createRepairStore({ userDataPath: root, safeStorage }); assert.equal(store.list().length, 1);
       const item = normalizeRepair({ ...old, repairRef: 'rpr_' + '1'.repeat(24), source: { kind: 'pr_review', reviewRef: snapshot().reviewRef },
         profileId: undefined, profileFingerprint: undefined, sourceWorkspaceFingerprint: undefined, sourceFingerprint: '2'.repeat(64) });
-      store.put(item); store.close(); assert.equal(JSON.parse(fs.readFileSync(file)).version, 3);
+      store.put(item); store.close(); assert.equal(JSON.parse(fs.readFileSync(file)).version, 4);
       assert.equal(createRepairStore({ userDataPath: root, safeStorage }).list().length, 2);
       assert.equal(item.validationProfile, undefined);
     }
     assert.throws(() => normalizeSource({ kind: 'pr_review', reviewRef: snapshot().reviewRef, headSha: HEAD }));
   });
-  it('migrates v1/v2 markers and refuses mismatched review origin/delivery/ref combinations', () => {
+  it('migrates v1–v3 markers and refuses mismatched review origin/delivery/ref combinations', () => {
     const raw = { version: MARKER_VERSION, id: 'wt_review01', state: 'ready', repoRoot: 'D:/repo', projectRoot: 'D:/repo', projectRel: '.',
       projectIdentity: 'windows:d:/repo', worktreeGitDir: 'D:/repo/.git/worktrees/checkout', baseHead: HEAD,
       expectedTree: 'b'.repeat(40), patchSha256: 'c'.repeat(64), patchBytes: 20, createdAt: 1, updatedAt: 2,
       originKind: 'pr_review', baseKind: 'remote_commit', deliveryKind: 'github_pr_update', reviewRef: snapshot().reviewRef };
-    const marker = normalizeMarker(raw); assert.ok(marker); assert.equal(marker.version, 3);
+    const marker = normalizeMarker(raw); assert.ok(marker); assert.equal(marker.version, 4);
+    assert.equal(normalizeMarker({ ...raw, version: 3 }).version, 4);
     const summary = publicSummary(marker); assert.equal(summary.canCreatePr, false); assert.equal(summary.canUpdatePr, true);
     for (const patch of [{ version: 2 }, { reviewRef: '' }, { remoteCiRef: 'rci_' + 'a'.repeat(24) }, { originKind: 'default' }, { baseKind: 'local_head' }, { deliveryKind: 'default' }]) assert.equal(normalizeMarker({ ...raw, ...patch }), null);
-    for (const version of [1, 2]) assert.equal(normalizeMarker({ ...raw, version, originKind: 'default', baseKind: 'local_head', deliveryKind: 'default', reviewRef: undefined }).version, 3);
-    assert.equal(normalizeMarker({ ...raw, version: 2, originKind: 'remote_ci', reviewRef: undefined, remoteCiRef: 'rci_' + 'a'.repeat(24) }).version, 3);
+    for (const version of [1, 2, 3]) assert.equal(normalizeMarker({ ...raw, version, originKind: 'default', baseKind: 'local_head', deliveryKind: 'default', reviewRef: undefined }).version, 4);
+    assert.equal(normalizeMarker({ ...raw, version: 2, originKind: 'remote_ci', reviewRef: undefined, remoteCiRef: 'rci_' + 'a'.repeat(24) }).version, 4);
   });
 });

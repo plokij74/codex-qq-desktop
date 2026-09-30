@@ -3,7 +3,7 @@ const { remoteCiError } = require('./remote-ci-state');
 const { cleanText } = require('./remote-ci-state');
 const { ref } = require('./pr-review-state');
 function resultError(cause, fallback = 'PR_UPDATE_UNAVAILABLE') {
-  const code = /^(?:PR_UPDATE_|PR_REVIEW_|REMOTE_CI_)[A-Z_]+$/.test(String(cause?.code || '')) ? cause.code : fallback;
+  const code = /^(?:PR_UPDATE_|PR_REVIEW_|PR_AUDIT_|REMOTE_CI_)[A-Z_]+$/.test(String(cause?.code || '')) ? cause.code : fallback;
   return { ok: false, code, error: code };
 }
 async function createRemoteWorktree(manager, sourceRef, { project, sessionId, subagentId, goal, signal } = {}, context = {}) {
@@ -11,10 +11,12 @@ async function createRemoteWorktree(manager, sourceRef, { project, sessionId, su
   const root = project?.path;
   const { kind, refField } = manager.deliverySource || { kind: 'remote_ci', refField: 'remoteCiRef' };
   const fresh = await manager.resolveMetadata(root, sourceRef, { ...context, signal });
-  const targetRef = kind === 'remote_ci' ? `refs/codex/remote-ci/${ref('rci')}` : `refs/codex/pr-review/${ref('prv')}`;
+  const operationRef = ref(kind === 'remote_ci' ? 'rci' : kind === 'pr_audit' ? 'par' : 'prv');
+  const targetRef = `refs/codex/${kind === 'remote_ci' ? 'remote-ci' : kind === 'pr_audit' ? 'pr-audit-repair' : 'pr-review'}/${operationRef}`;
   const github = manager.github;
   if (!github.fetchBranchToRef || !github.resolveCommit || !github.deleteInternalRef || !manager.worktree?.createAtCommit) return resultError(null);
   let fetched = false;
+  manager.activeRefs?.add(operationRef);
   try {
     manager._current?.({ ...context, signal });
     if (signal?.aborted) return resultError(null);
@@ -32,6 +34,7 @@ async function createRemoteWorktree(manager, sourceRef, { project, sessionId, su
       origin: { kind, [refField]: sourceRef }, delivery: 'github_pr_update', signal });
   } finally {
     if (fetched) { try { await github.deleteInternalRef({ repoRoot: fresh.repo.repoRoot, ref: targetRef }); } catch {} }
+    manager.activeRefs?.delete(operationRef);
   }
 }
 async function updatePr(manager, projectPath, resultId, subject, context = {}) {
@@ -63,7 +66,7 @@ async function updatePr(manager, projectPath, resultId, subject, context = {}) {
         const gate = context.permissionGate || context.gate;
         if (!reconcileOnly) {
           if (!gate?.authorize) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');
-          const decision = await gate.authorize({ tool: `${kind}_update_pr`, risk: 'remote-mutation', source: kind === 'remote_ci' ? 'remote-ci' : 'pr-review',
+          const decision = await gate.authorize({ tool: `${kind}_update_pr`, risk: 'remote-mutation', source: kind === 'remote_ci' ? 'remote-ci' : kind === 'pr_audit' ? 'pr-audit' : 'pr-review',
             summary: `更新 PR #${initial.item.prNumber} · ${initial.item.headRefName}`,
             detail: `${initial.item.headSha.slice(0, 12)} · ${initial.found.marker.stats?.files || 0} 个文件 · ${frozenSubject}`, signal: context.signal });
           if (!decision?.allowed) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');

@@ -870,7 +870,7 @@ function createWorktreeManager(opts = {}) {
     return listed.ok ? { ...listed, recovered, warnings: [...(listed.warnings || []), ...warnings] } : listed;
   }
 
-  async function createInternal({ project, sessionId, subagentId, goal, baseHead, baseKind = 'local_head', originKind = 'default', remoteCiRef, reviewRef, deliveryKind = 'default' }) {
+  async function createInternal({ project, sessionId, subagentId, goal, baseHead, baseKind = 'local_head', originKind = 'default', remoteCiRef, reviewRef, auditRepairRef, deliveryKind = 'default' }) {
     let repo;
     try { repo = await resolveRepo(project?.path); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
     return withProjectLock(repo.projectIdentity, async () => {
@@ -925,6 +925,7 @@ function createWorktreeManager(opts = {}) {
           originKind,
           ...(remoteCiRef ? { remoteCiRef } : {}),
           ...(reviewRef ? { reviewRef } : {}),
+          ...(auditRepairRef ? { auditRepairRef } : {}),
           deliveryKind,
           worktreeGitDir: '',
         });
@@ -1002,12 +1003,13 @@ function createWorktreeManager(opts = {}) {
   async function createAtCommit({ project, baseHead, sessionId, subagentId, goal, origin, delivery }) {
     const remoteCiRef = origin?.kind === 'remote_ci' ? String(origin.remoteCiRef || '') : '';
     const reviewRef = origin?.kind === 'pr_review' ? String(origin.reviewRef || '') : '';
-    if ((!/^rci_[a-f0-9]{24}$/.test(remoteCiRef) && !/^prv_[a-f0-9]{24}$/.test(reviewRef)) || delivery !== 'github_pr_update') {
+    const auditRepairRef = origin?.kind === 'pr_audit' ? String(origin.auditRepairRef || '') : '';
+    if ((!/^rci_[a-f0-9]{24}$/.test(remoteCiRef) && !/^prv_[a-f0-9]{24}$/.test(reviewRef) && !/^par_[a-f0-9]{24}$/.test(auditRepairRef)) || delivery !== 'github_pr_update') {
       return worktreeError('WORKTREE_CREATE_FAILED', '远程隔离来源无效');
     }
     return createInternal({
       project, baseHead, sessionId, subagentId, goal,
-      baseKind: 'remote_commit', originKind: origin.kind, remoteCiRef, reviewRef,
+      baseKind: 'remote_commit', originKind: origin.kind, remoteCiRef, reviewRef, auditRepairRef,
       deliveryKind: 'github_pr_update',
     });
   }
@@ -1519,7 +1521,7 @@ function createWorktreeManager(opts = {}) {
     try { repo = await resolveRepo(projectPath); } catch (err) { return worktreeError(err.code || 'NOT_GIT_REPO', err.message); }
     const result = await resultById(repo.projectRoot, resultId);
     if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
-    if (result.marker.deliveryKind !== 'github_pr_update' || (!result.marker.remoteCiRef && !result.marker.reviewRef)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不支持更新 PR');
+    if (result.marker.deliveryKind !== 'github_pr_update' || (!result.marker.remoteCiRef && !result.marker.reviewRef && !result.marker.auditRepairRef)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不支持更新 PR');
     return { ok: true, repo, result, marker: result.marker, summary: publicSummary(result.marker) };
   }
 
@@ -1542,7 +1544,7 @@ function createWorktreeManager(opts = {}) {
     return withProjectLock(repo.projectIdentity, async () => {
       const result = await resultById(repo.projectRoot, resultId);
       if (!result || result.marker.projectIdentity !== repo.projectIdentity) return worktreeError('RESULT_NOT_FOUND', '隔离结果不存在');
-      if (result.marker.deliveryKind !== 'github_pr_update' || (!result.marker.remoteCiRef && !result.marker.reviewRef)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不支持更新 PR');
+      if (result.marker.deliveryKind !== 'github_pr_update' || (!result.marker.remoteCiRef && !result.marker.reviewRef && !result.marker.auditRepairRef)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不支持更新 PR');
       if (!['ready', 'conflict', 'pr_update_failed', 'pr_update_uncertain'].includes(result.marker.state)) return worktreeError('PR_UPDATE_UNAVAILABLE', '当前结果不能更新 PR');
       const title = normalizeUpdateSubject(subject);
       if (!title) return worktreeError('PR_UPDATE_UNAVAILABLE', 'commit subject 不能为空');
@@ -1581,7 +1583,7 @@ function createWorktreeManager(opts = {}) {
             updatedAt: Date.now(),
           },
         });
-        return { ok: true, commit: commitSha, oldHead: result.marker.baseHead, expectedTree: result.marker.expectedTree, remoteCiRef: result.marker.remoteCiRef, reviewRef: result.marker.reviewRef, result: publicSummary(result.marker) };
+        return { ok: true, commit: commitSha, oldHead: result.marker.baseHead, expectedTree: result.marker.expectedTree, remoteCiRef: result.marker.remoteCiRef, reviewRef: result.marker.reviewRef, auditRepairRef: result.marker.auditRepairRef, result: publicSummary(result.marker) };
       } catch (err) {
         try { await updateState(result, 'pr_update_failed', { errorCode: err.code || 'PR_UPDATE_UNAVAILABLE', error: shortError(err.message) }); } catch {}
         return worktreeError(err.code || 'PR_UPDATE_UNAVAILABLE', shortError(err.message || err), { result: publicSummary(result.marker) });

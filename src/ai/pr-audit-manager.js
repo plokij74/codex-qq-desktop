@@ -53,7 +53,7 @@ class PrAuditManager {
     const fresh = await this.source(root, expected.prNumber, context);
     if (S.sourceKey(fresh.source) !== S.sourceKey(expected)) throw S.fail('CHANGED'); return fresh;
   }
-  async capture(root, prNumber, auditRef, context, expected) {
+  async capture(root, prNumber, auditRef, context, expected, refNamespace = 'pr-audit') {
     const { repo, source } = await this.source(root, prNumber, context);
     if (expected && S.sourceKey(expected) !== S.sourceKey(source)) throw S.fail('CHANGED');
     if (source.changedFiles > S.LIMITS.remoteFiles) throw S.fail('LIMIT');
@@ -61,7 +61,7 @@ class PrAuditManager {
     source.mergeBaseSha = await this.github.getAuditMergeBase(this.args(repo, context, source));
     if (expected && expected.mergeBaseSha !== source.mergeBaseSha) throw S.fail('CHANGED');
     this.current(context);
-    const snapshot = this.snapshotFactory({ github: this.github, repo, source, auditRef, files, signal: context.signal });
+    const snapshot = this.snapshotFactory({ github: this.github, repo, source, auditRef, files, signal: context.signal, refNamespace });
     try { await snapshot.init(); await this.fresh(root, source, context); return snapshot; }
     catch (cause) { await snapshot.cleanup(); throw cause; }
   }
@@ -126,7 +126,7 @@ class PrAuditManager {
     } catch (cause) { return S.error(cause); }
   }
   get(root, auditRef) {
-    try { const row = this.row(root, auditRef); return { ok: true, audit: { ...row, revision: S.revision(row) }, persistence: this.store.persistenceStatus() }; }
+    try { const row = this.row(root, auditRef); return { ok: true, audit: { ...row, revision: S.revision(row), repairRevision: S.repairRevision(row) }, persistence: this.store.persistenceStatus() }; }
     catch (cause) { return S.error(cause); }
   }
   cancel(root, auditRef) {

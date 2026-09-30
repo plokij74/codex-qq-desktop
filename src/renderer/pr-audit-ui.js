@@ -7,6 +7,8 @@
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const REF = /^pra_[a-f0-9]{24}$/; const FINDING = /^paf_[a-f0-9]{24}$/;
   const ACTIVE = new Set(['preparing', 'running']);
+  const MAX_REPAIR_FINDINGS = 5;
+  const FOCUS_ATTRS = ['data-audit-field', 'data-audit-title', 'data-audit-body', 'data-audit-check', 'data-audit-repair-check', 'data-audit-repair-field'];
   const statuses = { preparing: '准备提交快照', running: '审查中', completed: '审查完成', failed: '未完成', cancelled: '已取消', interrupted: '已中断' };
   const published = { publishing: '正在发布', published: '已发布', uncertain: '发布结果待核对', failed: '发布未完成' };
   const reasons = {
@@ -22,8 +24,29 @@
     PUBLISHED: '此报告已经发布。', UNCERTAIN: '发布可能已生效，请只读核对结果；此报告不会重发。',
     PUBLISH_FAILED: '发布未完成，请刷新状态后重新预览。', STORE_CORRUPT: '加密历史无法读取，原文件已保留；当前报告仅保留在内存。',
     STORE_MEMORY: '历史写入不可用；当前报告仅保留在本次运行中。',
+    REPAIR_INVALID: '请从当前报告选择 1–5 项发现，补充说明最多 2000 字。',
+    REPAIR_LIMIT: '修复来源已达上限，请先处理现有隔离结果。',
+    REPAIR_NOT_FOUND: '原报告或修复来源已不可用，请重新审查。',
+    REPAIR_CHANGED: '报告或 PR 来源已变化，请重新审查后生成修复。',
+    REPAIR_CONTEXT_LIMIT: '所选发现、代码和说明超过 32 KiB，请减少选择后重试。',
+    REPAIR_STORE_CORRUPT: '修复来源存储无法读取，原文件已保留；请恢复存储后再生成修复。',
+    REPAIR_STORE_MEMORY: '修复来源仅保留在本次运行中。',
   };
-  const reason = (code) => reasons[String(code || '').replace(/^PR_AUDIT_/, '')] || '操作未完成，请刷新查看状态。';
+  const repairReasons = {
+    REPAIR_ALREADY_RUNNING: '此项目已有修复或验证进行中，请先完成或取消。',
+    REPAIR_READ_ONLY: '只读模式不能生成修复。', REPAIR_APPROVAL_CANCELLED: '修复已取消。',
+    REPAIR_APPROVAL_REQUIRED: '修复需要写入授权。', REPAIR_PROJECT_BINDING_INVALID: '项目绑定已变化，请重新打开 PR。',
+    REMOTE_CI_VALIDATION_PROFILE_NOT_FOUND: '选定的本地验证档案已不可用，请重新选择。',
+    PR_UPDATE_UNCERTAIN: '推送结果尚未确认。请点击「核对更新状态」只读核对；不会再次推送。',
+    PR_UPDATE_HEAD_CHANGED: 'PR 分支已有变化，请重新审查后生成修复。',
+    PR_UPDATE_UNAVAILABLE: '当前隔离结果无法更新此 PR，请检查结果和原审查来源。',
+    PR_UPDATE_CONFIRM_REQUIRED: '更新 PR 未获确认。',
+    PR_UPDATE_TREE_MISMATCH: '隔离提交与审阅结果不一致，已阻止推送。',
+    PR_UPDATE_PUSH_FAILED: '推送失败，请检查远端分支权限后再操作。',
+    PR_UPDATE_IDENTITY_MISSING: '请先配置本地 Git 的 user.name 和 user.email。',
+    PR_UPDATE_CLEANUP_FAILED: 'PR 已更新，本地隔离目录清理未完成，可再次核对状态。',
+  };
+  const reason = (code) => repairReasons[code] || reasons[String(code || '').replace(/^PR_AUDIT_/, '')] || '操作未完成，请刷新查看状态。';
   const status = (row) => [statuses[row.status] || '未知状态', published[row.publicationStatus || row.publication?.status], row.stale ? '来源已变化' : ''].filter(Boolean).join(' · ');
   const location = (f) => `${f.path} · ${f.side === 'LEFT' ? '左侧' : '右侧'} ${f.startLine === f.line ? f.line : `${f.startLine}–${f.line}`} 行`;
 
@@ -46,8 +69,15 @@
       const audit = record.audit;
       if (!audit?.report) return null;
       if (!record.drafts.has(audit.auditRef)) record.drafts.set(audit.auditRef, { summary: audit.report.summary,
-        findings: new Map(audit.report.findings.map((f) => [f.findingId, { title: f.title, body: f.body, selected: false }])) });
-      return record.drafts.get(audit.auditRef);
+        findings: new Map(audit.report.findings.map((f) => [f.findingId, { title: f.title, body: f.body, selected: false }])),
+        repair: { selected: new Set(), note: '', profileId: '', preview: null, revision: audit.repairRevision }, view: {} });
+      const saved = record.drafts.get(audit.auditRef);
+      if (saved.repair.revision !== audit.repairRevision) {
+        saved.repair.revision = audit.repairRevision; saved.repair.preview = null;
+        saved.repair.selected = new Set([...saved.repair.selected].filter((id) => audit.report.findings.some((f) => f.findingId === id)));
+      }
+      for (const f of audit.report.findings) if (!saved.findings.has(f.findingId)) saved.findings.set(f.findingId, { title: f.title, body: f.body, selected: false });
+      return saved;
     }
     function capture() {
       if (!mount) return;
@@ -60,6 +90,16 @@
         const check = element.querySelector(`[data-audit-check="${id}"]`);
         if (title) value.title = title.value; if (body) value.body = body.value; if (check) value.selected = check.checked;
       }
+      for (const name of ['note', 'profileId']) {
+        const input = element.querySelector(`[data-audit-repair-field="${name}"]`); if (input) saved.repair[name] = input.value;
+      }
+      element.querySelectorAll('[data-audit-repair-check]').forEach((node) => {
+        if (node.checked) saved.repair.selected.add(node.dataset.auditRepairCheck); else saved.repair.selected.delete(node.dataset.auditRepairCheck);
+      });
+      const list = element.querySelector('[data-audit-findings]'); if (list) saved.view.scroll = list.scrollTop;
+      const focused = element.contains?.(doc?.activeElement) ? doc.activeElement : null;
+      const attr = focused && FOCUS_ATTRS.find((key) => focused.hasAttribute?.(key) || focused.attributes?.[key] !== undefined);
+      if (attr) saved.view.focus = { attr, id: focused.getAttribute?.(attr) ?? focused.attributes[attr], start: focused.selectionStart, end: focused.selectionEnd };
     }
     function invalidate(record) {
       if (!record) return;
@@ -82,7 +122,8 @@
     }
     async function select(ref, record = mount?.record) {
       if (!active(record) || record.busy || !REF.test(ref)) return false;
-      capture(); record.selected = ref; record.audit = null; record.preview = null; record.snippet = null;
+      capture(); if (record.selected !== ref) record.highlighted = new Set();
+      record.selected = ref; record.audit = null; record.preview = null; record.snippet = null;
       record.reading = true; record.contextSeq++; const seq = ++record.detailSeq; const epoch = record.epoch; render();
       const result = await invoke('getPrAudit', { projectBindingId: record.token, auditRef: ref });
       if (!active(record) || seq !== record.detailSeq || epoch !== record.epoch) return false;
@@ -113,6 +154,60 @@
         && (!record.headSha || record.headSha === audit.source?.headSha)
         && !['publishing', 'published', 'uncertain'].includes(audit.publication?.status) && !record.uncertain.has(audit.auditRef);
     }
+    function repairEligible(record) {
+      const audit = record.audit;
+      return audit?.status === 'completed' && audit.report && !audit.stale && /^[a-f0-9]{64}$/.test(audit.repairRevision)
+        && record.state === 'OPEN' && (!record.headSha || record.headSha === audit.source?.headSha);
+    }
+    function repairSelection(record) {
+      const selected = draft(record)?.repair.selected;
+      return record.audit?.report?.findings.filter((f) => selected?.has(f.findingId)) || [];
+    }
+    function repairKey(record) {
+      const saved = draft(record)?.repair;
+      return JSON.stringify([record.audit?.repairRevision, repairSelection(record).map((f) => f.findingId), saved?.note, saved?.profileId]);
+    }
+    function repairPreviewCurrent(record) {
+      return repairEligible(record) && draft(record)?.repair.preview === repairKey(record);
+    }
+    async function repair(action, record = mount?.record) {
+      if (!active(record) || record.busy || record.loading || record.reading || !repairEligible(record)) return false;
+      capture(); const saved = draft(record).repair; const findings = repairSelection(record);
+      if (!findings.length || findings.length > MAX_REPAIR_FINDINGS || saved.note.length > 2000) {
+        record.error = reason('PR_AUDIT_REPAIR_INVALID'); render(); return false;
+      }
+      if (action === 'previewRepair') { saved.preview = repairKey(record); record.error = ''; render(); return true; }
+      if (action !== 'repair' || !repairPreviewCurrent(record)) return false;
+      const epoch = record.epoch; const audit = record.audit; const headSha = record.headSha; const sessionId = options.getSessionId?.();
+      const note = saved.note; const profileId = saved.profileId;
+      const valid = () => active(record) && record.epoch === epoch && record.selected === audit.auditRef
+        && record.audit?.repairRevision === audit.repairRevision && record.headSha === headSha && repairEligible(record);
+      record.busy = 'repair'; record.error = ''; record.notice = ''; render();
+      try {
+        const source = await invoke('snapshotPrAuditRepair', { projectBindingId: record.token, auditRef: audit.auditRef,
+          repairRevision: audit.repairRevision, findingIds: findings.map((f) => f.findingId) });
+        if (!valid()) return false;
+        if (!source?.ok || !/^par_[a-f0-9]{24}$/.test(source.auditRepairRef)) { record.error = reason(source?.code); return false; }
+        const result = await invoke('startEngineeringRepair', { projectBindingId: record.token,
+          source: { kind: 'pr_audit', auditRepairRef: source.auditRepairRef }, note,
+          ...(profileId ? { validationProfileId: profileId } : {}), ...(sessionId ? { sessionId } : {}) });
+        if (!valid()) return false;
+        if (!result?.ok) { record.error = reason(result?.code); return false; }
+        record.repairRef = result.repair?.repairRef || result.repairRef || '';
+        record.notice = `修复已排队，可在工程中心审阅隔离结果。${source.persistence?.durable === false ? '修复来源仅保留在本次运行中。' : ''}`;
+        saved.preview = null;
+        if (record.repairRef) options.openRepair?.({ projectId: record.projectId, repairRef: record.repairRef });
+        return true;
+      } finally { record.busy = ''; if (active(record)) render(); }
+    }
+    function focusFindings(ids, record = mount?.record) {
+      if (!active(record) || !Array.isArray(ids)) return false;
+      record.highlighted = new Set(ids.filter((id) => record.audit?.report?.findings.some((f) => f.findingId === id)));
+      render();
+      const first = [...record.highlighted][0];
+      if (first) mount.element.querySelector(`[data-audit-finding="${first}"]`)?.scrollIntoView?.({ block: 'center' });
+      return Boolean(first);
+    }
     async function context(findingId, record = mount?.record) {
       if (!active(record) || record.busy || !record.audit?.report?.findings.some((f) => f.findingId === findingId)) return false;
       capture(); const seq = ++record.contextSeq; const ref = record.selected; const epoch = record.epoch;
@@ -123,6 +218,7 @@
       render(); return !!result?.ok;
     }
     async function operate(action, record = mount?.record) {
+      if (action === 'previewRepair' || action === 'repair') return repair(action, record);
       if (!active(record) || record.busy || record.loading || record.reading) return false;
       capture(); const audit = record.audit; const saved = draft(record); let method; let payload;
       if (action === 'start') {
@@ -158,11 +254,10 @@
       const record = mount?.record; if (!active(record)) return;
       capture(); const element = mount.element; const audit = record.audit; const saved = draft(record);
       const disabled = !!(record.busy || record.loading || record.reading);
-      const scroll = element.querySelector('[data-audit-findings]')?.scrollTop || 0;
+      const scroll = saved?.view.scroll || 0;
       const focused = element.contains?.(doc?.activeElement) ? doc.activeElement : null;
-      const focusAttr = focused && ['data-audit-field', 'data-audit-title', 'data-audit-body'].find((key) => focused.hasAttribute?.(key) || focused.attributes?.[key] !== undefined);
-      const focusId = focusAttr ? focused.getAttribute?.(focusAttr) ?? focused.attributes[focusAttr] : null;
-      const start = focused?.selectionStart; const end = focused?.selectionEnd;
+      const liveAttr = focused && FOCUS_ATTRS.find((key) => focused.hasAttribute?.(key) || focused.attributes?.[key] !== undefined);
+      const focus = liveAttr ? { attr: liveAttr, id: focused.getAttribute?.(liveAttr) ?? focused.attributes[liveAttr], start: focused.selectionStart, end: focused.selectionEnd } : saved?.view.focus;
       const button = (action, label, enabled = true, primary = false) => `<button type="button" class="${primary ? 'btn-secondary' : 'ghost-btn'}" data-audit-action="${action}" ${disabled || !enabled ? 'disabled' : ''}>${label}</button>`;
       const history = record.history.map((r) => `<button type="button" class="pr-audit-history-row${r.auditRef === record.selected ? ' is-selected' : ''}" data-audit-select="${r.auditRef}" ${disabled ? 'disabled' : ''}><strong>${escape(status(r))}</strong><span>${escape(r.createdAt)} · ${(r.headSha || '').slice(0, 8)} · ${Number(r.findingCount) || 0} 项发现</span></button>`).join('');
       let report = '';
@@ -175,9 +270,12 @@
           ${ACTIVE.has(audit.status) ? button('cancel', '取消审查') : ''}`;
         if (saved) {
           const locked = disabled || !eligible(record);
+          const repairLocked = disabled || !repairEligible(record);
+          const selected = repairSelection(record);
           const findings = audit.report.findings.map((f) => {
             const edit = saved.findings.get(f.findingId); const snippet = record.snippet?.findingId === f.findingId ? record.snippet : null;
-            return `<article class="pr-audit-finding"><div class="pr-audit-actions"><label><input type="checkbox" data-audit-check="${f.findingId}" ${edit.selected ? 'checked' : ''} ${locked ? 'disabled' : ''}> 发布此项</label><strong class="pr-audit-priority">${escape(f.priority)}</strong></div>
+            const repairSelected = saved.repair.selected.has(f.findingId);
+            return `<article class="pr-audit-finding${record.highlighted?.has(f.findingId) ? ' is-highlighted' : ''}" data-audit-finding="${f.findingId}"><div class="pr-audit-actions"><label><input type="checkbox" data-audit-check="${f.findingId}" ${edit.selected ? 'checked' : ''} ${locked ? 'disabled' : ''}> 发布此项</label><label><input type="checkbox" data-audit-repair-check="${f.findingId}" ${repairSelected ? 'checked' : ''} ${repairLocked || (!repairSelected && selected.length >= MAX_REPAIR_FINDINGS) ? 'disabled' : ''}> 修复此项</label><strong class="pr-audit-priority">${escape(f.priority)}</strong></div>
               <label class="pr-audit-field">标题<input type="text" maxlength="200" data-audit-title="${f.findingId}" value="${escape(edit.title)}" ${locked ? 'disabled' : ''}></label>
               <button type="button" class="pr-audit-location" data-audit-context="${f.findingId}" ${disabled ? 'disabled' : ''}>${escape(location(f))} · 查看代码</button>
               ${snippet ? `<div class="pr-audit-source">固定提交 ${escape(snippet.sha?.slice(0, 8))}</div><pre class="pr-audit-code">${escape(snippet.content)}</pre>` : ''}
@@ -186,11 +284,28 @@
           report += `<label class="pr-audit-field">审查汇总<textarea rows="4" maxlength="5000" data-audit-field="summary" ${locked ? 'disabled' : ''}>${escape(saved.summary)}</textarea></label>
             <div class="pr-audit-findings" data-audit-findings>${findings || '<div class="pr-audit-notice">本次审查未发现可确认的问题。</div>'}</div>
             <div class="muted">按固定提交静态阅读，未运行测试。发布项默认不勾选，也可仅发布汇总。</div>
-            ${audit.stale || (record.headSha && source?.headSha !== record.headSha) ? '<div class="pr-audit-notice">PR 已有变化，请重新审查后发布。</div>' : ''}
+            ${audit.stale || (record.headSha && source?.headSha !== record.headSha) ? '<div class="pr-audit-notice">PR 已有变化，请重新审查后发布或修复。</div>' : ''}
             ${['uncertain', 'publishing'].includes(audit.publication?.status) || record.uncertain.has(audit.auditRef) ? `<div class="pr-audit-notice">发布结果尚未确认，此报告不会重发。</div>${button('reconcile', '只读核对发布结果', audit.publication?.status !== 'publishing')}` : ''}
             ${eligible(record) ? `<div class="pr-audit-actions">${button('prepare', '预览发布内容', !!saved.summary.trim(), true)}</div>` : ''}
-            ${audit.publication?.status === 'published' ? `<div class="pr-audit-notice">已发布 COMMENT Review #${Number(audit.publication.reviewId)}。后续回复与修复请使用下方审查线程。</div>` : ''}
+            ${audit.publication?.status === 'published' ? `<div class="pr-audit-notice">已发布 COMMENT Review #${Number(audit.publication.reviewId)}。可继续修复原始发现；讨论回复在下方审查线程中处理。</div>` : ''}
             <div data-audit-preview>${record.preview ? `<div class="pr-audit-preview"><strong>发布预览 · ${Number(record.preview.commentCount)} 条行内意见</strong><pre>${escape(record.preview.preview)}</pre>${button('publish', '确认并发布 COMMENT Review', true, true)}</div>` : ''}</div>`;
+          if (audit.report.findings.length) {
+            const selectedProfile = saved.repair.profileId;
+            const unavailable = selectedProfile && !record.profiles.some((p) => p.id === selectedProfile)
+              ? `<option value="${escape(selectedProfile)}" selected>已选档案暂不可用</option>` : '';
+            const profiles = unavailable + record.profiles.map((p) => `<option value="${escape(p.id)}"${selectedProfile === p.id ? ' selected' : ''}>${escape(p.name)}</option>`).join('');
+            report += `<section class="pr-audit-repair" aria-label="修复 AI 审查发现"><strong>修复已选发现 · ${selected.length}/${MAX_REPAIR_FINDINGS}</strong>
+              <p class="muted">每次选择 1–5 项原始发现，生成一份隔离修复。可先生成修复，再决定是否发布审查意见。</p>
+              <label class="pr-audit-field">补充说明（可选，最多 2000 字）<textarea rows="2" maxlength="2000" data-audit-repair-field="note" ${repairLocked ? 'disabled' : ''}>${escape(saved.repair.note)}</textarea></label>
+              <label class="pr-audit-field">本地复验档案（可选）<select data-audit-repair-field="profileId" ${repairLocked ? 'disabled' : ''}><option value="">不选择</option>${profiles}</select></label>
+              <div class="pr-audit-actions">${button('previewRepair', '预览修复内容', !repairLocked && selected.length > 0 && selected.length <= MAX_REPAIR_FINDINGS, true)}</div>
+              <div data-audit-repair-preview>${repairPreviewCurrent(record) ? `<div class="pr-audit-preview"><strong>修复预览 · ${selected.length} 项原始发现</strong>
+                <div class="pr-audit-source">来源 PR #${record.prNumber} · 提交 ${escape(source.headSha)}</div>
+                <div class="pr-audit-repair-originals">${selected.map((f) => `<article><strong>[${escape(f.priority)}] ${escape(f.title)}</strong><div class="pr-audit-source">${escape(location(f))}</div><pre>${escape(f.body)}</pre></article>`).join('')}</div>
+                <p class="muted">使用保存的原始发现和补充说明。生成后请审阅 diff；本地复验手动运行，更新 PR 另行确认。</p>
+                ${button('repair', record.busy === 'repair' ? '准备修复…' : '生成隔离修复', !repairLocked, true)}</div>` : ''}</div>
+              ${record.repairRef ? button('repairProgress', '查看修复进度') : ''}</section>`;
+          }
         }
       }
       element.innerHTML = `<section class="pr-detail-section pr-audit-panel" aria-label="AI 代码审查"><div class="pr-audit-actions"><h2>AI 代码审查</h2>${button('refresh', record.loading ? '读取中…' : '刷新历史')}</div>
@@ -201,19 +316,36 @@
         ${memoryNotice(record.persistence)}${record.error ? `<div class="pr-audit-error" role="alert">${escape(record.error)}</div>` : ''}${record.notice ? `<div class="pr-audit-notice" role="status">${escape(record.notice)}</div>` : ''}
         <div class="pr-audit-history">${history || '<div class="muted">暂无审查历史</div>'}</div>${record.reading ? '<div class="muted">正在读取报告…</div>' : report}</section>`;
       mount.renderedRef = audit?.auditRef;
-      element.querySelectorAll('[data-audit-action]').forEach((node) => node.addEventListener('click', () => node.dataset.auditAction === 'refresh' ? refresh() : operate(node.dataset.auditAction)));
+      element.querySelectorAll('[data-audit-action]').forEach((node) => node.addEventListener('click', () => {
+        const action = node.dataset.auditAction;
+        if (action === 'refresh') return refresh();
+        if (action === 'repairProgress') return options.openRepair?.({ projectId: record.projectId, repairRef: record.repairRef });
+        return operate(action);
+      }));
       element.querySelectorAll('[data-audit-select]').forEach((node) => node.addEventListener('click', () => select(node.dataset.auditSelect)));
       element.querySelectorAll('[data-audit-context]').forEach((node) => node.addEventListener('click', () => context(node.dataset.auditContext)));
-      const edited = () => {
-        capture(); record.preview = null;
+      const edited = (event) => {
+        capture(); if (event.target.dataset.auditField === 'note') return;
+        record.preview = null;
         const preview = element.querySelector('[data-audit-preview]'); if (preview) preview.innerHTML = '';
         const prepare = element.querySelector('[data-audit-action="prepare"]'); if (prepare) prepare.disabled = !eligible(record) || !draft(record)?.summary.trim();
       };
       for (const selector of ['[data-audit-field]', '[data-audit-title]', '[data-audit-body]', '[data-audit-check]']) {
         element.querySelectorAll(selector).forEach((node) => node.addEventListener(selector === '[data-audit-check]' ? 'change' : 'input', edited));
       }
+      const repairEdited = () => {
+        capture(); if (!saved) return;
+        saved.repair.preview = null;
+        const preview = element.querySelector('[data-audit-repair-preview]'); if (preview) preview.innerHTML = '';
+      };
+      element.querySelectorAll('[data-audit-repair-check]').forEach((node) => node.addEventListener('change', () => {
+        repairEdited();
+        if (saved.repair.selected.size > MAX_REPAIR_FINDINGS) { node.checked = false; capture(); record.error = reason('PR_AUDIT_REPAIR_INVALID'); }
+        render();
+      }));
+      element.querySelectorAll('[data-audit-repair-field]').forEach((node) => node.addEventListener(node.dataset.auditRepairField === 'profileId' ? 'change' : 'input', repairEdited));
       const list = element.querySelector('[data-audit-findings]'); if (list) list.scrollTop = scroll;
-      if (focusAttr) { const input = element.querySelector(`[${focusAttr}="${focusId}"]`); input?.focus(); if (typeof start === 'number') input?.setSelectionRange?.(start, end); }
+      if (focus) { const input = element.querySelector(`[${focus.attr}="${focus.id}"]`); input?.focus(); if (typeof focus.start === 'number') input?.setSelectionRange?.(focus.start, focus.end); }
     }
     async function refreshCenter(value = center) {
       if (!centerCurrent(value)) return false;
@@ -260,7 +392,8 @@
       }
       const changed = mount?.record !== record || !mount?.element?.isConnected;
       if (mount?.record !== record) invalidate(mount?.record);
-      Object.assign(record, { state: data.state, headSha: data.headSha }); mount = { element, record }; render();
+      if (record.headSha && record.headSha !== data.headSha) for (const saved of record.drafts.values()) saved.repair.preview = null;
+      Object.assign(record, { state: data.state, headSha: data.headSha, profiles: Array.isArray(data.profiles) ? data.profiles.filter((p) => p?.enabled !== false) : [] }); mount = { element, record }; render();
       return changed || !record.projectKey ? refresh(record) : Promise.resolve(true);
     }
     function mountCenter(element, projectId) {
@@ -270,7 +403,7 @@
     }
     const offEvent = api.onPrAuditEvent?.(onEvent);
     function close() { unmount(); if (center) clearTimeout(center.timer); closed = true; offEvent?.(); records.clear(); center = null; }
-    return { mountPr, mountCenter, capture, unmount, forgetProject, refresh, select, operate, context, onEvent, close };
+    return { mountPr, mountCenter, capture, unmount, forgetProject, refresh, select, operate, context, focusFindings, onEvent, close };
   }
   return { create, reason, status };
 }));

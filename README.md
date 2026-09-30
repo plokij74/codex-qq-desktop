@@ -16,6 +16,7 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - **Phase D.15 CI 跟踪**：手动跟踪 PR 当前提交的 GitHub Actions，后台运行、应用内未读提醒、可选 Windows 通知
 - **Phase D.16 PR 审查反馈**：PR 详情按线程查看讨论、生成隔离修复、回复与解决，支持只读核对与更新 PR
 - **Phase D.17 主动 AI PR 审查**：PR 详情手动发起只读 AI 代码审查，分析 diff 与快照代码；编辑勾选后一次确认发布 COMMENT Review，无缝衔接 D16 反馈闭环
+- **Phase D.18 AI 审查直接修复**：从同一报告选择 1–5 项原始发现，预览后生成隔离修复，手动复验并单独确认更新原 PR
 
 ## 开发
 
@@ -897,3 +898,16 @@ D12 把 D11 profile 组合成受控 DAG 工作流。用户可以显式运行 `ty
 - **D16 无缝衔接**：发布成功后自动通知 PR 审查面板（Phase D.16），立即将其渲染为可继续讨论、回复、解决和隔离修复的 GitHub Review 线程。
 
 设计与验收状态见 [D17 设计](docs/superpowers/specs/2026-09-29-phase-d17-ai-pr-review-design.md) 和 [实施记录](docs/superpowers/plans/2026-09-29-phase-d17-ai-pr-review.md)。离线桌面冒烟：`node scripts/smoke-pr-audit.cjs`，覆盖真实 Electron 进程中的启动审查、查看代码上下文、草稿编辑、冻结预览、审批发布、工程中心历史与 PR 回溯。真实 GitHub.com / Enterprise 远端写入尚待指定测试仓库验收。
+
+## Phase D.18：AI PR 审查发现直接修复
+
+在 D17 报告中勾选「修复此项」，一次选择 1–5 项原始发现，点击「预览修复内容」后生成一份隔离修复。无需先发布 Review，修复选择与发布草稿独立保存。
+
+- 修复使用保存的原始发现，可补充最多 2000 字说明。支持 RIGHT、LEFT、删除和重命名位置；完整发现、代码及说明超过 32 KiB 时整批拒绝，可减少选择后重试。
+- 仅支持已完成、未过期的报告和 origin 同仓库的 OPEN PR（含 Draft）。PR 提交、分支、比较起点或描述改变后需重新审查；Review 发布状态不影响修复。
+- 复用 D13 六轮生成和 D5 隔离 worktree，主工作区须清洁。工程中心查看进度、取消、重试和结果；可选复验档案需手动运行，结果仅供参考。
+- 审阅 diff 后单独确认「更新此 PR」，`full-auto` 也需一次性远端批准。结果只更新原 PR；不确定推送和重启恢复只读核对，不会重复推送。
+- 历史和结果卡可返回原报告定位发现。PR 更新后可点击「重新 AI 审查」或「跟踪 CI」；这些操作均由用户发起，不自动发布 Review、回复或解决线程。
+- 修复来源仅加密保存不可变元数据，并保护所引用的报告。发布草稿、修复说明和代码上下文不写入聊天或本地会话存储；worktree marker 与 repair store 的 v4 格式兼容读取 v1–v3。
+
+设计与实施记录见 [D18 spec](docs/superpowers/specs/2026-09-30-phase-d18-pr-audit-repair-design.md) 和 [D18 plan](docs/superpowers/plans/2026-09-30-phase-d18-pr-audit-repair.md)。离线桌面冒烟：`node scripts/smoke-pr-audit-repair.cjs`，使用临时 Git 仓库、配置和模拟 GitHub/model，覆盖 1100×720 与 900×580。真实 GitHub.com / Enterprise 远端写入需在指定测试仓库独立验收。

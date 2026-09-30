@@ -11,6 +11,7 @@ const { createPrReviewStore } = require('./pr-review-store');
 const ReviewState = require('./pr-review-state');
 const { createPrAuditManager } = require('./pr-audit-manager');
 const AuditState = require('./pr-audit-state');
+const { createPrAuditRepairManager } = require('./pr-audit-repair-manager');
 const { createRemoteCiStore } = require('./remote-ci-store');
 const { createGithubCli } = require('./github-cli');
 const { createCiWatchManager } = require('./ci-watch-manager');
@@ -57,6 +58,9 @@ function createEngineeringIpcHandlers(options = {}) {
   let remoteCi = null;
   let prReviews = null;
   let prAudits = null;
+  let prAuditRepairs = null;
+  const auditRepairScanned = new Set();
+  const auditRepairProtected = new Set();
   const reviewProtected = new Set();
   let ciWatches = null;
   const remoteProtected = new Set();
@@ -111,9 +115,31 @@ function createEngineeringIpcHandlers(options = {}) {
     if (!prAudits) prAudits = options.prAuditManager || createPrAuditManager({
       githubCli: options.githubCli, userDataPath: options.userDataPath, safeStorage: options.safeStorage,
       getSettings: options.getSettings, mutationLock: options.withMutation,
+      isProtected: (ref) => !prAuditRepairs || prAuditRepairs.protectsReport(ref),
       onEvent: (event) => options.onPrAuditEvent?.(event, [...(projectOwners.get(event.projectKey) || [])]),
     });
     return prAudits;
+  }
+
+  function getPrAuditRepairs() {
+    if (!prAuditRepairs) prAuditRepairs = options.prAuditRepairManager || createPrAuditRepairManager({
+      auditManager: getPrAudits(), githubCli: options.githubCli, worktreeManager: options.worktreeManager,
+      userDataPath: options.userDataPath, safeStorage: options.safeStorage, mutationLock: options.withMutation,
+      isProtected: (ref, row) => !auditRepairScanned.has(row.projectKey) || auditRepairProtected.has(ref)
+        || !!repairs?.store.list(row.projectKey).some((r) => r.source.kind === 'pr_audit' && r.source.auditRepairRef === ref),
+    });
+    return prAuditRepairs;
+  }
+
+  async function refreshAuditRepairProtection(root) {
+    const manager = getPrAuditRepairs(); const key = projectKey(root);
+    getRepairs(); // Load retained repair history before any report/source can be evicted.
+    let listed;
+    try { listed = await options.worktreeManager?.list?.({ projectPath: root }); } catch {}
+    if (!listed?.ok) { auditRepairScanned.delete(key); return; }
+    for (const row of manager.store.list(key)) auditRepairProtected.delete(row.auditRepairRef);
+    for (const row of listed.results || []) if (row.auditRepairRef && !['pr_updated', 'pr_created', 'discarded_cleanup_pending', 'applied_cleanup_pending'].includes(row.state)) auditRepairProtected.add(row.auditRepairRef);
+    auditRepairScanned.add(key);
   }
 
   async function auditRequest(event, payload, fields, fn, mutation = false) {
@@ -343,9 +369,10 @@ function createEngineeringIpcHandlers(options = {}) {
         worktreeManager: options.worktreeManager,
         remoteCiManager: getRemoteCi(),
         prReviewManager: getPrReviews(),
+        prAuditRepairManager: getPrAuditRepairs(),
         subagentRuntime: options.subagentRuntime,
         runLoop: options.runLoop,
-        getProfiles: options.getProfiles,
+        getProfiles: (projectPath) => syncProfiles(projectPath).listProfiles(projectPath, { includeDisabled: true, includeCommand: true }),
         getSettings: options.getSettings,
         workspaceFingerprint: options.workspaceFingerprint,
         onEvent: (event) => {
@@ -417,7 +444,10 @@ function createEngineeringIpcHandlers(options = {}) {
   }
 
   return {
-    prAuditStart: (event, payload) => auditRequest(event, payload, ['prNumber', 'note'], (m, b, c) => m.start(b.projectPath, payload.prNumber, payload.note, c)),
+    prAuditStart: (event, payload) => auditRequest(event, payload, ['prNumber', 'note'], async (m, b, c) => {
+      await refreshAuditRepairProtection(b.projectPath);
+      return m.start(b.projectPath, payload.prNumber, payload.note, c);
+    }),
     prAuditList: (event, payload) => auditRequest(event, payload, ['prNumber'], (m, b) => m.list(b.projectPath, payload.prNumber)),
     prAuditGet: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b) => m.get(b.projectPath, payload.auditRef)),
     prAuditCancel: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b) => m.cancel(b.projectPath, payload.auditRef)),
@@ -425,6 +455,12 @@ function createEngineeringIpcHandlers(options = {}) {
     prAuditPrepare: (event, payload) => auditRequest(event, payload, ['auditRef', 'revision', 'summary', 'selections'], (m, b, c) => m.prepare(b.projectPath, payload, c)),
     prAuditPublish: (event, payload) => auditRequest(event, payload, ['draftRef'], (m, b, c) => m.publish(b.projectPath, payload.draftRef, c), true),
     prAuditReconcile: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b, c) => m.reconcile(b.projectPath, payload.auditRef, c)),
+    prAuditRepairSnapshot: (event, payload) => auditRequest(event, payload, ['auditRef', 'repairRevision', 'findingIds'], async (_m, b, c) => {
+      await refreshAuditRepairProtection(b.projectPath);
+      return getPrAuditRepairs().snapshot(b.projectPath, { auditRef: payload.auditRef, repairRevision: payload.repairRevision, findingIds: payload.findingIds }, c);
+    }),
+    prAuditRepairSource: (event, payload) => auditRequest(event, payload, ['auditRepairRef'], (_m, b, c) => getPrAuditRepairs().source(b.projectPath, payload.auditRepairRef, c)),
+    prAuditUpdatePr: (event, payload) => auditRequest(event, payload, ['resultId', 'subject'], (_m, b, c) => getPrAuditRepairs().updatePr(b.projectPath, payload.resultId, payload.subject, c), true),
     ciWatchStart: (event, payload) => ciWatchRequest(event, payload, ['prNumber', 'durationMinutes'], (m, root) => m.start(root, payload.prNumber, payload.durationMinutes)),
     ciWatchList: (event, payload) => ciWatchRequest(event, payload, [], (m, root) => m.list(root)),
     ciWatchGet: (event, payload) => ciWatchRequest(event, payload, ['watchRef'], (m, root) => m.get(root, payload.watchRef)),
@@ -526,7 +562,7 @@ function createEngineeringIpcHandlers(options = {}) {
     },
     repairGetForAgent: (projectPath, repairRef) => getRepairs().get(projectPath, repairRef),
     repairResultForAgent: (projectPath, repairRef) => getRepairs().result(projectPath, repairRef),
-    repairStartForAgent: (projectPath, payload, context = {}) => payload?.source?.kind === 'pr_review'
+    repairStartForAgent: (projectPath, payload, context = {}) => ['pr_review', 'pr_audit'].includes(payload?.source?.kind)
       ? error('REPAIR_SOURCE_INVALID', '审查修复仅由 PR 页面发起') : getRepairs().start(projectPath, payload, context),
     repairCancelForAgent: (projectPath, repairRef, context = {}) => getRepairs().cancel(projectPath, repairRef, context),
 
@@ -702,6 +738,9 @@ function createEngineeringIpcHandlers(options = {}) {
       return getRepairs().result(binding.projectPath, String(payload.repairRef));
     }),
     repairStart: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (payload.source?.kind === 'pr_audit') return auditRequest(event, payload,
+        ['source', 'note', 'validationProfileId', 'sessionId'], (_m, b, c) => getRepairs().start(b.projectPath,
+          { source: payload.source, note: payload.note, validationProfileId: payload.validationProfileId }, c), true);
       if (payload.source?.kind === 'pr_review') return reviewRequest(event, payload,
         ['source', 'note', 'validationProfileId', 'sessionId'], (_m, b, c) => getRepairs().start(b.projectPath,
           { source: payload.source, note: payload.note, validationProfileId: payload.validationProfileId }, c), true);
@@ -714,6 +753,8 @@ function createEngineeringIpcHandlers(options = {}) {
       finally { unregisterGate(context.owner, context.gate); }
     }),
     repairRetry: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      if (getRepairs().store.get(payload.repairRef, projectKey(binding.projectPath))?.source.kind === 'pr_audit') return auditRequest(event, payload,
+        ['repairRef', 'note', 'sessionId'], (_m, b, c) => getRepairs().retry(b.projectPath, payload.repairRef, { note: payload.note }, c), true);
       if (getRepairs().store.get(payload.repairRef, projectKey(binding.projectPath))?.source.kind === 'pr_review') return reviewRequest(event, payload,
         ['repairRef', 'note', 'sessionId'], (_m, b, c) => getRepairs().retry(b.projectPath, payload.repairRef, { note: payload.note }, c), true);
       if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
@@ -727,7 +768,10 @@ function createEngineeringIpcHandlers(options = {}) {
       return getRepairs().cancel(binding.projectPath, String(payload.repairRef), { ownerId: ownerId(event) });
     }),
     repairValidate: (event, payload = {}) => withBinding(event, payload, async (binding) => {
+      syncProfiles(binding.projectPath);
       if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
+      if (getRepairs().store.get(payload.repairRef, projectKey(binding.projectPath))?.source.kind === 'pr_audit') return auditRequest(event, payload,
+        ['repairRef', 'sessionId'], (_m, b, c) => getRepairs().validate(b.projectPath, payload.repairRef, c), true);
       const settings = options.getSettings ? options.getSettings() : {};
       const context = permissionContext(event, payload, settings);
       try { return await getRepairs().validate(binding.projectPath, String(payload.repairRef || ''), context.options); }
@@ -792,6 +836,7 @@ function createEngineeringIpcHandlers(options = {}) {
         workflows: workflowState,
         repairs: repairState,
         prAudits: auditState,
+        prAuditRepairs: getPrAuditRepairs().persistenceStatus(),
       };
     },
     close: () => {
@@ -799,6 +844,7 @@ function createEngineeringIpcHandlers(options = {}) {
       for (const active of remoteOwners.values()) for (const abort of active) abort.abort();
       remoteCi?.store?.close();
       prReviews?.close();
+      prAuditRepairs?.close();
       prAudits?.close();
       for (const index of indexes.values()) index.close();
       workflows?.close();
@@ -814,6 +860,7 @@ function createEngineeringIpcHandlers(options = {}) {
     get verification() { return verification; },
     get workflowManager() { return workflows; },
     get repairManager() { return repairs; },
+    get prAuditRepairManager() { return prAuditRepairs; },
   };
 }
 

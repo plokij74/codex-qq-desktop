@@ -10,7 +10,8 @@ const ACTIVE = new Set(['preparing', 'running']);
 const STATES = new Set([...ACTIVE, 'completed', 'failed', 'cancelled', 'interrupted']);
 const CODES = new Set(['INVALID', 'BINDING', 'UNAVAILABLE', 'UNSUPPORTED', 'NOT_FOUND', 'NOT_OPEN', 'FORK', 'CHANGED',
   'INCOMPLETE', 'LIMIT', 'CONTEXT_LIMIT', 'LOCATION', 'MODEL_REQUIRED', 'REPORT_INVALID', 'TURNS', 'TIMEOUT',
-  'CANCELLED', 'BUSY', 'CONFIRM_REQUIRED', 'PUBLISHED', 'UNCERTAIN', 'PUBLISH_FAILED', 'STORE_CORRUPT', 'STORE_MEMORY']);
+  'CANCELLED', 'BUSY', 'CONFIRM_REQUIRED', 'PUBLISHED', 'UNCERTAIN', 'PUBLISH_FAILED', 'STORE_CORRUPT', 'STORE_MEMORY',
+  'REPAIR_INVALID', 'REPAIR_LIMIT', 'REPAIR_NOT_FOUND', 'REPAIR_CHANGED', 'REPAIR_CONTEXT_LIMIT', 'REPAIR_STORE_CORRUPT', 'REPAIR_STORE_MEMORY']);
 const ref = (prefix = 'pra') => `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
 const isRef = (value, prefix = 'pra') => typeof value === 'string' && new RegExp(`^${prefix}_[a-f0-9]{24}$`).test(value);
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -117,6 +118,7 @@ function normalizeReport(raw, files) {
   } catch { throw fail('REPORT_INVALID'); }
 }
 function revision(row) { return hash([row.auditRef, row.source, row.status, row.stale, row.report, row.publication]); }
+function repairRevision(row) { return hash([row.auditRef, row.source, row.status, row.stale === true, row.report]); }
 function publicationHashes(payload) {
   return { bodyHash: hash(payload.body), comments: (payload.comments || []).map((c) => ({ path: c.path, side: c.side,
     line: c.line, startLine: c.start_line || c.line, bodyHash: hash(c.body) })) };
@@ -152,5 +154,5 @@ function normalizeRecord(row) {
   if (row.status === 'completed' && (!row.source || !row.report || !row.coverage)) throw fail();
   return structuredClone(row);
 }
-module.exports = { LIMITS, ACTIVE, STATES, ref, isRef, hash, digest, number, remoteId, fail, error, assertCurrent, text, keys,
-  scopePath, normalizePr, sourceKey, parsePatch, validLocation, normalizeReport, revision, publicationHashes, normalizeRecord };
+module.exports = { LIMITS, ACTIVE, STATES, CODES, ref, isRef, hash, digest, number, remoteId, fail, error, assertCurrent, text, keys,
+  scopePath, normalizePr, sourceKey, parsePatch, validLocation, normalizeReport, revision, repairRevision, publicationHashes, normalizeRecord };

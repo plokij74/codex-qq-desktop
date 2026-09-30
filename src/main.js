@@ -1369,6 +1369,9 @@ ipcMain.handle('engineering:pr-audit:context', (event, payload = {}) => getEngin
 ipcMain.handle('engineering:pr-audit:prepare', (event, payload = {}) => getEngineeringIpc().prAuditPrepare(event, payload));
 ipcMain.handle('engineering:pr-audit:publish', (event, payload = {}) => getEngineeringIpc().prAuditPublish(event, payload));
 ipcMain.handle('engineering:pr-audit:reconcile', (event, payload = {}) => getEngineeringIpc().prAuditReconcile(event, payload));
+ipcMain.handle('engineering:pr-audit:repair-snapshot', (event, payload = {}) => getEngineeringIpc().prAuditRepairSnapshot(event, payload));
+ipcMain.handle('engineering:pr-audit:repair-source', (event, payload = {}) => getEngineeringIpc().prAuditRepairSource(event, payload));
+ipcMain.handle('engineering:pr-audit:update-pr', (event, payload = {}) => getEngineeringIpc().prAuditUpdatePr(event, payload));
 ipcMain.handle('engineering:remote-ci:failures', (event, payload = {}) => getEngineeringIpc().remoteCiFailures(event, payload));
 ipcMain.handle('engineering:remote-ci:snapshot', (event, payload = {}) => getEngineeringIpc().remoteCiSnapshot(event, payload));
 ipcMain.handle('engineering:remote-ci:list', (event, payload = {}) => getEngineeringIpc().remoteCiList(event, payload));

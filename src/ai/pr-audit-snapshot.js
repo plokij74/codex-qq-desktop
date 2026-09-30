@@ -3,10 +3,11 @@ const S = require('./pr-audit-state');
 const { devNull } = require('node:os');
 
 class AuditSnapshot {
-  constructor({ github, repo, source, auditRef, files, signal }) {
+  constructor({ github, repo, source, auditRef, files, signal, refNamespace = 'pr-audit' }) {
     this.github = github; this.repo = repo; this.source = source; this.auditRef = auditRef;
     this.rawFiles = files; this.signal = signal; this.files = []; this.trees = new Map(); this.blobs = new Map();
     this.refs = []; this.contextBytes = 0;
+    this.refNamespace = refNamespace;
   }
   async git(args, options = {}) {
     S.assertCurrent({ signal: options.cleanup ? undefined : this.signal });
@@ -45,9 +46,10 @@ class AuditSnapshot {
     this.blobs.set(entry.oid, body); return body;
   }
   async init() {
-    if (!S.isRef(this.auditRef) || !Array.isArray(this.rawFiles) || this.rawFiles.length !== this.source.changedFiles) throw S.fail('INCOMPLETE');
+    if (!S.isRef(this.auditRef) || !['pr-audit', 'pr-audit-repair'].includes(this.refNamespace)
+      || !Array.isArray(this.rawFiles) || this.rawFiles.length !== this.source.changedFiles) throw S.fail('INCOMPLETE');
     try {
-      const refs = ['base', 'head'].map((name) => `refs/codex/pr-audit/${this.auditRef}/${name}`);
+      const refs = ['base', 'head'].map((name) => `refs/codex/${this.refNamespace}/${this.auditRef}/${name}`);
       this.refs.push(...refs);
       await this.git(['-c', 'gc.auto=0', '-c', 'fetch.writeCommitGraph=false', 'fetch', '--no-auto-maintenance', '--no-recurse-submodules', '--refmap=', '--no-tags', '--no-write-fetch-head', 'origin',
         `refs/heads/${this.source.baseRefName}:${refs[0]}`, `refs/heads/${this.source.headRefName}:${refs[1]}`], { timeoutMs: 60000 });
@@ -152,12 +154,15 @@ function verifyPatch(patch, before, after) {
   if (left.length - l !== right.length - r) throw S.fail('INCOMPLETE');
   while (l < left.length) if (!same(left[l++], right[r++])) throw S.fail('INCOMPLETE');
 }
-async function cleanupAuditRefs(github, repoRoot, activeRefs = new Set()) {
-  const out = await github.runCommand('git', ['-C', repoRoot, 'for-each-ref', '--format=%(refname)', 'refs/codex/pr-audit/'], { rawOutput: true });
+async function cleanupAuditRefs(github, repoRoot, activeRefs = new Set(), refNamespace = 'pr-audit') {
+  if (!['pr-audit', 'pr-audit-repair'].includes(refNamespace)) throw S.fail();
+  const out = await github.runCommand('git', ['-C', repoRoot, 'for-each-ref', '--format=%(refname)', `refs/codex/${refNamespace}/`], { rawOutput: true });
   if (!out?.ok) return;
+  const pattern = refNamespace === 'pr-audit' ? /^refs\/codex\/pr-audit\/(pra_[a-f0-9]{24})\/(?:base|head)$/
+    : /^refs\/codex\/pr-audit-repair\/(?:(pra_[a-f0-9]{24})\/(?:base|head)|(par_[a-f0-9]{24}))$/;
   for (const name of out.stdout.split(/\r?\n/)) {
-    const match = name.match(/^refs\/codex\/pr-audit\/(pra_[a-f0-9]{24})\/(base|head)$/);
-    if (!match || activeRefs.has(match[1])) continue;
+    const match = name.match(pattern);
+    if (!match || activeRefs.has(match[1] || match[2])) continue;
     await github.runCommand('git', ['-c', `core.hooksPath=${devNull}`, '-C', repoRoot, 'update-ref', '-d', name]);
   }
 }
