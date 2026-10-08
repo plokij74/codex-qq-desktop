@@ -41,9 +41,11 @@ const FRIENDS = [
 let sessions = [];
 let projects = [];
 const worktreeBindings = new Map();
+const worktreeBindingRequests = new Map();
 let ciWatchUi = null;
 let prReviewUi = null;
 let prAuditUi = null;
+let prAuditRecheckUi = null;
 const pullRequestDrafts = new Map();
 let pullRequestForm = null;
 const worktreePreviews = new Map();
@@ -668,15 +670,24 @@ function replaceProjectWorktreeResults(projectId, rawResults) {
 }
 
 async function bindWorktreeProject(project, force = false) {
+  const pending = worktreeBindingRequests.get(project.id);
+  if (pending?.path === project.path) return pending.promise;
   if (force) worktreeBindings.delete(project.id);
   let token = worktreeBindings.get(project.id);
   if (token) { ciWatchUi?.bindProject(project, token); return token; }
-  const bound = await window.codex.bindWorktreeProject({ projectId: project.id, projectPath: project.path });
-  if (!bound?.ok || !bound.projectBindingId) return '';
-  token = bound.projectBindingId;
-  worktreeBindings.set(project.id, token);
-  ciWatchUi?.bindProject(project, token);
-  return token;
+  const request = { path: project.path };
+  request.promise = (async () => {
+    const bound = await window.codex.bindWorktreeProject({ projectId: project.id, projectPath: request.path });
+    if (!bound?.ok || !bound.projectBindingId) return '';
+    if (getProject(project.id)?.path !== request.path) return '';
+    token = bound.projectBindingId;
+    worktreeBindings.set(project.id, token);
+    ciWatchUi?.bindProject(project, token);
+    return token;
+  })();
+  worktreeBindingRequests.set(project.id, request);
+  try { return await request.promise; }
+  finally { if (worktreeBindingRequests.get(project.id) === request) worktreeBindingRequests.delete(project.id); }
 }
 
 function workflowGateSelectionKey(project, action, scope) {
@@ -1367,6 +1378,10 @@ async function worktreeAction(session, ref, action) {
     await openPrReviewSource(project.id, ref.reviewRef);
     return;
   }
+  if (action === 'recheck') {
+    await openPrAuditRecheck(project.id, ref.auditRepairRef, ref.id);
+    return;
+  }
   if (action === 'auditFindings' || action === 'reaudit') {
     await openPrAuditRepairSource(project.id, ref.auditRepairRef, { reaudit: action === 'reaudit' });
     return;
@@ -1551,6 +1566,7 @@ function renderWorktreeCards(root, session) {
     if (ref.originKind === 'pr_audit' && ref.auditRepairRef) {
       addButton('查看原 AI 审查发现', 'auditFindings');
       if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state)) addButton('重新 AI 审查', 'reaudit');
+      if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state)) addButton('复审本次修复', 'recheck');
     }
     if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state) && ref.prUpdate?.prNumber) addButton('跟踪 CI（30 分钟）', 'watchCi');
     if (ref.canPreview) addButton('查看 diff', 'preview', true);
@@ -2236,6 +2252,7 @@ async function showEngineeringRepair(token, repairRef) {
     `<div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · 来源 ${escapeHtml(engineeringRepairSourceText(repair.source))} · ${escapeHtml(repair.profileId || '')}</div>`,
     repair.source?.kind === 'pr_review' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-review">查看原审查线程</button>' : '',
     repair.source?.kind === 'pr_audit' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-audit">查看原 AI 审查发现</button>' : '',
+    repair.source?.kind === 'pr_audit' && repair.resultId ? '<span id="engineering-repair-recheck"></span>' : '',
     repair.resultId ? `<div class="work-card-meta">D5 隔离结果：<code>${escapeHtml(repair.resultId)}</code></div><div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-repair-open-result">查看 D5 结果卡</button></div>` : '',
     repair.incomplete ? '<div class="work-card-notice">这是未完整结束的隔离结果，仍需用户审阅。</div>' : '',
     repair.errorCode ? `<div class="work-card-error">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : '',
@@ -2262,6 +2279,14 @@ async function showEngineeringRepair(token, repairRef) {
       }, 0);
     });
     await reconciled;
+    if (repair.source?.kind === 'pr_audit' && repair.resultId && isCurrent()) {
+      const saved = await window.codex.getWorktreeResult({ projectBindingId: token, resultId: repair.resultId }).catch(() => null);
+      if (isCurrent() && ['pr_updated', 'pr_update_cleanup_pending'].includes(saved?.result?.state)) {
+        const entry = document.getElementById('engineering-repair-recheck');
+        if (entry) { entry.innerHTML = '<button type="button" class="ghost-btn">复审本次修复</button>';
+          entry.querySelector('button')?.addEventListener('click', () => openPrAuditRecheck(project.id, repair.source.auditRepairRef, repair.resultId)); }
+      }
+    }
   }
 }
 
@@ -2483,6 +2508,8 @@ async function renderEngineeringCenter() {
   const refresh = () => refreshEngineeringIndexStatus(token);
   body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div class="work-card-title">AI 代码审查</div><div id="engineering-pr-audits"></div></section>');
   prAuditUi?.mountCenter(document.getElementById('engineering-pr-audits'), sessionProject()?.id);
+  body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div id="engineering-pr-rechecks"></div></section>');
+  prAuditRecheckUi?.mount(document.getElementById('engineering-pr-rechecks'), { projectId: sessionProject()?.id });
   body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div class="work-card-title">CI 跟踪</div><div id="engineering-ci-watches"></div></section>');
   ciWatchUi?.mountCenter(document.getElementById('engineering-ci-watches'), sessionProject()?.id);
   document.getElementById('engineering-index-rebuild')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexRebuild({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引重建失败'); await refresh(); });
@@ -2917,6 +2944,7 @@ async function deleteProject(id) {
   ciWatchUi?.forgetProject(id);
   prReviewUi?.forgetProject(id);
   prAuditUi?.forgetProject(id);
+  prAuditRecheckUi?.forgetProject(id);
   for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
   if (worktreeBindingId) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
@@ -2951,6 +2979,7 @@ async function bindProjectPath(id) {
   if (previous !== dir) {
     prReviewUi?.forgetProject(id);
     prAuditUi?.forgetProject(id);
+    prAuditRecheckUi?.forgetProject(id);
     for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
     pullRequestForm = null;
     resetPullRequestView(null);
@@ -3380,6 +3409,7 @@ function updateClock() {
 function setView(view) {
   capturePullRequestDraft();
   if (view !== 'prs') { pullRequestForm = null; prReviewUi?.unmount(); prAuditUi?.unmount(); }
+  prAuditRecheckUi?.unmount();
   currentView = view;
   document.querySelectorAll('#main-toolbar .tb-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
   document.querySelectorAll('#left-nav .nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
@@ -3561,6 +3591,7 @@ function renderPullRequestView() {
         <div id="pr-ci-watch"></div>
       </section>
       <div id="pr-audit-panel"></div>
+      <div id="pr-audit-recheck-panel"></div>
       <div id="pr-review-panel"></div>
       <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
       <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
@@ -3587,6 +3618,7 @@ function renderPullRequestView() {
     </div>`;
   ciWatchUi?.mountPr(document.getElementById('pr-ci-watch'), { projectId: project.id, prNumber: pr?.number, state: pr?.state });
   prAuditUi?.mountPr(document.getElementById('pr-audit-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha, profiles: pullRequestView.remoteProfiles });
+  prAuditRecheckUi?.mount(document.getElementById('pr-audit-recheck-panel'), { projectId: project.id, prNumber: pr?.number });
   prReviewUi?.mountPr(document.getElementById('pr-review-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha, profiles: pullRequestView.remoteProfiles });
   if (pr) {
     const fields = { title: body.querySelector('.pr-edit-title'), body: body.querySelector('.pr-edit-body'), comment: body.querySelector('.pr-comment-input'), merge: body.querySelector('.pr-merge-method') };
@@ -3825,6 +3857,17 @@ async function openPrReviewSource(projectId, reviewRef) {
   document.getElementById('pr-review-panel')?.scrollIntoView({ block: 'start' });
 }
 
+async function openPrAuditRecheck(projectId, auditRepairRef, resultId) {
+  const token = worktreeBindings.get(projectId); const projectPath = getProject(projectId)?.path;
+  const opened = await openPrAuditRepairSource(projectId, auditRepairRef);
+  if (!opened || !projectPath || getProject(projectId)?.path !== projectPath || worktreeBindings.get(projectId) !== token || sessionProject()?.id !== projectId || currentView !== 'prs') return;
+  const prNumber = pullRequestView.detail?.number;
+  await prAuditRecheckUi?.refresh();
+  if (worktreeBindings.get(projectId) !== token || sessionProject()?.id !== projectId || currentView !== 'prs' || pullRequestView.detail?.number !== prNumber) return;
+  await prAuditRecheckUi?.start(resultId);
+  document.getElementById('pr-audit-recheck-panel')?.scrollIntoView({ block: 'start' });
+}
+
 async function openPrAuditRepairSource(projectId, auditRepairRef, { reaudit = false } = {}) {
   const project = getProject(projectId); const token = worktreeBindings.get(projectId); const projectPath = project?.path;
   const fromSession = activeSessionId; const fromView = currentView;
@@ -3849,6 +3892,7 @@ async function openPrAuditRepairSource(projectId, auditRepairRef, { reaudit = fa
     const selected = await prAuditUi?.select(source.auditRef);
     if (visible() && selected) prAuditUi?.focusFindings(source.findingIds);
   }
+  return visible();
 }
 
 async function openEngineeringRepair({ projectId, repairRef }) {
@@ -5714,8 +5758,12 @@ function boot() {
       return true;
     },
   });
+  prAuditRecheckUi = window.PrAuditRecheckUi?.create({ api: window.codex, document, getProject,
+    getToken: (id) => worktreeBindings.get(id), openSource: openPrAuditRepairSource,
+    isVisible: (id, prNumber) => sessionProject()?.id === id && (prNumber ? currentView === 'prs' && pullRequestView.detail?.number === prNumber : currentView === 'scheduled'),
+  });
   const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);
-  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
+  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); prAuditRecheckUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
   renderEmojiPanel();
   bindEvents();
   bindTerminalPanel();

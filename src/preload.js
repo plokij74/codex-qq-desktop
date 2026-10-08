@@ -208,6 +208,16 @@ contextBridge.exposeInMainWorld('codex', {
   resolvePrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:resolve', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision }),
   updatePrReviewPr: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:update-pr', { projectBindingId: payload?.projectBindingId, resultId: payload?.resultId, subject: payload?.subject }),
   startPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:start', { projectBindingId: payload?.projectBindingId, prNumber: payload?.prNumber, note: payload?.note }),
+  startPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:start', { projectBindingId: p?.projectBindingId, resultId: p?.resultId }),
+  listPrAuditRechecks: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:list', { projectBindingId: p?.projectBindingId, prNumber: p?.prNumber }),
+  getPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:get', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef }),
+  cancelPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:cancel', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef }),
+  getPrAuditRecheckContext: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:context', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef, evidenceId: p?.evidenceId }),
+  onPrAuditRecheckEvent: (cb) => {
+    const listener = (_event, data) => cb(data);
+    ipcRenderer.on('engineering:pr-audit:recheck:event', listener);
+    return () => ipcRenderer.removeListener('engineering:pr-audit:recheck:event', listener);
+  },
   listPrAudits: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:list', { projectBindingId: payload?.projectBindingId, prNumber: payload?.prNumber }),
   getPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:get', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef }),
   cancelPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:cancel', { projectBindingId: payload?.projectBindingId, auditRef: payload?.auditRef }),

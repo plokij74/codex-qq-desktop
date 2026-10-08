@@ -264,6 +264,7 @@ if (!process.versions.electron) {
       }
       handlers.set('chat:approve', (event, payload) => ({ ok: engineering.resolveApproval(event, payload.approvalId, payload.decision) }));
       handlers.set('engineering:remote-ci:failures', () => ({ ok: true, failures: [], unsupported: [] }));
+      handlers.set('engineering:pr-audit:recheck:list', (event, payload) => engineering.prAuditRecheckList(event, payload));
       for (const [channel, result] of [
         ['engineering:index:ensure', { ok: true, state: 'ready' }], ['engineering:index:status', { ok: true, state: 'ready' }],
         ['engineering:verification:profiles', { ok: true, profiles: [], candidates: [] }], ['engineering:verification:list', { ok: true, jobs: [] }],

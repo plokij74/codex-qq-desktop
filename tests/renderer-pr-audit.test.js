@@ -227,6 +227,23 @@ describe('D17 renderer PR audit UI', () => {
     assert.equal(recheckedInput.value, '自定义修改标题');
   });
 
+  it('keeps the current report and draft visible while refreshing the same report', async (t) => {
+    const f = fixture(t);
+    await f.ui.mountPr(f.panel, f.data);
+    const title = f.panel.querySelector(`[data-audit-title="${FINDING_ID}"]`);
+    title.value = '保留正在编辑的草稿'; title.dispatch('input');
+    let finish;
+    f.api.getPrAudit = () => new Promise((resolve) => { finish = resolve; });
+    const pending = f.ui.select(AUDIT_REF);
+    assert.match(f.panel.innerHTML, /正在读取报告/);
+    assert.equal(f.panel.querySelector(`[data-audit-title="${FINDING_ID}"]`).value, '保留正在编辑的草稿');
+    assert.equal(f.panel.querySelector('[data-audit-action="prepare"]').disabled, true);
+    finish({ ok: true, audit: structuredClone(f.detail) });
+    await pending;
+    assert.equal(f.panel.querySelector(`[data-audit-title="${FINDING_ID}"]`).value, '保留正在编辑的草稿');
+    assert.doesNotMatch(f.panel.innerHTML, /正在读取报告/);
+  });
+
   it('prepares and publishes review, firing onPublished callback', async (t) => {
     const f = fixture(t);
     await f.ui.mountPr(f.panel, f.data);

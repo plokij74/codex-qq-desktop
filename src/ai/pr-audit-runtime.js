@@ -20,14 +20,17 @@ function reportFromText(content) {
   const value = String(content || '').trim().replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```$/, '');
   try { return JSON.parse(value); } catch { return null; }
 }
-async function runAudit({ snapshot, settings, note = '', signal, onProgress, chatFn = chatCompletionMessage, fetchFn }) {
+async function runAudit({ snapshot, settings, note = '', signal, onProgress, chatFn = chatCompletionMessage, fetchFn, protocol }) {
   if (settings?.mode !== 'api' || settings.agentEnabled === false || !settings.apiKey || !settings.model) throw S.fail('MODEL_REQUIRED');
   S.text(note, 2000, true);
-  const input = { prNumber: snapshot.source.prNumber, headSha: snapshot.source.headSha, mergeBaseSha: snapshot.source.mergeBaseSha,
+  const input = protocol ? protocol.input : { prNumber: snapshot.source.prNumber, headSha: snapshot.source.headSha, mergeBaseSha: snapshot.source.mergeBaseSha,
     scope: snapshot.source.prefix || '.', title: snapshot.source.title, description: snapshot.source.body, focus: note,
     coverage: snapshot.coverage, diffs: snapshot.files.filter((f) => !f.skipped).map((f) => ({ path: f.path, oldPath: f.oldPath, patch: f.patch })) };
   snapshot.consume(input);
-  const working = [{ role: 'system', content: [
+  const tools = protocol?.tools || TOOLS;
+  const normalize = protocol?.normalize || ((raw) => S.normalizeReport(raw, snapshot.files));
+  const finalTool = protocol?.finalTool || 'submit_review';
+  const working = [{ role: 'system', content: protocol?.instructions || [
     '你是只读 PR 代码审查员。用中文审查本次 diff 引入的缺陷，先读取相关实现和测试核对触发条件、影响与依据。',
     '不要报告纯风格偏好、未经证实的猜测或改动前已经存在的问题。P0=紧急普遍阻断，P1=高，P2=中，P3=低。',
     '只能调用实际提供的快照工具；无法修改文件、执行命令、联网、调用其他 Agent 或发布评论。',
@@ -40,14 +43,14 @@ async function runAudit({ snapshot, settings, note = '', signal, onProgress, cha
   ].join('\n') }, { role: 'user', content: JSON.stringify(input) }];
   let toolsSupported = true; let streamFailedOnce = false; let streamOptionsFailedOnce = false; let corrections = 0;
   const usage = { inputTokens: 0, outputTokens: 0, estimated: false };
-  const known = new Set(TOOLS.map((t) => t.function.name));
+  const known = new Set(tools.map((t) => t.function.name));
   for (let turn = 1; turn <= S.LIMITS.turns; turn++) {
     S.assertCurrent({ signal });
     const estimate = working.reduce((n, m) => n + Math.ceil(Buffer.byteLength(JSON.stringify(m)) / 3), 0);
     const budget = Number(settings.compactMaxApproxTokens) || 24000;
     if (estimate > budget) throw S.fail('CONTEXT_LIMIT');
     onProgress?.({ turn });
-    const invoke = () => callModelTurn({ chatFn, settings, working, tools: TOOLS, toolsSupported, signal, fetchFn,
+    const invoke = () => callModelTurn({ chatFn, settings, working, tools, toolsSupported, signal, fetchFn,
       streamFailedOnce, streamOptionsFailedOnce, onEvent: (event) => {
         if (event.type === 'usage') { usage.inputTokens += event.inputTokens || 0; usage.outputTokens += event.outputTokens || 0; usage.estimated ||= !!event.estimated; }
       } });
@@ -65,11 +68,11 @@ async function runAudit({ snapshot, settings, note = '', signal, onProgress, cha
     const native = Array.isArray(msg.tool_calls) && msg.tool_calls.length ? msg.tool_calls : null;
     const calls = native || parseTextToolCalls(String(msg.content || ''));
     if (!calls.length) {
-      try { return { report: S.normalizeReport(reportFromText(msg.content), snapshot.files), turns: turn, usage }; }
+      try { return { report: normalize(reportFromText(msg.content)), turns: turn, usage }; }
       catch {
         if (++corrections > 1) throw S.fail('REPORT_INVALID');
         working.push({ role: 'assistant', content: String(msg.content || '').slice(0, S.LIMITS.report) },
-          { role: 'user', content: '报告格式或位置无效。请按 submit_review 的字段提交完整 JSON，位置必须对应 diff 改动行。' }); continue;
+          { role: 'user', content: protocol?.correction || '报告格式或位置无效。请按 submit_review 的字段提交完整 JSON，位置必须对应 diff 改动行。' }); continue;
       }
     }
     if (calls.length > 12) throw S.fail('LIMIT');
@@ -79,17 +82,20 @@ async function runAudit({ snapshot, settings, note = '', signal, onProgress, cha
       try {
         args = JSON.parse(call.function?.arguments ?? call.arguments ?? '{}');
         if (!known.has(name)) throw S.fail('INVALID');
-        const def = TOOLS.find((t) => t.function.name === name).function.parameters;
+        const def = tools.find((t) => t.function.name === name).function.parameters;
         S.keys(args, Object.keys(def.properties)); S.assertCurrent({ signal });
         if (def.required.some((key) => args[key] === undefined)) throw S.fail('INVALID');
-        if (name === 'submit_review') return { report: S.normalizeReport(args, snapshot.files), turns: turn, usage };
-        if (name === 'review_read_file') value = await snapshot.read(args);
-        if (name === 'review_list_files') value = await snapshot.list(args);
-        if (name === 'review_search') value = await snapshot.search(args);
+        if (name === finalTool) return { report: normalize(args), turns: turn, usage };
+        if (protocol) value = await protocol.execute(name, args);
+        else {
+          if (name === 'review_read_file') value = await snapshot.read(args);
+          if (name === 'review_list_files') value = await snapshot.list(args);
+          if (name === 'review_search') value = await snapshot.search(args);
+        }
       } catch (cause) {
         S.assertCurrent({ signal });
         if (cause.code === 'PR_AUDIT_CONTEXT_LIMIT') throw cause;
-        if (name === 'submit_review' && ++corrections > 1) throw S.fail('REPORT_INVALID');
+        if (name === finalTool && ++corrections > 1) throw S.fail('REPORT_INVALID');
         value = S.error(cause);
       }
       working.push(native ? { role: 'tool', tool_call_id: call.id, content: JSON.stringify(value) }

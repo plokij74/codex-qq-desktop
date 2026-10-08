@@ -122,8 +122,8 @@
     }
     async function select(ref, record = mount?.record) {
       if (!active(record) || record.busy || !REF.test(ref)) return false;
-      capture(); if (record.selected !== ref) record.highlighted = new Set();
-      record.selected = ref; record.audit = null; record.preview = null; record.snippet = null;
+      capture(); if (record.selected !== ref) { record.highlighted = new Set(); record.audit = null; }
+      record.selected = ref; record.preview = null; record.snippet = null;
       record.reading = true; record.contextSeq++; const seq = ++record.detailSeq; const epoch = record.epoch; render();
       const result = await invoke('getPrAudit', { projectBindingId: record.token, auditRef: ref });
       if (!active(record) || seq !== record.detailSeq || epoch !== record.epoch) return false;
@@ -314,7 +314,7 @@
         <div class="pr-audit-actions">${button('start', record.busy === 'start' ? '正在开始…' : '开始 AI 审查', record.state === 'OPEN' && !record.history.some((r) => ACTIVE.has(r.status)), true)}</div>
         ${record.state !== 'OPEN' ? '<div class="pr-audit-notice">仅支持仍然打开的 PR（包括 Draft）。历史报告仍可查看。</div>' : ''}
         ${memoryNotice(record.persistence)}${record.error ? `<div class="pr-audit-error" role="alert">${escape(record.error)}</div>` : ''}${record.notice ? `<div class="pr-audit-notice" role="status">${escape(record.notice)}</div>` : ''}
-        <div class="pr-audit-history">${history || '<div class="muted">暂无审查历史</div>'}</div>${record.reading ? '<div class="muted">正在读取报告…</div>' : report}</section>`;
+        <div class="pr-audit-history">${history || '<div class="muted">暂无审查历史</div>'}</div>${record.reading ? '<div class="muted">正在读取报告…</div>' : ''}${report}</section>`;
       mount.renderedRef = audit?.auditRef;
       element.querySelectorAll('[data-audit-action]').forEach((node) => node.addEventListener('click', () => {
         const action = node.dataset.auditAction;

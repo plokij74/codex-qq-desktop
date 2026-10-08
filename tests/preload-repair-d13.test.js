@@ -47,7 +47,22 @@ describe('D13 repair IPC and preload contract', () => {
       'engineering:repair:start', 'engineering:repair:retry', 'engineering:repair:cancel',
       'engineering:repair:validate', 'engineering:repair:validate-cancel',
       'engineering:pr-audit:repair-snapshot', 'engineering:pr-audit:repair-source', 'engineering:pr-audit:update-pr',
+      ...['start', 'list', 'get', 'cancel', 'context'].map((action) => `engineering:pr-audit:recheck:${action}`),
     ]) assert.match(main, new RegExp(`ipcMain\\.handle\\('${channel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`));
+  });
+
+  it('D19 reconstructs all read-only recheck payloads with opaque IDs only', async () => {
+    const injected = { projectBindingId: 'pb_test', resultId: 'wt_test', recheckRef: 'pac_test', evidenceId: 'pce_test', prNumber: 7,
+      projectPath: 'D:/forged', headSha: 'forged', findings: [], evidence: [], status: 'resolved', approved: true };
+    for (const [method, action, fields] of [
+      ['startPrAuditRecheck', 'start', ['resultId']], ['listPrAuditRechecks', 'list', ['prNumber']],
+      ['getPrAuditRecheck', 'get', ['recheckRef']], ['cancelPrAuditRecheck', 'cancel', ['recheckRef']],
+      ['getPrAuditRecheckContext', 'context', ['recheckRef', 'evidenceId']],
+    ]) {
+      await exposed[method](injected);
+      assert.deepEqual(calls.at(-1), [`engineering:pr-audit:recheck:${action}`,
+        Object.fromEntries(['projectBindingId', ...fields].map((key) => [key, injected[key]]))]);
+    }
   });
 
   it('reconstructs every repair payload and drops path, command, model, and result injection', async () => {

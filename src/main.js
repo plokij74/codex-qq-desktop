@@ -210,6 +210,11 @@ function getEngineeringIpc() {
         if (ownerIds.includes(win.webContents.id)) safeSend(win.webContents, 'engineering:pr-audit:event', event);
       }
     },
+    onPrAuditRecheckEvent: (event, ownerIds) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (ownerIds.includes(win.webContents.id)) safeSend(win.webContents, 'engineering:pr-audit:recheck:event', event);
+      }
+    },
     isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
     createPermissionGate: (event, settings) => createPermissionGate({
       permissionMode: PERMISSION_MODES.has(settings.permissionMode) ? settings.permissionMode : 'confirm-writes',
@@ -1362,6 +1367,11 @@ ipcMain.handle('engineering:pr-review:reply', (event, payload = {}) => getEngine
 ipcMain.handle('engineering:pr-review:resolve', (event, payload = {}) => getEngineeringIpc().prReviewResolve(event, payload));
 ipcMain.handle('engineering:pr-review:update-pr', (event, payload = {}) => getEngineeringIpc().prReviewUpdatePr(event, payload));
 ipcMain.handle('engineering:pr-audit:start', (event, payload = {}) => getEngineeringIpc().prAuditStart(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:start', (event, payload = {}) => getEngineeringIpc().prAuditRecheckStart(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:list', (event, payload = {}) => getEngineeringIpc().prAuditRecheckList(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:get', (event, payload = {}) => getEngineeringIpc().prAuditRecheckGet(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:cancel', (event, payload = {}) => getEngineeringIpc().prAuditRecheckCancel(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:context', (event, payload = {}) => getEngineeringIpc().prAuditRecheckContext(event, payload));
 ipcMain.handle('engineering:pr-audit:list', (event, payload = {}) => getEngineeringIpc().prAuditList(event, payload));
 ipcMain.handle('engineering:pr-audit:get', (event, payload = {}) => getEngineeringIpc().prAuditGet(event, payload));
 ipcMain.handle('engineering:pr-audit:cancel', (event, payload = {}) => getEngineeringIpc().prAuditCancel(event, payload));

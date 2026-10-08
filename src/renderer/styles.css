@@ -920,6 +920,11 @@ html, body {
 .pr-audit-center { padding: 4px 0; }
 .pr-audit-center-list { margin-top: 8px; max-height: 240px; overflow: auto; }
 .pr-audit-panel button:disabled { cursor: default; opacity: .6; }
+.pr-audit-recheck { min-width: 0; margin: 12px 0; padding: 10px; border: 1px solid #afc5dc; background: #f6faff; border-radius: 5px; overflow-wrap: anywhere; }
+.pr-audit-recheck-history { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-height: 180px; overflow: auto; margin: 8px 0; }
+.pr-audit-recheck button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.pr-audit-recheck-findings { max-height: 420px; overflow: auto; }
+.pr-audit-recheck pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; padding: 7px; background: #fff; border: 1px solid #cad8e6; }
 @media (max-width: 980px) {
   .pr-workspace { grid-template-columns: minmax(0, 1fr); }
   .pr-list { border-right: 0; border-bottom: 1px solid #bfd1df; padding-right: 0; padding-bottom: 6px; max-height: 160px; overflow: auto; }

@@ -11,7 +11,8 @@ const STATES = new Set([...ACTIVE, 'completed', 'failed', 'cancelled', 'interrup
 const CODES = new Set(['INVALID', 'BINDING', 'UNAVAILABLE', 'UNSUPPORTED', 'NOT_FOUND', 'NOT_OPEN', 'FORK', 'CHANGED',
   'INCOMPLETE', 'LIMIT', 'CONTEXT_LIMIT', 'LOCATION', 'MODEL_REQUIRED', 'REPORT_INVALID', 'TURNS', 'TIMEOUT',
   'CANCELLED', 'BUSY', 'CONFIRM_REQUIRED', 'PUBLISHED', 'UNCERTAIN', 'PUBLISH_FAILED', 'STORE_CORRUPT', 'STORE_MEMORY',
-  'REPAIR_INVALID', 'REPAIR_LIMIT', 'REPAIR_NOT_FOUND', 'REPAIR_CHANGED', 'REPAIR_CONTEXT_LIMIT', 'REPAIR_STORE_CORRUPT', 'REPAIR_STORE_MEMORY']);
+  'REPAIR_INVALID', 'REPAIR_LIMIT', 'REPAIR_NOT_FOUND', 'REPAIR_CHANGED', 'REPAIR_CONTEXT_LIMIT', 'REPAIR_STORE_CORRUPT', 'REPAIR_STORE_MEMORY',
+  'RECHECK_SOURCE', 'RECHECK_DELIVERY', 'RECHECK_ANCESTRY', 'RECHECK_STORE_CORRUPT', 'RECHECK_STORE_MEMORY']);
 const ref = (prefix = 'pra') => `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
 const isRef = (value, prefix = 'pra') => typeof value === 'string' && new RegExp(`^${prefix}_[a-f0-9]{24}$`).test(value);
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');

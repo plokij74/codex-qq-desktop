@@ -85,6 +85,7 @@ if (!process.versions.electron) {
     return { content: '修复完成', turns: 1, terminalReason: 'completed' };
   } });
   const handlers = new Map();
+  handlers.set('engineering:pr-audit:recheck:list', (event, payload) => engineering.prAuditRecheckList(event, payload));
   handlers.set('settings:get', () => settings);
   handlers.set('worktree:bind', (event, payload) => {
     const previous = worktrees.listProjectPaths(event); const result = worktrees.bind(event, payload);

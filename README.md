@@ -17,6 +17,7 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - **Phase D.16 PR 审查反馈**：PR 详情按线程查看讨论、生成隔离修复、回复与解决，支持只读核对与更新 PR
 - **Phase D.17 主动 AI PR 审查**：PR 详情手动发起只读 AI 代码审查，分析 diff 与快照代码；编辑勾选后一次确认发布 COMMENT Review，无缝衔接 D16 反馈闭环
 - **Phase D.18 AI 审查直接修复**：从同一报告选择 1–5 项原始发现，预览后生成隔离修复，手动复验并单独确认更新原 PR
+- **Phase D.19 修复后复审**：成功更新 PR 后手动逐项复审原问题，提供只读 AI 结论、固定提交依据、独立历史与过期提示
 
 ## 开发
 
@@ -911,3 +912,16 @@ D12 把 D11 profile 组合成受控 DAG 工作流。用户可以显式运行 `ty
 - 修复来源仅加密保存不可变元数据，并保护所引用的报告。发布草稿、修复说明和代码上下文不写入聊天或本地会话存储；worktree marker 与 repair store 的 v4 格式兼容读取 v1–v3。
 
 设计与实施记录见 [D18 spec](docs/superpowers/specs/2026-09-30-phase-d18-pr-audit-repair-design.md) 和 [D18 plan](docs/superpowers/plans/2026-09-30-phase-d18-pr-audit-repair.md)。离线桌面冒烟：`node scripts/smoke-pr-audit-repair.cjs`，使用临时 Git 仓库、配置和模拟 GitHub/model，覆盖 1100×720 与 900×580。真实 GitHub.com / Enterprise 远端写入需在指定测试仓库独立验收。
+
+## Phase D.19：修复后复审与问题追踪
+
+D18 的 PR 更新核对成功后，在结果卡、修复详情或 PR 的「修复后复审」面板点击「复审本次修复」。每次检查该次修复的全部 1–5 项原始问题，不修改原报告或发布草稿。
+
+- 逐项给出「AI 判断已解决」「AI 判断仍存在」「无法判断」及理由；代码依据绑定实际读取的固定提交，可展开查看。结论只读，不代表测试通过、人工确认或可以合并。
+- 沿用当前 API/模型配置和 gh 登录；仅支持 origin 同仓库的 OPEN PR（含 Draft）。目标可以包含修复后的新提交，但必须仍包含修复提交；强推移除修复或交付尚未确认时拒绝启动。
+- 原审查、修复与目标提交分别展示。PR 提交、分支或描述变化后标记结论过期；查询失败显示「当前状态未核实」。允许脏工作区，不修改文件、index 或远端跟踪分支。
+- PR 面板与工程中心保留独立历史，默认查看最近完成的复审。可手动再次复审或进入完整 AI 审查；后续修复须从新的 D17 报告发起，不直接重修复，也不自动发布评论、解决线程、测试或合并。
+- D17/D19 共用每项目一个、全局两个任务名额；最多八轮、五分钟。切换页面后后台继续，解绑或退出取消；重启只保留中断记录，不恢复模型调用。
+- 历史使用 `safeStorage` 加密保存在 `engineering-pr-audit-rechecks.json`，每项目最多 50 条、全局 200 条，并保护关联的 D18 来源和 D17 报告。加密或写入失败退化为内存并提示；不把结论、代码或提示写入聊天、localStorage、导出、记忆或 Hooks。
+
+设计与实施记录见 [D19 spec](docs/superpowers/specs/2026-10-08-phase-d19-pr-audit-recheck-design.md) 和 [D19 plan](docs/superpowers/plans/2026-10-08-phase-d19-pr-audit-recheck.md)。离线桌面冒烟：`node scripts/smoke-pr-audit-recheck.cjs`，覆盖真实 Electron、临时 Git 和 1100×720 / 900×580 窗口；GitHub 与模型使用测试替身，不访问真实远端。真实 GitHub.com / Enterprise 权限、网络和实际模型仍需在指定测试仓库验收。

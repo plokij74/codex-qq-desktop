@@ -5,7 +5,7 @@
 if (!process.versions.electron) {
   const { spawn } = require('node:child_process');
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
-  const child = spawn(require('electron'), [__filename], { env, stdio: 'inherit', windowsHide: true });
+  const child = spawn(require('electron'), [__filename, ...process.argv.slice(2)], { env, stdio: 'inherit', windowsHide: true });
   child.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
   child.on('exit', (code) => { process.exitCode = code ?? 1; });
 } else {
@@ -22,6 +22,8 @@ if (!process.versions.electron) {
   const { runTerminal } = require('../src/ai/terminal');
   const { repositoryKey } = require('../src/ai/remote-ci-state');
   const { DEFAULT_SETTINGS } = require('../src/ai/settings');
+  const { runRecheck } = require('../src/ai/pr-audit-recheck-runtime');
+  const recheckMode = process.argv.includes('--recheck');
 
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-d18-smoke-'));
   app.setPath('userData', profile); app.disableHardwareAcceleration();
@@ -42,7 +44,7 @@ if (!process.versions.electron) {
   const localHead = git(['rev-parse', 'HEAD']); const beforeRefs = git(['show-ref']);
   const repo = { host: 'github.com', owner: 'example', repo: 'demo', nameWithOwner: 'example/demo' };
   const repoKey = repositoryKey(repo.host, repo.nameWithOwner);
-  const state = { head: remoteHead, audits: 0, generations: 0, pushes: 0, validations: 0, watches: 0, reviews: 0, replies: 0, resolves: 0 };
+  const state = { head: remoteHead, audits: 0, rechecks: 0, generations: 0, pushes: 0, validations: 0, watches: 0, reviews: 0, replies: 0, resolves: 0 };
   const validationProfile = { id: 'vfy_' + 'a'.repeat(16), name: '本地输入检查', kind: 'test', command: 'node check.cjs', cwd: '.', timeoutMs: 10000, enabled: true };
   function auditPr() { return { number: 7, state: 'open', merged: false, title: '为空输入添加处理', body: 'D18 本地桌面验收',
     headSha: state.head, baseSha: baseHead, headRefName: 'feature/audit', baseRefName: 'main', headRepo: repo.nameWithOwner, baseRepo: repo.nameWithOwner, changedFiles: 1 }; }
@@ -107,6 +109,24 @@ if (!process.versions.electron) {
     } catch (error) { generationFailure = error; throw error; }
   } });
   const handlers = new Map();
+  for (const [action, method] of [['start', 'prAuditRecheckStart'], ['list', 'prAuditRecheckList'], ['get', 'prAuditRecheckGet'], ['cancel', 'prAuditRecheckCancel'], ['context', 'prAuditRecheckContext']]) {
+    handlers.set(`engineering:pr-audit:recheck:${action}`, (event, payload) => {
+      if (action === 'start') {
+        const manager = engineering.prAuditRecheckManager;
+        assert.ok(manager);
+        manager.runtime = (args) => {
+          state.rechecks++; let turn = 0;
+          return runRecheck({ ...args, chatFn: async () => {
+            if (++turn === 1) return { tool_calls: [{ id: 'read_target', type: 'function', function: { name: 'recheck_read_file', arguments: '{"path":"src/app.js","offset":1,"limit":4}' } }] };
+            const target = [...args.snapshot.evidence.values()].find((e) => e.stage === 'target'); assert.ok(target);
+            return { content: JSON.stringify({ summary: '已逐项检查修复后的输入处理', findings: args.findings.map((f) => ({ findingId: f.findingId,
+              status: 'resolved', reason: '目标代码先检查输入类型与数组长度，原触发条件已消除。', evidence: [target.evidenceId] })) }) };
+          } });
+        };
+      }
+      return engineering[method](event, payload);
+    });
+  }
   handlers.set('settings:get', () => settings);
   handlers.set('worktree:bind', (event, payload) => {
     const previous = worktrees.listProjectPaths(event); const result = worktrees.bind(event, payload);
@@ -137,7 +157,14 @@ if (!process.versions.electron) {
       unexpected.push(channel); throw new Error(`Unexpected smoke IPC: ${channel}`);
     });
   }
-  const js = (source) => win.webContents.executeJavaScript(source);
+  const js = async (source) => {
+    let timer;
+    try {
+      return await Promise.race([win.webContents.executeJavaScript(source), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Renderer evaluation timed out: ${source.slice(0, 180)}`)), 45000);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
   async function until(source, timeout = 45000) {
     const end = Date.now() + timeout;
     while (Date.now() < end) {
@@ -148,7 +175,8 @@ if (!process.versions.electron) {
     throw new Error(`UI condition timed out: ${source}`);
   }
   async function capture(name) {
-    await js('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+    // Hidden native windows may not receive animation frames after navigation.
+    await js('new Promise(resolve => { setTimeout(resolve, 250); requestAnimationFrame(() => requestAnimationFrame(resolve)); })');
     fs.writeFileSync(path.join(profile, name + '.png'), (await win.webContents.capturePage()).toPNG());
   }
 
@@ -163,6 +191,7 @@ if (!process.versions.electron) {
       });
       const watches = createCiWatchManager({ githubCli: github, onEvent: (event) => { if (win && !win.isDestroyed()) win.webContents.send('engineering:ci-watch:event', event); } });
       engineering = createEngineeringIpcHandlers({ prAuditManager: audits, ciWatchManager: watches, githubCli: github, worktreeManager, subagentRuntime: runtime,
+        onPrAuditRecheckEvent: (event, ownerIds) => { if (win && !win.isDestroyed() && ownerIds.includes(win.webContents.id)) win.webContents.send('engineering:pr-audit:recheck:event', event); },
         userDataPath: profile, safeStorage, getSettings: () => settings, getProfiles: () => [validationProfile], resolveBinding: (event, payload) => worktrees.resolveBinding(event, payload),
         runTerminal: async (cwd, command, options) => { state.validations++; assert.notEqual(cwd.toLowerCase(), root.toLowerCase()); return runTerminal(cwd, command, options); },
         createPermissionGate: (event) => createPermissionGate({
@@ -215,6 +244,7 @@ if (!process.versions.electron) {
       await js("document.querySelector('[data-audit-action=repair]').click()");
       await until("currentView === 'scheduled' && Boolean(document.querySelector('#engineering-repairs [data-repair-view]'))", 90000);
       assert.equal(state.generations, 1); assert.equal(state.validations, 0); assert.equal(state.pushes, 0);
+      console.log('D18 smoke: isolated repair generated');
       await js("document.querySelector('#engineering-repairs [data-repair-view]').click()");
       await until("Boolean(document.getElementById('engineering-repair-open-audit'))");
       await js("document.getElementById('engineering-repair-open-audit').click()");
@@ -228,6 +258,7 @@ if (!process.versions.electron) {
       await js("document.querySelector('#engineering-approval [data-engineering-decision=allow]').click()");
       await until("document.getElementById('engineering-repairs')?.textContent.includes('验证 通过')", 60000);
       assert.equal(state.validations, 1);
+      console.log('D18 smoke: explicit validation passed');
       await js("document.querySelector('#engineering-repairs [data-repair-view]').click()");
       await until("Boolean(document.getElementById('engineering-repair-open-result'))");
       await js("document.getElementById('engineering-repair-open-result').click()");
@@ -243,6 +274,29 @@ if (!process.versions.electron) {
       await until("activeSession()?.pendingWorktreeResults?.some(r=>r.state==='pr_updated')", 60000);
       assert.equal(state.pushes, 1); assert.equal(git(['rev-parse', 'HEAD']), localHead); assert.equal(git(['show-ref']), beforeRefs); assert.equal(git(['status', '--porcelain']), '');
       assert.equal(state.audits, 1); assert.equal(state.watches, 0);
+      console.log('D18 smoke: PR delivery confirmed');
+      if (recheckMode) {
+        await js("[...document.querySelectorAll('.worktree-result-card button')].find(n=>n.textContent==='复审本次修复').click()");
+        await until("document.querySelector('.pr-audit-recheck-findings')?.textContent.includes('AI 判断已解决')", 60000);
+        assert.equal(state.rechecks, 1); assert.equal(state.audits, 1); assert.equal(state.pushes, 1);
+        console.log('D19 smoke: recheck completed');
+        await js("document.querySelector('[data-recheck-action=context]').click()");
+        await until("document.querySelector('.pr-audit-recheck-snippet')?.textContent.includes('Array.isArray')");
+        for (const [width, height] of [[900, 580], [1100, 720]]) {
+          win.setContentSize(width, height);
+          await js("document.querySelector('.pr-audit-recheck-snippet').scrollIntoView({block:'center'})");
+          await capture(`recheck-evidence-${width}x${height}`);
+          const sizes = await js("['.pr-audit-recheck','.pr-audit-recheck-snippet','.pr-detail'].map(s=>{const n=document.querySelector(s);return {selector:s,width:n.clientWidth,scroll:n.scrollWidth};})");
+          for (const size of sizes) assert.ok(size.scroll <= size.width + 1, JSON.stringify(size));
+        }
+        win.setContentSize(900, 580);
+        const originalGet = github.getAuditPr; github.getAuditPr = async () => ({ ...(await originalGet()), body: 'changed description' });
+        await js("prAuditRecheckUi.refresh()"); await until("document.querySelector('[data-recheck-detail]')?.textContent.includes('结论已过期')");
+        github.getAuditPr = originalGet;
+        assert.doesNotMatch(await js('localStorage.getItem(STORAGE_KEY)'), /目标代码先检查|已逐项检查/);
+        assert.equal(git(['status', '--porcelain']), ''); assert.equal(git(['show-ref']), beforeRefs);
+        await js("setView('chat')");
+      }
       await js("[...document.querySelectorAll('.worktree-result-card button')].find(n=>n.textContent.includes('跟踪 CI')).click()");
       await until('ciWatchUi.snapshot().length === 1'); assert.equal(state.watches, 1);
       await js("[...document.querySelectorAll('.worktree-result-card button')].find(n=>n.textContent==='查看原 AI 审查发现').click()");
@@ -255,12 +309,18 @@ if (!process.versions.electron) {
       assert.doesNotMatch(JSON.stringify(engineering.repairManager.store.list()), /SMOKE_|"note"/);
       await js("setView('chat')");
       const reloaded = new Promise((resolve) => win.webContents.once('did-finish-load', resolve)); win.reload(); await reloaded;
-      await until("Boolean(document.querySelector('.worktree-result-card'))");
+      await until("Boolean(worktreeBindings.get('smoke')) && Boolean(document.querySelector('.worktree-result-card'))");
       await js("[...document.querySelectorAll('.worktree-result-card button')].find(n=>n.textContent==='查看原 AI 审查发现').click()");
       await until("document.querySelectorAll('.pr-audit-finding.is-highlighted').length === 2");
       assert.equal(await js("document.querySelector('[data-audit-repair-field=note]').value"), '');
       assert.equal(await js("document.querySelector('[data-audit-repair-check]').checked"), false);
       await capture('source-after-reload-900x580');
+      if (recheckMode) {
+        await js("prAuditRecheckUi.refresh()"); await until("document.querySelector('.pr-audit-recheck-findings')?.textContent.includes('AI 判断已解决')");
+        await js("setView('scheduled')"); await until("document.querySelector('#engineering-pr-rechecks')?.textContent.includes('复审完成')");
+        await js("document.getElementById('engineering-pr-rechecks').scrollIntoView({block:'start'})");
+        await capture('recheck-history-900x580');
+      }
       await js("setView('chat'); [...document.querySelectorAll('.worktree-result-card button')].find(n=>n.textContent==='重新 AI 审查').click()");
       await until("document.querySelectorAll('.pr-audit-history-row').length === 2 && document.querySelector('.pr-audit-status')?.textContent.includes('审查完成')");
       assert.equal(state.audits, 2); assert.equal(state.generations, 1); assert.equal(state.pushes, 1); assert.equal(state.reviews + state.replies + state.resolves, 0);

@@ -6,6 +6,7 @@ const { createPrAuditStore } = require('./pr-audit-store');
 const { AuditSnapshot, cleanupAuditRefs } = require('./pr-audit-snapshot');
 const { runAudit } = require('./pr-audit-runtime');
 const S = require('./pr-audit-state');
+const { AuditTaskPool } = require('./pr-audit-task-pool');
 
 class PrAuditManager {
   constructor(options = {}) {
@@ -14,6 +15,7 @@ class PrAuditManager {
     this.getSettings = options.getSettings || (() => ({})); this.mutationLock = options.mutationLock;
     this.onEvent = options.onEvent; this.now = options.now || Date.now; this.timeoutMs = options.timeoutMs || S.LIMITS.timeout;
     this.runs = new Map(); this.drafts = new Map(); this.pending = new Set(); this.cleaned = new Map(); this.closing = false;
+    this.taskPool = options.taskPool || new AuditTaskPool();
   }
   current(context) { if (this.closing) throw S.fail('CANCELLED'); S.assertCurrent(context); }
   row(root, auditRef) {
@@ -66,13 +68,15 @@ class PrAuditManager {
     catch (cause) { await snapshot.cleanup(); throw cause; }
   }
   async start(projectPath, prNumber, note = '', context = {}) {
+    let acquired;
     try {
       const root = canonicalProjectPath(projectPath); const key = projectKey(root); this.current(context);
       if (!root || !S.number(prNumber)) throw S.fail(); S.text(note, 2000, true);
       const settings = { ...this.getSettings() };
       if (settings.mode !== 'api' || settings.agentEnabled === false || !settings.apiKey || !settings.model) throw S.fail('MODEL_REQUIRED');
       if ([...this.runs.values()].some((r) => r.key === key) || this.runs.size >= 2) throw S.fail('BUSY');
-      const row = this.save({ auditRef: S.ref(), projectKey: key, prNumber, createdAt: new Date(this.now()).toISOString(),
+      const auditRef = S.ref(); this.taskPool.acquire(auditRef, key); acquired = auditRef;
+      const row = this.save({ auditRef, projectKey: key, prNumber, createdAt: new Date(this.now()).toISOString(),
         status: 'preparing', stale: false, model: String(settings.model).slice(0, 200) });
       const controller = new AbortController(); const abort = () => controller.abort(context.signal?.reason);
       context.signal?.addEventListener('abort', abort, { once: true }); if (context.signal?.aborted) abort();
@@ -106,6 +110,7 @@ class PrAuditManager {
           clearTimeout(timer);
           try { await snapshot?.cleanup(); } finally {
             this.runs.delete(row.auditRef);
+            this.taskPool.release(row.auditRef);
             context.signal?.removeEventListener('abort', abort); context.release?.();
           }
         }
@@ -113,7 +118,7 @@ class PrAuditManager {
       // Resource cleanup must run even if storage or an injected observer fails.
       record.done.catch(() => {});
       return { ok: true, auditRef: row.auditRef, persistence: this.store.persistenceStatus() };
-    } catch (cause) { return S.error(cause); }
+    } catch (cause) { if (acquired) this.taskPool.release(acquired); return S.error(cause); }
   }
   list(root, prNumber) {
     try {
