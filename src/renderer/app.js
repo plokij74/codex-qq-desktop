@@ -398,7 +398,7 @@ function handleTerminalPanelEvent(ev) {
   }
   // Verification approvals use a dedicated ephemeral panel. They must never
   // fall through to renderApprovalCard, which would attach them to chatRun.
-  if (type === 'approval-needed' && (['remote-ci', 'pr-review', 'pr-audit'].includes(ev.source) || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
+  if (type === 'approval-needed' && (['remote-ci', 'pr-review', 'pr-audit', 'pr-audit-recheck'].includes(ev.source) || (ev.source === 'repair' && !document.getElementById('engineering-approval')))) {
     void appConfirm([ev.summary, ev.detail].filter(Boolean).join('\n')).then((allowed) => window.codex.approveChat({ approvalId: ev.approvalId, decision: allowed ? 'allow' : 'deny' })).catch(() => {});
     return true;
   }
@@ -1379,11 +1379,17 @@ async function worktreeAction(session, ref, action) {
     return;
   }
   if (action === 'recheck') {
-    await openPrAuditRecheck(project.id, ref.auditRepairRef, ref.id);
+    if (ref.originKind === 'pr_audit_recheck') await openPrAuditRecheckRepairSource(project.id, ref.recheckRepairRef, { resultId: ref.id });
+    else await openPrAuditRecheck(project.id, ref.auditRepairRef, ref.id);
+    return;
+  }
+  if (action === 'parentRecheck') {
+    await openPrAuditRecheckRepairSource(project.id, ref.recheckRepairRef);
     return;
   }
   if (action === 'auditFindings' || action === 'reaudit') {
-    await openPrAuditRepairSource(project.id, ref.auditRepairRef, { reaudit: action === 'reaudit' });
+    if (ref.originKind === 'pr_audit_recheck') await openPrAuditRecheckRepairSource(project.id, ref.recheckRepairRef, { original: true, reaudit: action === 'reaudit' });
+    else await openPrAuditRepairSource(project.id, ref.auditRepairRef, { reaudit: action === 'reaudit' });
     return;
   }
   if (action === 'discard') {
@@ -1415,13 +1421,13 @@ async function worktreeAction(session, ref, action) {
       }
     } else if (action === 'updatePr') {
       const reconcileOnly = ['pr_update_uncertain', 'pr_update_cleanup_pending'].includes(ref.state);
-      const defaultSubject = { pr_review: 'Address PR review feedback', pr_audit: 'Fix AI PR review findings' }[ref.originKind] || 'Fix GitHub Actions failure';
+      const defaultSubject = { pr_review: 'Address PR review feedback', pr_audit: 'Fix AI PR review findings', pr_audit_recheck: 'Address PR recheck findings' }[ref.originKind] || 'Fix GitHub Actions failure';
       const subject = reconcileOnly ? ref.prUpdate?.subject || '' : await appPrompt('提交说明（重试将复用上次提交）', ref.prUpdate?.subject || defaultSubject, '更新此 PR');
       if (subject == null) return;
-      const update = { pr_review: window.codex.updatePrReviewPr, pr_audit: window.codex.updatePrAuditPr }[ref.originKind] || window.codex.updateRemoteCiPr;
+      const update = { pr_review: window.codex.updatePrReviewPr, pr_audit: window.codex.updatePrAuditPr, pr_audit_recheck: window.codex.updatePrAuditRecheckPr }[ref.originKind] || window.codex.updateRemoteCiPr;
       response = await update({ projectBindingId: token, resultId: ref.id, subject });
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
-      if (response?.ok) toast(ref.originKind === 'pr_audit' ? 'PR 已更新，可重新 AI 审查或跟踪 CI' : 'PR 已更新，可点击「跟踪 CI」观察新提交');
+      if (response?.ok) toast(['pr_audit', 'pr_audit_recheck'].includes(ref.originKind) ? 'PR 已更新，可手动复审本次修复或跟踪 CI' : 'PR 已更新，可点击「跟踪 CI」观察新提交');
     } else if (action === 'createPr') {
       const method = ref.canRetryPr ? window.codex.retryWorktreePr : window.codex.createWorktreePr;
       response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true, ...workflowGatePayload(project, 'create_pr', gateScope) });
@@ -1463,7 +1469,7 @@ async function worktreeAction(session, ref, action) {
     }
     if (!response?.ok) {
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
-      const sourceUi = { pr_review: window.PrReviewUi, pr_audit: window.PrAuditUi }[ref.originKind];
+      const sourceUi = { pr_review: window.PrReviewUi, pr_audit: window.PrAuditUi, pr_audit_recheck: window.PrAuditRecheckUi }[ref.originKind];
       toast(sourceUi && action === 'updatePr' ? sourceUi.reason(response?.code) : response?.error || '隔离改动操作失败');
       reconcileWorktreeResults(project);
     } else if (action === 'preview') {
@@ -1563,6 +1569,11 @@ function renderWorktreeCards(root, session) {
     if (ref.canCreatePr) addButton(ref.canRetryPr ? '重试 PR' : '创建 Draft PR', 'prForm', true, false, true);
     if (ref.canUpdatePr) addButton(['pr_update_uncertain', 'pr_update_cleanup_pending'].includes(ref.state) ? '核对更新状态' : ref.canRetryPrUpdate ? '重试更新此 PR' : '更新此 PR', 'updatePr', true, false, true);
     if (ref.originKind === 'pr_review' && ref.reviewRef) addButton('查看原审查线程', 'reviewThread');
+    if (ref.originKind === 'pr_audit_recheck' && ref.recheckRepairRef) {
+      addButton('查看来源复审', 'parentRecheck');
+      addButton('查看原 AI 审查发现', 'auditFindings');
+      if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state)) addButton('复审本次修复', 'recheck');
+    }
     if (ref.originKind === 'pr_audit' && ref.auditRepairRef) {
       addButton('查看原 AI 审查发现', 'auditFindings');
       if (['pr_updated', 'pr_update_cleanup_pending'].includes(ref.state)) addButton('重新 AI 审查', 'reaudit');
@@ -2214,7 +2225,7 @@ const VALIDATION_STATUS_LABELS = {
 
 function engineeringRepairStatusText(status) { return REPAIR_STATUS_LABELS[String(status || '')] || String(status || '未知'); }
 function engineeringValidationStatusText(status) { return VALIDATION_STATUS_LABELS[String(status || '')] || String(status || '未验证'); }
-function engineeringRepairSourceText(source) { return ({ verification: '本地验证', workflow: '工程工作流', remote_ci: 'GitHub Actions', pr_review: 'PR 审查反馈', pr_audit: 'AI PR 审查发现' })[source?.kind] || '未知来源'; }
+function engineeringRepairSourceText(source) { return ({ verification: '本地验证', workflow: '工程工作流', remote_ci: 'GitHub Actions', pr_review: 'PR 审查反馈', pr_audit: 'AI PR 审查发现', pr_audit_recheck: 'PR 复审继续修复' })[source?.kind] || '未知来源'; }
 
 async function beginEngineeringRepair(token, source) {
   if (!source || !token) return;
@@ -2227,12 +2238,14 @@ async function beginEngineeringRepair(token, source) {
   await loadEngineeringRepairs(token);
 }
 
+let engineeringRepairSeq = 0;
 async function showEngineeringRepair(token, repairRef) {
   const detail = document.getElementById('engineering-repair-detail');
   if (!detail) return;
+  const seq = ++engineeringRepairSeq;
   const project = sessionProject(); const projectPath = project?.path;
   detail.dataset.repairRef = repairRef;
-  const isCurrent = () => currentView === 'scheduled' && engineeringBindingToken() === token
+  const isCurrent = () => seq === engineeringRepairSeq && currentView === 'scheduled' && engineeringBindingToken() === token
     && sessionProject()?.id === project?.id && sessionProject()?.path === projectPath
     && document.getElementById('engineering-repair-detail') === detail && detail.dataset.repairRef === repairRef;
   const result = await window.codex.getEngineeringRepairResult({ projectBindingId: token, repairRef }).catch(() => null);
@@ -2252,7 +2265,8 @@ async function showEngineeringRepair(token, repairRef) {
     `<div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · 来源 ${escapeHtml(engineeringRepairSourceText(repair.source))} · ${escapeHtml(repair.profileId || '')}</div>`,
     repair.source?.kind === 'pr_review' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-review">查看原审查线程</button>' : '',
     repair.source?.kind === 'pr_audit' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-audit">查看原 AI 审查发现</button>' : '',
-    repair.source?.kind === 'pr_audit' && repair.resultId ? '<span id="engineering-repair-recheck"></span>' : '',
+    repair.source?.kind === 'pr_audit_recheck' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-recheck">查看来源复审</button>' : '',
+    ['pr_audit', 'pr_audit_recheck'].includes(repair.source?.kind) && repair.resultId ? '<span id="engineering-repair-recheck"></span>' : '',
     repair.resultId ? `<div class="work-card-meta">D5 隔离结果：<code>${escapeHtml(repair.resultId)}</code></div><div class="engineering-detail-actions"><button type="button" class="ghost-btn" id="engineering-repair-open-result">查看 D5 结果卡</button></div>` : '',
     repair.incomplete ? '<div class="work-card-notice">这是未完整结束的隔离结果，仍需用户审阅。</div>' : '',
     repair.errorCode ? `<div class="work-card-error">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : '',
@@ -2266,6 +2280,7 @@ async function showEngineeringRepair(token, repairRef) {
   if (projectPath) {
     document.getElementById('engineering-repair-open-review')?.addEventListener('click', () => openPrReviewSource(project.id, repair.source.reviewRef));
     document.getElementById('engineering-repair-open-audit')?.addEventListener('click', () => openPrAuditRepairSource(project.id, repair.source.auditRepairRef));
+    document.getElementById('engineering-repair-open-recheck')?.addEventListener('click', () => openPrAuditRecheckRepairSource(project.id, repair.source.recheckRepairRef));
     const reconciled = repair.resultId ? reconcileWorktreeResults(project) : Promise.resolve();
     document.getElementById('engineering-repair-open-result')?.addEventListener('click', async () => {
       await reconciled;
@@ -2279,12 +2294,14 @@ async function showEngineeringRepair(token, repairRef) {
       }, 0);
     });
     await reconciled;
-    if (repair.source?.kind === 'pr_audit' && repair.resultId && isCurrent()) {
+    if (['pr_audit', 'pr_audit_recheck'].includes(repair.source?.kind) && repair.resultId && isCurrent()) {
       const saved = await window.codex.getWorktreeResult({ projectBindingId: token, resultId: repair.resultId }).catch(() => null);
       if (isCurrent() && ['pr_updated', 'pr_update_cleanup_pending'].includes(saved?.result?.state)) {
         const entry = document.getElementById('engineering-repair-recheck');
         if (entry) { entry.innerHTML = '<button type="button" class="ghost-btn">复审本次修复</button>';
-          entry.querySelector('button')?.addEventListener('click', () => openPrAuditRecheck(project.id, repair.source.auditRepairRef, repair.resultId)); }
+          entry.querySelector('button')?.addEventListener('click', () => repair.source.kind === 'pr_audit_recheck'
+            ? openPrAuditRecheckRepairSource(project.id, repair.source.recheckRepairRef, { resultId: repair.resultId })
+            : openPrAuditRecheck(project.id, repair.source.auditRepairRef, repair.resultId)); }
       }
     }
   }
@@ -3872,19 +3889,19 @@ async function openPrAuditRepairSource(projectId, auditRepairRef, { reaudit = fa
   const project = getProject(projectId); const token = worktreeBindings.get(projectId); const projectPath = project?.path;
   const fromSession = activeSessionId; const fromView = currentView;
   const bound = () => getProject(projectId)?.path === projectPath && worktreeBindings.get(projectId) === token;
-  if (!projectPath || !token || !auditRepairRef) return toast('AI 审查来源不可用');
+  if (!projectPath || !token || !auditRepairRef) { console.log('[REPAIR_SOURCE] bad token/ref', { projectPath, token, auditRepairRef }); return toast('AI 审查来源不可用'); }
   const response = await window.codex.getPrAuditRepairSource({ projectBindingId: token, auditRepairRef }).catch(() => null);
-  if (!bound() || activeSessionId !== fromSession || currentView !== fromView) return;
-  if (!response?.ok) return toast(window.PrAuditUi.reason(response?.code));
+  if (!bound() || activeSessionId !== fromSession || currentView !== fromView) { console.log('[REPAIR_SOURCE] stale view/session', { bound: bound(), activeSessionId, fromSession, currentView, fromView }); return; }
+  if (!response?.ok) { console.log('[REPAIR_SOURCE] response not ok', response); return toast(window.PrAuditUi.reason(response?.code)); }
   const source = response.source;
   if (sessionProject()?.id !== projectId) openProjectChat(projectId);
   resetPullRequestView(project); pullRequestView.selectedNumber = source.prNumber; pullRequestView.resultId = '';
   setView('prs');
   await loadPullRequestDetail(source.prNumber);
   const visible = () => bound() && sessionProject()?.id === projectId && currentView === 'prs' && pullRequestView.detail?.number === source.prNumber;
-  if (!visible()) return;
+  if (!visible()) { console.log('[REPAIR_SOURCE] not visible after load'); return; }
   await prAuditUi?.refresh();
-  if (!visible()) return;
+  if (!visible()) { console.log('[REPAIR_SOURCE] not visible after prAuditUi refresh'); return; }
   if (reaudit) {
     await prAuditUi?.operate('start');
     if (visible()) document.getElementById('pr-audit-panel')?.scrollIntoView({ block: 'start' });
@@ -3892,6 +3909,31 @@ async function openPrAuditRepairSource(projectId, auditRepairRef, { reaudit = fa
     const selected = await prAuditUi?.select(source.auditRef);
     if (visible() && selected) prAuditUi?.focusFindings(source.findingIds);
   }
+  return visible();
+}
+
+async function openPrAuditRecheckRepairSource(projectId, recheckRepairRef, { resultId, original = false, reaudit = false } = {}) {
+  const token = worktreeBindings.get(projectId); const projectPath = getProject(projectId)?.path;
+  const fromSession = activeSessionId; const fromView = currentView;
+  const bound = () => !!projectPath && getProject(projectId)?.path === projectPath && worktreeBindings.get(projectId) === token;
+  if (!token || !bound() || !recheckRepairRef) { console.log('[RECHECK_REPAIR_SOURCE] bad token/bound/ref', { token, bound: bound(), recheckRepairRef }); return false; }
+  const response = await window.codex.getPrAuditRecheckRepairSource({ projectBindingId: token, recheckRepairRef }).catch(() => null);
+  if (!bound() || activeSessionId !== fromSession || currentView !== fromView) { console.log('[RECHECK_REPAIR_SOURCE] stale view/session', { bound: bound(), activeSessionId, fromSession, currentView, fromView }); return false; }
+  if (!response?.ok) { console.log('[RECHECK_REPAIR_SOURCE] response not ok', response); toast(window.PrAuditRecheckUi.reason(response?.code)); return false; }
+  const source = response.source;
+  const opened = await openPrAuditRepairSource(projectId, source.auditRepairRef, { reaudit });
+  const visible = () => bound() && sessionProject()?.id === projectId && currentView === 'prs' && pullRequestView.detail?.number === source.prNumber;
+  if (!opened || !visible()) { console.log('[RECHECK_REPAIR_SOURCE] opened or visible false', { opened, visible: visible() }); return false; }
+  if (original) {
+    if (!reaudit) prAuditUi?.focusFindings(source.findingIds);
+    return true;
+  }
+  await prAuditRecheckUi?.refresh();
+  if (!visible()) { console.log('[RECHECK_REPAIR_SOURCE] not visible after refresh'); return false; }
+  if (resultId) await prAuditRecheckUi?.start(resultId);
+  else await prAuditRecheckUi?.select(source.recheckRef);
+  if (visible()) document.getElementById('pr-audit-recheck-panel')?.scrollIntoView({ block: 'start' });
+  console.log('[RECHECK_REPAIR_SOURCE] done successfully', { source, noteField: Boolean(document.querySelector('[data-recheck-repair-field=note]')) });
   return visible();
 }
 
@@ -5760,6 +5802,7 @@ function boot() {
   });
   prAuditRecheckUi = window.PrAuditRecheckUi?.create({ api: window.codex, document, getProject,
     getToken: (id) => worktreeBindings.get(id), openSource: openPrAuditRepairSource,
+    openRepair: openEngineeringRepair,
     isVisible: (id, prNumber) => sessionProject()?.id === id && (prNumber ? currentView === 'prs' && pullRequestView.detail?.number === prNumber : currentView === 'scheduled'),
   });
   const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);

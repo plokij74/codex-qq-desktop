@@ -1372,6 +1372,9 @@ ipcMain.handle('engineering:pr-audit:recheck:list', (event, payload = {}) => get
 ipcMain.handle('engineering:pr-audit:recheck:get', (event, payload = {}) => getEngineeringIpc().prAuditRecheckGet(event, payload));
 ipcMain.handle('engineering:pr-audit:recheck:cancel', (event, payload = {}) => getEngineeringIpc().prAuditRecheckCancel(event, payload));
 ipcMain.handle('engineering:pr-audit:recheck:context', (event, payload = {}) => getEngineeringIpc().prAuditRecheckContext(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:repair-snapshot', (event, payload = {}) => getEngineeringIpc().prAuditRecheckRepairSnapshot(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:repair-source', (event, payload = {}) => getEngineeringIpc().prAuditRecheckRepairSource(event, payload));
+ipcMain.handle('engineering:pr-audit:recheck:update-pr', (event, payload = {}) => getEngineeringIpc().prAuditRecheckUpdatePr(event, payload));
 ipcMain.handle('engineering:pr-audit:list', (event, payload = {}) => getEngineeringIpc().prAuditList(event, payload));
 ipcMain.handle('engineering:pr-audit:get', (event, payload = {}) => getEngineeringIpc().prAuditGet(event, payload));
 ipcMain.handle('engineering:pr-audit:cancel', (event, payload = {}) => getEngineeringIpc().prAuditCancel(event, payload));

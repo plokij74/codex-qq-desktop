@@ -15,6 +15,24 @@ function durableRecord(raw) {
     comments: raw.publication.comments.map((c) => pick(c, ['path', 'side', 'line', 'startLine', 'bodyHash'])) };
   return S.normalizeRecord(row);
 }
+function replaceFileSync(fsImpl, source, target) {
+  try {
+    fsImpl.renameSync(source, target);
+  } catch (err) {
+    if ((err?.code === 'EPERM' || err?.code === 'EBUSY') && process.platform === 'win32') {
+      for (let i = 0; i < 10; i++) {
+        try {
+          const waitTill = Date.now() + 5;
+          while (Date.now() < waitTill) {}
+          fsImpl.renameSync(source, target);
+          return;
+        } catch {}
+      }
+    }
+    throw err;
+  }
+}
+
 class PrAuditStore {
   constructor(options = {}) {
     this.fs = options.fs || fs; this.safeStorage = options.safeStorage;
@@ -51,7 +69,7 @@ class PrAuditStore {
       this.fs.writeFileSync(temp, JSON.stringify({ version: 1, cipher: 'electron-safeStorage', payload: Buffer.from(payload).toString('base64') }));
       const verify = JSON.parse(this.fs.readFileSync(temp, 'utf8'));
       if (this.safeStorage.decryptString(Buffer.from(verify.payload, 'base64')) !== plain) throw S.fail();
-      this.fs.renameSync(temp, this.file); return true;
+      replaceFileSync(this.fs, temp, this.file); return true;
     } catch {
       this.mode = 'memory'; this.error = 'PR_AUDIT_STORE_MEMORY';
       if (temp) { try { this.fs.unlinkSync(temp); } catch {} } return false;

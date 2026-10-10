@@ -4,7 +4,7 @@ const RESULT_ID_RE = /^wt_[A-Za-z0-9]{6,80}$/;
 const SHA1_RE = /^[a-f0-9]{40}$/i;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 
-const MARKER_VERSION = 4;
+const MARKER_VERSION = 5;
 const PENDING_LIMIT = 3;
 const PATCH_MAX_BYTES = 16 * 1024 * 1024;
 const FILE_SUMMARY_LIMIT = 200;
@@ -144,7 +144,7 @@ function normalizePrChecks(raw) {
 function normalizeMarker(raw, { now = Date.now() } = {}) {
   if (!raw || typeof raw !== 'object') return null;
   const inputVersion = Number(raw.version);
-  if (![1, 2, 3, MARKER_VERSION].includes(inputVersion) || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
+  if (![1, 2, 3, 4, MARKER_VERSION].includes(inputVersion) || !isResultId(raw.id) || !STATES.has(raw.state)) return null;
   const repoRoot = normalizePath(raw.repoRoot);
   const projectRoot = normalizePath(raw.projectRoot);
   const projectIdentity = text(raw.projectIdentity, 600);
@@ -198,11 +198,14 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     checksSummary: normalizePrChecks(rawPr.checksSummary),
   };
   const baseKind = raw.baseKind === 'remote_commit' ? 'remote_commit' : 'local_head';
-  const originKind = ['remote_ci', 'pr_review', 'pr_audit'].includes(raw.originKind) ? raw.originKind : 'default';
+  const originKind = ['remote_ci', 'pr_review', 'pr_audit', 'pr_audit_recheck'].includes(raw.originKind) ? raw.originKind : 'default';
   const deliveryKind = raw.deliveryKind === 'github_pr_update' ? 'github_pr_update' : 'default';
   const remoteCiRef = /^rci_[a-f0-9]{24}$/.test(String(raw.remoteCiRef || '')) ? String(raw.remoteCiRef) : '';
   const reviewRef = /^prv_[a-f0-9]{24}$/.test(String(raw.reviewRef || '')) ? String(raw.reviewRef) : '';
   const auditRepairRef = /^par_[a-f0-9]{24}$/.test(String(raw.auditRepairRef || '')) ? String(raw.auditRepairRef) : '';
+  const recheckRepairRef = /^pcr_[a-f0-9]{24}$/.test(String(raw.recheckRepairRef || '')) ? String(raw.recheckRepairRef) : '';
+  if (raw.recheckRepairRef != null && (!recheckRepairRef || inputVersion < 5 || originKind !== 'pr_audit_recheck')) return null;
+  if (originKind === 'pr_audit_recheck' && (inputVersion < 5 || !recheckRepairRef || raw.auditRepairRef || raw.remoteCiRef || raw.reviewRef)) return null;
   if (raw.auditRepairRef != null && (!auditRepairRef || inputVersion < 4 || originKind !== 'pr_audit')) return null;
   if (originKind === 'pr_audit' && (inputVersion < 4 || !auditRepairRef || raw.remoteCiRef || raw.reviewRef)) return null;
   if (originKind === 'pr_review' && (inputVersion < 3 || !reviewRef || remoteCiRef || auditRepairRef)) return null;
@@ -238,6 +241,7 @@ function normalizeMarker(raw, { now = Date.now() } = {}) {
     ...(remoteCiRef ? { remoteCiRef } : {}),
     ...(reviewRef ? { reviewRef } : {}),
     ...(auditRepairRef ? { auditRepairRef } : {}),
+    ...(recheckRepairRef ? { recheckRepairRef } : {}),
     deliveryKind,
     worktreeGitDir,
     expectedTree,
@@ -332,6 +336,7 @@ function publicSummary(raw) {
     ...(marker.remoteCiRef ? { remoteCiRef: marker.remoteCiRef } : {}),
     ...(marker.reviewRef ? { reviewRef: marker.reviewRef } : {}),
     ...(marker.auditRepairRef ? { auditRepairRef: marker.auditRepairRef } : {}),
+    ...(marker.recheckRepairRef ? { recheckRepairRef: marker.recheckRepairRef } : {}),
     deliveryKind: marker.deliveryKind,
     incomplete: marker.incomplete,
     files: marker.files,

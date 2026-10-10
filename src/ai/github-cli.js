@@ -818,7 +818,7 @@ function createGithubCli(opts = {}) {
   async function fetchBranchToRef({ repoRoot, branch, targetRef, signal }) {
     const cleanBranch = shellSafeName(branch);
     const cleanRef = String(targetRef || '');
-    if (!cleanBranch || !/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_|pr-audit-repair\/par_)[a-f0-9]{24}$/.test(cleanRef)) {
+    if (!cleanBranch || !/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_|pr-audit-repair\/par_|pr-audit-recheck-repair\/pcr_)[a-f0-9]{24}$/.test(cleanRef)) {
       return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI fetch 参数无效' };
     }
     // Keep the long-lived fetch tail stable for callers while pinning the
@@ -831,7 +831,7 @@ function createGithubCli(opts = {}) {
 
   async function resolveCommit({ repoRoot, ref, signal }) {
     const cleanRef = String(ref || '');
-    if (!/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_|pr-audit-repair\/par_)[a-f0-9]{24}$/.test(cleanRef)) {
+    if (!/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_|pr-audit-repair\/par_|pr-audit-recheck-repair\/pcr_)[a-f0-9]{24}$/.test(cleanRef)) {
       return { ok: false, code: 'REMOTE_CI_FETCH_MISMATCH', error: '远程 CI ref 无效' };
     }
     const result = await git(repoRoot, ['rev-parse', '--verify', `${cleanRef}^{commit}`], { signal });
@@ -841,7 +841,7 @@ function createGithubCli(opts = {}) {
 
   async function deleteInternalRef({ repoRoot, ref }) {
     const cleanRef = String(ref || '');
-    if (!/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_|pr-audit-repair\/par_)[a-f0-9]{24}$/.test(cleanRef)) return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI ref 无效' };
+    if (!/^refs\/codex\/(?:remote-ci\/rci_|pr-review\/prv_|pr-audit-repair\/par_|pr-audit-recheck-repair\/pcr_)[a-f0-9]{24}$/.test(cleanRef)) return { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: '远程 CI ref 无效' };
     const result = await git(repoRoot, ['update-ref', '-d', cleanRef]);
     return result.ok ? { ok: true } : { ok: false, code: 'REMOTE_CI_FETCH_FAILED', error: clip(result.error || '无法清理远程 CI ref') };
   }

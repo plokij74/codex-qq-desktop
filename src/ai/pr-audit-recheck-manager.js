@@ -9,6 +9,7 @@ const { runRecheck } = require('./pr-audit-recheck-runtime');
 class PrAuditRecheckManager {
   constructor(options = {}) {
     this.audits = options.auditManager; this.repairs = options.auditRepairManager;
+    this.getRecheckRepairs = options.getRecheckRepairs || (() => options.recheckRepairManager);
     this.github = options.githubCli || this.audits.github; this.worktree = options.worktreeManager;
     this.store = options.store || new PrAuditRecheckStore(options);
     this.runtime = options.runtime || runRecheck; this.snapshotFactory = options.snapshotFactory || ((args) => new RecheckSnapshot(args));
@@ -28,6 +29,10 @@ class PrAuditRecheckManager {
   }
   protectsSource(ref) { return this.store.referencesUnknown?.() || this.store.list().some((r) => r.source.auditRepairRef === ref) || [...this.runs.values()].some((r) => r.source?.auditRepairRef === ref); }
   protectsReport(ref) { return this.store.referencesUnknown?.() || this.store.list().some((r) => r.source.auditRef === ref) || [...this.runs.values()].some((r) => r.source?.auditRef === ref); }
+  protectsRecheckRepair(ref) {
+    return this.store.referencesUnknown?.() || this.store.list().some((r) => r.source.recheckRepairRef === ref)
+      || [...this.runs.values()].some((r) => r.source?.recheckRepairRef === ref);
+  }
   cleanup(repoRoot) {
     if (!this.cleaned.has(repoRoot)) this.cleaned.set(repoRoot,
       cleanupRecheckRefs(this.github, repoRoot, { has: (ref) => this.runs.has(ref) }).catch(() => {}));
@@ -49,16 +54,31 @@ class PrAuditRecheckManager {
     this.current(ctx); if (!isResultId(resultId)) throw A.fail();
     const found = await this.worktree.inspectRemoteResult({ projectPath: root, resultId }); this.current(ctx);
     const m = found?.marker;
-    if (!found?.ok || m?.originKind !== 'pr_audit' || m.deliveryKind !== 'github_pr_update'
+    if (!found?.ok || !['pr_audit', 'pr_audit_recheck'].includes(m?.originKind) || m.deliveryKind !== 'github_pr_update'
       || !['pr_updated', 'pr_update_cleanup_pending'].includes(m.state)) throw A.fail('RECHECK_DELIVERY');
-    const { item, findings } = this.historical(root, m.auditRepairRef);
+    const followup = m.originKind === 'pr_audit_recheck';
+    const history = followup ? this.getRecheckRepairs()?.historical(root, m.recheckRepairRef) : this.historical(root, m.auditRepairRef);
+    if (!history) throw A.fail('RECHECK_SOURCE');
+    const { item, findings } = history; const rootItem = history.rootItem || item;
     if (m.baseHead !== item.headSha || m.prUpdate?.oldHead !== item.headSha || m.prUpdate?.expectedTree !== m.expectedTree
       || m.prUpdate?.prNumber !== item.prNumber) throw A.fail('RECHECK_DELIVERY');
-    const source = S.source({ auditRef: item.auditRef, auditRepairRef: item.auditRepairRef, resultId,
+    const source = S.source({ auditRef: rootItem.auditRef, auditRepairRef: rootItem.auditRepairRef, resultId,
       repoKey: item.repoKey, prNumber: item.prNumber, prefix: item.prefix, headRefName: item.headRefName, baseRefName: item.baseRefName,
-      originalHead: item.headSha, originalBase: item.mergeBaseSha, repairCommit: m.prUpdate.newCommit, expectedTree: m.expectedTree,
-      repairRevision: item.repairRevision, findingIds: findings.map((f) => f.findingId) });
+      originalHead: rootItem.headSha, originalBase: rootItem.mergeBaseSha, repairBaseHead: item.headSha,
+      repairCommit: m.prUpdate.newCommit, expectedTree: m.expectedTree,
+      repairRevision: rootItem.repairRevision, findingIds: findings.map((f) => f.findingId),
+      ...(followup ? { recheckRepairRef: item.recheckRepairRef, parentRecheckRef: item.recheckRef } : {}) });
     return { source, findings };
+  }
+  originals(root, source) {
+    if (!source.recheckRepairRef) return this.historical(root, source.auditRepairRef).findings;
+    const history = this.getRecheckRepairs()?.historical(root, source.recheckRepairRef);
+    if (!history || history.item.recheckRef !== source.parentRecheckRef || history.item.headSha !== source.repairBaseHead
+      || history.rootItem.auditRepairRef !== source.auditRepairRef || history.rootItem.auditRef !== source.auditRef
+      || history.rootItem.headSha !== source.originalHead || history.rootItem.mergeBaseSha !== source.originalBase
+      || history.rootItem.repairRevision !== source.repairRevision
+      || A.hash(history.item.findingIds) !== A.hash(source.findingIds)) throw A.fail('RECHECK_SOURCE');
+    return history.findings;
   }
   async target(root, source, ctx) {
     const { repo, source: latest } = await this.audits.source(root, source.prNumber, ctx); this.current(ctx);
@@ -98,7 +118,7 @@ class PrAuditRecheckManager {
           this.save({ ...this.row(root, ref), status: 'running', target });
           const generated = await this.runtime({ snapshot, findings, settings, signal: context.signal,
             onProgress: ({ turn }) => { this.current(context); this.save({ ...this.row(root, ref), turns: turn }); } });
-          this.current(context); this.historical(root, source.auditRepairRef);
+          this.current(context); this.originals(root, source);
           const report = S.report(generated.report, source.findingIds, snapshot.evidence);
           const selected = new Set(report.findings.flatMap((f) => f.evidence));
           const bounded = (v) => Number.isFinite(v) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(v))) : 0;
@@ -131,11 +151,13 @@ class PrAuditRecheckManager {
       this.current(ctx);
       const deliveries = [];
       for (const m of listed?.ok ? listed.results || [] : []) {
-        if (m.originKind !== 'pr_audit' || !['pr_updated', 'pr_update_cleanup_pending'].includes(m.state)) continue;
-        let historical; try { historical = this.historical(root, m.auditRepairRef); } catch {}
+        if (!['pr_audit', 'pr_audit_recheck'].includes(m.originKind) || !['pr_updated', 'pr_update_cleanup_pending'].includes(m.state)) continue;
+        let historical; try { historical = m.originKind === 'pr_audit_recheck'
+          ? this.getRecheckRepairs()?.historical(root, m.recheckRepairRef) : this.historical(root, m.auditRepairRef); } catch {}
         const number = historical?.item.prNumber || m.prUpdate?.prNumber;
         if (!A.number(number) || (prNumber && number !== prNumber)) continue;
-        deliveries.push({ resultId: m.id, auditRepairRef: m.auditRepairRef, auditRef: historical?.item.auditRef, prNumber: number,
+        deliveries.push({ resultId: m.id, auditRepairRef: historical?.rootItem?.auditRepairRef || m.auditRepairRef,
+          ...(m.recheckRepairRef ? { recheckRepairRef: m.recheckRepairRef } : {}), auditRef: historical?.item.auditRef, prNumber: number,
           repairCommit: m.prUpdate?.newCommit, findingCount: historical?.findings.length || 0, available: !!historical,
           ...(!historical ? { errorCode: 'PR_AUDIT_RECHECK_SOURCE' } : {}) });
       }
@@ -152,8 +174,9 @@ class PrAuditRecheckManager {
         row = this.row(root, ref); row.freshness = freshness; this.store.put(row);
       }
       let originals = []; let sourceAvailable = true;
-      try { originals = this.historical(canonicalProjectPath(root), row.source.auditRepairRef).findings; } catch { sourceAvailable = false; }
-      return { ok: true, recheck: row, originalFindings: originals, sourceAvailable, persistence: this.store.persistenceStatus() };
+      try { originals = this.originals(canonicalProjectPath(root), row.source); } catch { sourceAvailable = false; }
+      return { ok: true, recheck: row, originalFindings: originals, sourceAvailable,
+        ...(row.status === 'completed' ? { repairRevision: S.repairRevision(row) } : {}), persistence: this.store.persistenceStatus() };
     } catch (cause) { return A.error(cause); }
   }
   cancel(root, ref) { try { this.row(root, ref); this.runs.get(ref)?.controller.abort(); return { ok: true }; } catch (cause) { return A.error(cause); } }

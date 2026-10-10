@@ -4,20 +4,29 @@ const { isResultId } = require('./worktree-state');
 const { normalizeSha, normalizeHeadRef, normalizeProjectKey, redactRemoteText } = require('./remote-ci-state');
 const ACTIVE = new Set(['preparing', 'running']);
 const STATES = new Set([...ACTIVE, 'completed', 'failed', 'cancelled', 'interrupted']);
-const STAGES = ['original_head', 'original_base', 'repair', 'target'];
+const STAGES = ['original_head', 'original_base', 'repair_base', 'repair', 'target'];
 const sha = (v) => typeof v === 'string' && normalizeSha(v) === v;
 const ref = () => A.ref('pac');
 const isRef = (v) => A.isRef(v, 'pac');
+const SOURCE_FIELDS = ['auditRef', 'auditRepairRef', 'resultId', 'repoKey', 'prNumber', 'prefix', 'headRefName', 'baseRefName',
+  'originalHead', 'originalBase', 'repairBaseHead', 'repairCommit', 'expectedTree', 'repairRevision', 'findingIds',
+  'recheckRepairRef', 'parentRecheckRef'];
 function source(raw) {
-  A.keys(raw, ['auditRef', 'auditRepairRef', 'resultId', 'repoKey', 'prNumber', 'prefix', 'headRefName', 'baseRefName',
-    'originalHead', 'originalBase', 'repairCommit', 'expectedTree', 'repairRevision', 'findingIds']);
+  A.keys(raw, SOURCE_FIELDS);
   if (!A.isRef(raw.auditRef) || !A.isRef(raw.auditRepairRef, 'par') || !isResultId(raw.resultId) || !A.digest(raw.repoKey)
     || !A.number(raw.prNumber) || !A.digest(raw.repairRevision) || !['originalHead', 'originalBase', 'repairCommit', 'expectedTree'].every((k) => sha(raw[k]))
     || !['headRefName', 'baseRefName'].every((k) => typeof raw[k] === 'string' && raw[k] && normalizeHeadRef(raw[k]) === raw[k]) || typeof raw.prefix !== 'string'
     || !A.scopePath(`${raw.prefix ? `${raw.prefix}/` : ''}file`, raw.prefix)
     || !Array.isArray(raw.findingIds) || !raw.findingIds.length || raw.findingIds.length > 5
     || new Set(raw.findingIds).size !== raw.findingIds.length || raw.findingIds.some((id) => !A.isRef(id, 'paf'))) throw A.fail('RECHECK_SOURCE');
-  return structuredClone(raw);
+  const repairBaseHead = raw.repairBaseHead ?? raw.originalHead;
+  if (!sha(repairBaseHead)) throw A.fail('RECHECK_SOURCE');
+  if (raw.recheckRepairRef !== undefined) {
+    if (!A.isRef(raw.recheckRepairRef, 'pcr') || !isRef(raw.parentRecheckRef) || !sha(raw.repairBaseHead)) throw A.fail('RECHECK_SOURCE');
+  } else if (raw.parentRecheckRef !== undefined || repairBaseHead !== raw.originalHead) throw A.fail('RECHECK_SOURCE');
+  const normalized = { ...structuredClone(raw), repairBaseHead };
+  // Migration and live capture must hash the same semantic source in the same order.
+  return Object.fromEntries(SOURCE_FIELDS.filter((key) => normalized[key] !== undefined).map((key) => [key, normalized[key]]));
 }
 function target(raw) {
   A.keys(raw, ['repoKey', 'prNumber', 'prefix', 'baseSha', 'headSha', 'mergeBaseSha', 'baseRefName', 'headRefName', 'descriptionHash']);
@@ -29,7 +38,8 @@ function target(raw) {
 }
 function evidence(raw, row) {
   A.keys(raw, ['evidenceId', 'stage', 'sha', 'path', 'kind', 'startLine', 'line', 'existedBefore']);
-  const expected = { original_head: row.source.originalHead, original_base: row.source.originalBase, repair: row.source.repairCommit, target: row.target?.headSha };
+  const expected = { original_head: row.source.originalHead, original_base: row.source.originalBase,
+    repair_base: row.source.repairBaseHead, repair: row.source.repairCommit, target: row.target?.headSha };
   if (!A.isRef(raw.evidenceId, 'pce') || !STAGES.includes(raw.stage) || raw.sha !== expected[raw.stage]
     || !A.scopePath(raw.path, row.source.prefix) || !['code', 'absence'].includes(raw.kind)) throw A.fail('REPORT_INVALID');
   if (raw.kind === 'code' && (!A.number(raw.startLine) || !A.number(raw.line) || raw.line < raw.startLine || raw.line - raw.startLine >= 200)) throw A.fail('REPORT_INVALID');
@@ -79,4 +89,8 @@ function record(raw) {
   if (row.status === 'completed' && (!row.target || !row.report)) throw A.fail();
   return row;
 }
-module.exports = { ACTIVE, STATES, STAGES, sha, ref, isRef, source, target, evidence, report, record };
+function repairRevision(row) {
+  const r = record(row);
+  return A.hash([r.recheckRef, r.projectKey, r.status, r.source, r.target, r.report, r.evidence || []]);
+}
+module.exports = { ACTIVE, STATES, STAGES, sha, ref, isRef, source, target, evidence, report, record, repairRevision };

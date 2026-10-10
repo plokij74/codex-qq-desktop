@@ -11,8 +11,9 @@ async function createRemoteWorktree(manager, sourceRef, { project, sessionId, su
   const root = project?.path;
   const { kind, refField } = manager.deliverySource || { kind: 'remote_ci', refField: 'remoteCiRef' };
   const fresh = await manager.resolveMetadata(root, sourceRef, { ...context, signal });
-  const operationRef = ref(kind === 'remote_ci' ? 'rci' : kind === 'pr_audit' ? 'par' : 'prv');
-  const targetRef = `refs/codex/${kind === 'remote_ci' ? 'remote-ci' : kind === 'pr_audit' ? 'pr-audit-repair' : 'pr-review'}/${operationRef}`;
+  const operationRef = ref(manager.deliverySource?.refPrefix || (kind === 'remote_ci' ? 'rci' : kind === 'pr_audit' ? 'par' : 'prv'));
+  const namespace = manager.deliverySource?.refNamespace || (kind === 'remote_ci' ? 'remote-ci' : kind === 'pr_audit' ? 'pr-audit-repair' : 'pr-review');
+  const targetRef = `refs/codex/${namespace}/${operationRef}`;
   const github = manager.github;
   if (!github.fetchBranchToRef || !github.resolveCommit || !github.deleteInternalRef || !manager.worktree?.createAtCommit) return resultError(null);
   let fetched = false;
@@ -66,7 +67,7 @@ async function updatePr(manager, projectPath, resultId, subject, context = {}) {
         const gate = context.permissionGate || context.gate;
         if (!reconcileOnly) {
           if (!gate?.authorize) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');
-          const decision = await gate.authorize({ tool: `${kind}_update_pr`, risk: 'remote-mutation', source: kind === 'remote_ci' ? 'remote-ci' : kind === 'pr_audit' ? 'pr-audit' : 'pr-review',
+          const decision = await gate.authorize({ tool: `${kind}_update_pr`, risk: 'remote-mutation', source: manager.deliverySource?.approvalSource || (kind === 'remote_ci' ? 'remote-ci' : kind === 'pr_audit' ? 'pr-audit' : 'pr-review'),
             summary: `更新 PR #${initial.item.prNumber} · ${initial.item.headRefName}`,
             detail: `${initial.item.headSha.slice(0, 12)} · ${initial.found.marker.stats?.files || 0} 个文件 · ${frozenSubject}`, signal: context.signal });
           if (!decision?.allowed) throw remoteCiError('PR_UPDATE_CONFIRM_REQUIRED');

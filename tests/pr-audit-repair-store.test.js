@@ -62,11 +62,12 @@ describe('D18 source retention and v4 compatibility', () => {
     const f = fixture(t); const saved = await f.snapshot();
     const marker = createMarker({ id: 'wt_auditrepair1', projectRoot: f.root, repoRoot: f.root, projectIdentity: 'test-project',
       baseHead: f.state.pr.headSha, originKind: 'pr_audit', auditRepairRef: saved.auditRepairRef, baseKind: 'remote_commit', deliveryKind: 'github_pr_update' });
-    assert.equal(marker.version, 4);
+    assert.equal(marker.version, 5);
+    assert.equal(normalizeMarker({ ...marker, version: 4 }).version, 5);
     for (const version of [1, 2, 3]) assert.equal(normalizeMarker({ ...marker, version }), null);
     assert.equal(normalizeMarker({ ...marker, reviewRef: 'prv_' + '1'.repeat(24) }), null);
     const legacy = { ...marker, originKind: 'default', baseKind: 'local_head', deliveryKind: 'default' }; delete legacy.auditRepairRef;
-    for (const version of [1, 2, 3]) assert.equal(normalizeMarker({ ...legacy, version }).version, 4);
+    for (const version of [1, 2, 3, 4]) assert.equal(normalizeMarker({ ...legacy, version }).version, 5);
     const file = path.join(f.root, 'repairs.json');
     const row = { repairRef: 'rpr_' + '1'.repeat(24), projectKey: f.row.projectKey, source: { kind: 'pr_audit', auditRepairRef: saved.auditRepairRef },
       sourceFingerprint: S.sourceFingerprint(f.manager.store.get(saved.auditRepairRef, f.row.projectKey)), status: 'ready', createdAt: DATE };

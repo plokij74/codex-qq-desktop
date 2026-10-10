@@ -213,6 +213,11 @@ contextBridge.exposeInMainWorld('codex', {
   getPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:get', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef }),
   cancelPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:cancel', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef }),
   getPrAuditRecheckContext: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:context', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef, evidenceId: p?.evidenceId }),
+  snapshotPrAuditRecheckRepair: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:repair-snapshot', {
+    projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef, repairRevision: p?.repairRevision,
+    findingIds: Array.isArray(p?.findingIds) ? p.findingIds.slice(0, 6) : p?.findingIds }),
+  getPrAuditRecheckRepairSource: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:repair-source', { projectBindingId: p?.projectBindingId, recheckRepairRef: p?.recheckRepairRef }),
+  updatePrAuditRecheckPr: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:update-pr', { projectBindingId: p?.projectBindingId, resultId: p?.resultId, subject: p?.subject }),
   onPrAuditRecheckEvent: (cb) => {
     const listener = (_event, data) => cb(data);
     ipcRenderer.on('engineering:pr-audit:recheck:event', listener);
@@ -253,10 +258,11 @@ contextBridge.exposeInMainWorld('codex', {
     const normalizedSource = source.kind === 'verification'
       ? { kind: 'verification', jobRef: String(source.jobRef || '') }
       : source.kind === 'pr_audit' ? { kind: 'pr_audit', auditRepairRef: String(source.auditRepairRef || '') }
+      : source.kind === 'pr_audit_recheck' ? { kind: 'pr_audit_recheck', recheckRepairRef: String(source.recheckRepairRef || '') }
       : source.kind === 'pr_review' ? { kind: 'pr_review', reviewRef: String(source.reviewRef || '') }
       : source.kind === 'remote_ci' ? { kind: 'remote_ci', remoteCiRef: String(source.remoteCiRef || '') }
         : { kind: 'workflow', workflowRunRef: String(source.workflowRunRef || ''), nodeId: String(source.nodeId || '').slice(0, 120) };
-    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, normalizedSource.kind === 'pr_audit' ? 2001 : 2000), sessionId: String(payload?.sessionId || ''), ...(['remote_ci', 'pr_review', 'pr_audit'].includes(normalizedSource.kind) && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
+    return ipcRenderer.invoke('engineering:repair:start', { projectBindingId: String(payload?.projectBindingId || ''), source: normalizedSource, note: String(payload?.note || '').slice(0, ['pr_audit', 'pr_audit_recheck'].includes(normalizedSource.kind) ? 2001 : 2000), sessionId: String(payload?.sessionId || ''), ...(['remote_ci', 'pr_review', 'pr_audit', 'pr_audit_recheck'].includes(normalizedSource.kind) && payload?.validationProfileId ? { validationProfileId: String(payload.validationProfileId) } : {}) });
   },
   retryEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:retry', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || ''), note: String(payload?.note || '').slice(0, 2001), sessionId: String(payload?.sessionId || '') }),
   cancelEngineeringRepair: (payload = {}) => ipcRenderer.invoke('engineering:repair:cancel', { projectBindingId: String(payload?.projectBindingId || ''), repairRef: String(payload?.repairRef || '') }),

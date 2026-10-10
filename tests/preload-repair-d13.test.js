@@ -47,7 +47,7 @@ describe('D13 repair IPC and preload contract', () => {
       'engineering:repair:start', 'engineering:repair:retry', 'engineering:repair:cancel',
       'engineering:repair:validate', 'engineering:repair:validate-cancel',
       'engineering:pr-audit:repair-snapshot', 'engineering:pr-audit:repair-source', 'engineering:pr-audit:update-pr',
-      ...['start', 'list', 'get', 'cancel', 'context'].map((action) => `engineering:pr-audit:recheck:${action}`),
+      ...['start', 'list', 'get', 'cancel', 'context', 'repair-snapshot', 'repair-source', 'update-pr'].map((action) => `engineering:pr-audit:recheck:${action}`),
     ]) assert.match(main, new RegExp(`ipcMain\\.handle\\('${channel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`));
   });
 
@@ -63,6 +63,21 @@ describe('D13 repair IPC and preload contract', () => {
       assert.deepEqual(calls.at(-1), [`engineering:pr-audit:recheck:${action}`,
         Object.fromEntries(['projectBindingId', ...fields].map((key) => [key, injected[key]]))]);
     }
+  });
+
+  it('D20 exposes source-reference-only capture, start and delivery payloads', async () => {
+    const injected = { projectBindingId: 'pb_test', recheckRef: 'pac_test', recheckRepairRef: 'pcr_test', repairRevision: 'abc',
+      findingIds: ['paf_1', 'paf_2'], resultId: 'wt_test', subject: 'Continue fixes', headSha: 'forged', reason: 'edited', evidence: [], approved: true };
+    await exposed.snapshotPrAuditRecheckRepair(injected);
+    assert.deepEqual(calls.at(-1), ['engineering:pr-audit:recheck:repair-snapshot', { projectBindingId: 'pb_test', recheckRef: 'pac_test', repairRevision: 'abc', findingIds: ['paf_1', 'paf_2'] }]);
+    await exposed.getPrAuditRecheckRepairSource(injected);
+    assert.deepEqual(calls.at(-1), ['engineering:pr-audit:recheck:repair-source', { projectBindingId: 'pb_test', recheckRepairRef: 'pcr_test' }]);
+    await exposed.updatePrAuditRecheckPr(injected);
+    assert.deepEqual(calls.at(-1), ['engineering:pr-audit:recheck:update-pr', { projectBindingId: 'pb_test', resultId: 'wt_test', subject: 'Continue fixes' }]);
+    await exposed.startEngineeringRepair({ ...injected, source: { kind: 'pr_audit_recheck', recheckRepairRef: 'pcr_test', headSha: 'forged' }, note: 'x'.repeat(2100), validationProfileId: 'vfy_test' });
+    assert.deepEqual(calls.at(-1)[1], { projectBindingId: 'pb_test', source: { kind: 'pr_audit_recheck', recheckRepairRef: 'pcr_test' }, note: 'x'.repeat(2001), sessionId: '', validationProfileId: 'vfy_test' });
+    await exposed.snapshotPrAuditRecheckRepair({ ...injected, findingIds: Array(100).fill('paf_1') });
+    assert.equal(calls.at(-1)[1].findingIds.length, 6);
   });
 
   it('reconstructs every repair payload and drops path, command, model, and result injection', async () => {

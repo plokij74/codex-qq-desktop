@@ -9,7 +9,7 @@ const {
   TERMINAL_REPAIR_STATES,
 } = require('./repair-state');
 
-const STORE_VERSION = 4;
+const STORE_VERSION = 5;
 const MAX_PROJECT_REPAIRS = 50;
 const MAX_REPAIRS = 200;
 
@@ -37,10 +37,11 @@ class RepairStore {
     if (this.mode !== 'encrypted' || !this.repairPath || !this.fs.existsSync(this.repairPath)) return null;
     try {
       const envelope = JSON.parse(this.fs.readFileSync(this.repairPath, 'utf8'));
-      if (![1, 2, 3, STORE_VERSION].includes(Number(envelope.version)) || envelope.cipher !== 'electron-safeStorage' || !envelope.payload) throw new Error('invalid envelope');
+      if (![1, 2, 3, 4, STORE_VERSION].includes(Number(envelope.version)) || envelope.cipher !== 'electron-safeStorage' || !envelope.payload) throw new Error('invalid envelope');
       const parsed = JSON.parse(this.safeStorage.decryptString(Buffer.from(String(envelope.payload), 'base64')));
       if (!Array.isArray(parsed)) throw new Error('invalid repair store');
       if (Number(envelope.version) < 4 && parsed.some((row) => row?.source?.kind === 'pr_audit')) throw new Error('invalid source version');
+      if (Number(envelope.version) < 5 && parsed.some((row) => row?.source?.kind === 'pr_audit_recheck')) throw new Error('invalid source version');
       return parsed;
     } catch {
       this.corrupt = true;
@@ -138,6 +139,10 @@ class RepairStore {
       .slice(0, max);
   }
   listPublic(projectKey, limit) { return this.list(projectKey, limit).map(publicRepairSummary).filter(Boolean); }
+  referencesUnknown() {
+    try { return !!this.repairPath && (this.corrupt || this.mode !== 'encrypted') && this.fs.existsSync(this.repairPath); }
+    catch { return true; }
+  }
   persistenceStatus() {
     return {
       persistence: this.mode,

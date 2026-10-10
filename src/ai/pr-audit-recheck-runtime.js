@@ -27,6 +27,7 @@ async function runRecheck({ snapshot, findings, ...options }) {
       '对每个 findingId 返回 resolved、still_present 或 unknown，附理由和工具返回的 evidenceId 数组。',
       '读取目标提交中的实现及相关测试，判断原触发条件是否消除。证据位置不要求落在 PR diff 内。',
       '原问题的 LEFT 是原 merge-base，RIGHT 是原 head；目标包含修复后的其他改动，可能撤销修复。',
+      'original_head/original_base 永远是最初发现问题的提交；repair_base 是本轮修复前的提交，repair 是本轮交付。多轮修复时不要混淆这两种基线。',
       'resolved 必须解释触发条件如何消除；文件删除或改名、行号移动、搜索零结果本身不代表解决。',
       '可以引用工具确认的目标路径缺失，但必须分析调用方或功能移除是否确实消除了原触发条件，不能仅凭缺失判定解决。',
       'still_present 必须引用目标提交代码并说明当前触发条件。证据不足、范围外、读取受限或无法核实原问题时使用 unknown 并说明原因。',

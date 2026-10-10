@@ -4,14 +4,16 @@ const A = require('./pr-audit-state');
 const S = require('./pr-audit-recheck-state');
 const { devNull } = require('node:os');
 class RecheckSnapshot extends AuditSnapshot {
-  constructor({ github, repo, target, source, recheckRef, signal }) {
+  constructor({ github, repo, target, source, recheckRef, signal, refNamespace = 'pr-audit-recheck', includeDiffs = true }) {
     super({ github, repo, source: target, signal });
-    this.origin = source; this.recheckRef = recheckRef; this.readers = new Map(); this.evidence = new Map();
+    this.origin = S.source(source); this.recheckRef = recheckRef; this.readers = new Map(); this.evidence = new Map();
+    this.refNamespace = refNamespace; this.includeDiffs = includeDiffs;
   }
   reader(stage) {
     if (!S.STAGES.includes(stage)) throw A.fail('LOCATION');
     if (!this.readers.has(stage)) {
-      const headSha = { target: this.source.headSha, repair: this.origin.repairCommit, original_head: this.origin.originalHead, original_base: this.origin.originalBase }[stage];
+      const headSha = { target: this.source.headSha, repair: this.origin.repairCommit, repair_base: this.origin.repairBaseHead,
+        original_head: this.origin.originalHead, original_base: this.origin.originalBase }[stage];
       const reader = new AuditSnapshot({ github: this.github, repo: this.repo, source: { ...this.source, headSha, mergeBaseSha: headSha }, signal: this.signal });
       reader.consume = this.consume.bind(this); reader.blobs = this.blobs; reader.trees = this.trees;
       this.readers.set(stage, reader);
@@ -19,20 +21,23 @@ class RecheckSnapshot extends AuditSnapshot {
     return this.readers.get(stage);
   }
   async init() {
-    S.source(this.origin); S.target(this.source); if (!S.isRef(this.recheckRef)) throw A.fail();
-    this.refs = ['base', 'head'].map((n) => `refs/codex/pr-audit-recheck/${this.recheckRef}/${n}`);
+    S.source(this.origin); S.target(this.source);
+    const prefix = { 'pr-audit-recheck': 'pac', 'pr-audit-recheck-repair': 'pcr' }[this.refNamespace];
+    if (!prefix || !A.isRef(this.recheckRef, prefix)) throw A.fail();
+    this.refs = ['base', 'head'].map((n) => `refs/codex/${this.refNamespace}/${this.recheckRef}/${n}`);
     try {
       await this.git(['-c', 'gc.auto=0', '-c', 'fetch.writeCommitGraph=false', 'fetch', '--no-auto-maintenance', '--no-recurse-submodules', '--refmap=', '--no-tags', '--no-write-fetch-head', 'origin',
         `refs/heads/${this.source.baseRefName}:${this.refs[0]}`, `refs/heads/${this.source.headRefName}:${this.refs[1]}`], { timeoutMs: 60000 });
       for (let i = 0; i < 2; i++) if ((await this.git(['rev-parse', '--verify', `${this.refs[i]}^{commit}`])).trim() !== (i ? this.source.headSha : this.source.baseSha)) throw A.fail('CHANGED');
       if ((await this.git(['merge-base', '--all', this.source.baseSha, this.source.headSha])).trim() !== this.source.mergeBaseSha) throw A.fail('INCOMPLETE');
-      if ((await this.git(['rev-list', '--parents', '-n', '1', this.origin.repairCommit])).trim() !== `${this.origin.repairCommit} ${this.origin.originalHead}`
+      if ((await this.git(['rev-list', '--parents', '-n', '1', this.origin.repairCommit])).trim() !== `${this.origin.repairCommit} ${this.origin.repairBaseHead}`
         || (await this.git(['rev-parse', `${this.origin.repairCommit}^{tree}`])).trim() !== this.origin.expectedTree) throw A.fail('RECHECK_DELIVERY');
       try {
         await this.git(['merge-base', '--is-ancestor', this.origin.repairCommit, this.source.headSha]);
         await this.git(['merge-base', '--is-ancestor', this.origin.originalBase, this.origin.originalHead]);
+        if (this.origin.recheckRepairRef) await this.git(['merge-base', '--is-ancestor', this.origin.originalHead, this.origin.repairBaseHead]);
       } catch { A.assertCurrent({ signal: this.signal }); throw A.fail('RECHECK_ANCESTRY'); }
-      this.diffs = [await this.delta('original_head', 'repair'), await this.delta('repair', 'target')];
+      this.diffs = this.includeDiffs ? [await this.delta(this.origin.recheckRepairRef ? 'repair_base' : 'original_head', 'repair'), await this.delta('repair', 'target')] : [];
       if (Buffer.byteLength(JSON.stringify(this.diffs)) > A.LIMITS.diff) throw A.fail('CONTEXT_LIMIT');
       return this;
     } catch (cause) { await this.cleanup(); throw cause; }
@@ -100,15 +105,17 @@ class RecheckSnapshot extends AuditSnapshot {
       }
       originals.push({ ...finding, snippet });
     }
-    return { prNumber: this.source.prNumber, originalHead: this.origin.originalHead, repairCommit: this.origin.repairCommit,
+    return { prNumber: this.source.prNumber, originalHead: this.origin.originalHead, repairBaseHead: this.origin.repairBaseHead, repairCommit: this.origin.repairCommit,
       targetHead: this.source.headSha, scope: this.source.prefix || '.', findings: originals, diffs: this.diffs };
   }
 }
-async function cleanupRecheckRefs(github, repoRoot, active = new Set()) {
-  const out = await github.runCommand('git', ['-C', repoRoot, 'for-each-ref', '--format=%(refname)', 'refs/codex/pr-audit-recheck/'], { rawOutput: true });
+async function cleanupRecheckRefs(github, repoRoot, active = new Set(), namespace = 'pr-audit-recheck') {
+  const prefix = { 'pr-audit-recheck': 'pac', 'pr-audit-recheck-repair': 'pcr' }[namespace];
+  if (!prefix) throw A.fail();
+  const out = await github.runCommand('git', ['-C', repoRoot, 'for-each-ref', '--format=%(refname)', `refs/codex/${namespace}/`], { rawOutput: true });
   if (!out?.ok || out.truncated) return;
   for (const name of out.stdout.split(/\r?\n/)) {
-    const match = name.match(/^refs\/codex\/pr-audit-recheck\/(pac_[a-f0-9]{24})\/(base|head)$/);
+    const match = name.match(new RegExp('^refs/codex/' + namespace + '/(' + prefix + '_[a-f0-9]{24})(?:/(?:base|head))?$'));
     if (match && !active.has(match[1])) await github.runCommand('git', ['-c', `core.hooksPath=${devNull}`, '-C', repoRoot, 'update-ref', '-d', name]);
   }
 }

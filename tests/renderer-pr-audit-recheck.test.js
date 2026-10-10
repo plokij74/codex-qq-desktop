@@ -63,3 +63,51 @@ it('D19 UI defaults to the latest completed history, retaining older failures se
   assert.ok(Object.hasOwn(f.element.querySelector('[data-recheck-action="original"]').attrs, 'disabled'));
   assert.equal(f.calls.length, 0); f.ui.close();
 });
+
+function setupFollowup() {
+  const f = setup(); const writes = []; const opens = [];
+  const id = f.detail.report.findings[0].findingId;
+  const second = 'paf_' + 'e'.repeat(24);
+  f.detail.freshness = 'current';
+  f.detail.report.findings.unshift({ findingId: second, status: 'still_present', reason: '空输入仍失败', evidence: [] });
+  f.api.getPrAuditRecheck = async () => ({ ok: true, recheck: structuredClone(f.detail), repairRevision: 'f'.repeat(64),
+    originalFindings: [{ findingId: id, title: '未知问题', body: '待确认' }, { findingId: second, title: '空输入', body: '仍失败' }], sourceAvailable: true });
+  f.api.listVerificationProfiles = async () => ({ ok: true, profiles: [{ id: 'vfy_' + '1'.repeat(8), name: 'Tests', enabled: true }] });
+  f.api.snapshotPrAuditRecheckRepair = async (p) => { writes.push(['snapshot', p]); return { ok: true, recheckRepairRef: 'pcr_' + 'c'.repeat(24) }; };
+  f.api.startEngineeringRepair = async (p) => { writes.push(['start', p]); return { ok: true, repairRef: 'rpr_' + '1'.repeat(24) }; };
+  return { ...f, id, second, writes, opens };
+}
+it('D20 UI previews mixed findings, retains drafts on refresh and submits only source references', async () => {
+  const f = setupFollowup(); await f.ui.mount(f.element, { projectId: 'p', prNumber: 7 });
+  assert.equal(f.writes.length, 0); assert.equal(await f.ui.repair(), false);
+  assert.equal(f.ui.selectRepair(f.id, true), true); assert.equal(f.ui.selectRepair(f.second, true), true);
+  f.ui.editRepair('note', '用户说明'); f.ui.editRepair('profileId', 'vfy_' + '1'.repeat(8));
+  await f.ui.refresh(); assert.match(f.element.innerHTML, /用户说明/); assert.match(f.element.innerHTML, /已选择 2\/5/);
+  assert.equal(await f.ui.previewRepair(), true); assert.match(f.element.innerHTML, /继续修复预览/);
+  assert.match(f.element.innerHTML, /无法判断，尝试修复/);
+  assert.equal(await f.ui.repair(), true);
+  assert.deepEqual(f.writes[0], ['snapshot', { projectBindingId: 'token', recheckRef: REF,
+    repairRevision: 'f'.repeat(64), findingIds: [f.second, f.id] }]);
+  assert.deepEqual(f.writes[1], ['start', { projectBindingId: 'token', source: { kind: 'pr_audit_recheck', recheckRepairRef: 'pcr_' + 'c'.repeat(24) },
+    note: '用户说明', validationProfileId: 'vfy_' + '1'.repeat(8) }]);
+  assert.equal(f.calls.length, 0); f.ui.close();
+});
+it('D20 UI blocks stale reports, resolved findings and edits after a frozen preview', async () => {
+  const f = setupFollowup(); f.detail.report.findings[0].status = 'resolved';
+  await f.ui.mount(f.element, { projectId: 'p', prNumber: 7 });
+  assert.equal(f.ui.selectRepair(f.second, true), false); assert.equal(f.ui.selectRepair(f.id, true), true);
+  await f.ui.previewRepair(); f.ui.editRepair('note', 'changed'); assert.equal(await f.ui.repair(), false);
+  f.detail.freshness = 'unknown'; await f.ui.refresh();
+  assert.equal(await f.ui.previewRepair(), false); assert.equal(f.ui.selectRepair(f.id, true), false);
+  f.detail.freshness = 'stale'; await f.ui.refresh();
+  assert.equal(await f.ui.repair(), false); assert.equal(f.writes.length, 0); f.ui.close();
+});
+it('D20 UI never starts repair from a late snapshot after leaving or rebinding the page', async () => {
+  for (const leave of [(f) => f.ui.unmount(), (f) => f.token('rebound')]) {
+    const f = setupFollowup(); const wait = deferred(); f.api.snapshotPrAuditRecheckRepair = () => wait.promise;
+    await f.ui.mount(f.element, { projectId: 'p', prNumber: 7 }); f.ui.selectRepair(f.id, true); await f.ui.previewRepair();
+    const pending = f.ui.repair(); leave(f);
+    wait.resolve({ ok: true, recheckRepairRef: 'pcr_' + 'c'.repeat(24) });
+    assert.equal(await pending, false); assert.equal(f.writes.length, 0); f.ui.close();
+  }
+});
