@@ -1367,6 +1367,8 @@ ipcMain.handle('engineering:pr-review:reply', (event, payload = {}) => getEngine
 ipcMain.handle('engineering:pr-review:resolve', (event, payload = {}) => getEngineeringIpc().prReviewResolve(event, payload));
 ipcMain.handle('engineering:pr-review:update-pr', (event, payload = {}) => getEngineeringIpc().prReviewUpdatePr(event, payload));
 ipcMain.handle('engineering:pr-audit:start', (event, payload = {}) => getEngineeringIpc().prAuditStart(event, payload));
+ipcMain.handle('engineering:pr-audit:tracking:list', (event, payload = {}) => getEngineeringIpc().prAuditTrackingList(event, payload));
+ipcMain.handle('engineering:pr-audit:tracking:get', (event, payload = {}) => getEngineeringIpc().prAuditTrackingGet(event, payload));
 ipcMain.handle('engineering:pr-audit:recheck:start', (event, payload = {}) => getEngineeringIpc().prAuditRecheckStart(event, payload));
 ipcMain.handle('engineering:pr-audit:recheck:list', (event, payload = {}) => getEngineeringIpc().prAuditRecheckList(event, payload));
 ipcMain.handle('engineering:pr-audit:recheck:get', (event, payload = {}) => getEngineeringIpc().prAuditRecheckGet(event, payload));

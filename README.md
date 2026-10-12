@@ -19,6 +19,7 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - **Phase D.18 AI 审查直接修复**：从同一报告选择 1–5 项原始发现，预览后生成隔离修复，手动复验并单独确认更新原 PR
 - **Phase D.19 修复后复审**：成功更新 PR 后手动逐项复审原问题，提供只读 AI 结论、固定提交依据、独立历史与过期提示
 - **Phase D.20 从复审继续修复**：选择仍存在或无法判断的问题，预览后生成下一轮隔离修复，单独确认更新 PR，再手动复审本轮问题
+- **Phase D.21 多轮修复追踪**：按原报告汇总问题、修复轮次与复审结论，显示提交、过期状态及历史关系，并跳转现有操作详情
 
 ## 开发
 
@@ -940,3 +941,14 @@ D18 或 D20 的 PR 更新核对成功后，在结果卡、修复详情或 PR 的
 - 支持 origin 同仓库 OPEN PR（含 Draft），使用当前 API/模型与 gh 登录；生成、更新、复验和再次复审均为独立动作，不自动评论、解决线程或合并。
 
 设计与实施记录见 [D20 spec](docs/superpowers/specs/2026-10-09-phase-d20-pr-audit-recheck-repair-design.md) 和 [D20 plan](docs/superpowers/plans/2026-10-09-phase-d20-pr-audit-recheck-repair.md)。离线桌面冒烟：`node scripts/smoke-pr-audit-recheck-repair.cjs`，覆盖真实 Electron、临时 Git、连续两轮修复及 1100×720 / 900×580 窗口。GitHub 与模型使用测试替身；真实 GitHub.com / Enterprise 和实际模型仍需在指定测试仓库验收。
+
+## Phase D.21：多轮修复追踪
+
+在 PR 详情的「多轮修复追踪」查看每份原始 AI 审查报告的问题列表，展开问题可进入相关修复轮次；工程中心也提供报告入口。每轮展示生成、复验、PR 交付和全部复审记录，并保留续修的父子关系与分支。
+
+- 每个问题显示最近完成的 AI 复审判断及对应提交。旧结论继续保留，已过期或当前性未核实的结论不计入当前已解决数量；未参与后续复审的问题可能仍需复审。
+- 刷新核对当前 PR。离线、历史缺失或存储降级时显示提示，仍可查看可用记录。失败、取消、中断与无改动的尝试保留在历史中。
+- 「查看原发现」「查看复审」「查看修复详情」「查看结果 / diff」跳转既有界面；后续操作由用户手动发起。追踪本身不调用模型、不推送、不修改人工状态，也不作为合并门禁。
+- 按原始报告独立追踪，不自动合并不同报告里的相似问题；沿用现有历史容量和加密存储，不新建追踪数据库。
+
+设计与实施记录见 [D21 spec](docs/superpowers/specs/2026-10-12-phase-d21-pr-audit-tracking-design.md) 和 [D21 plan](docs/superpowers/plans/2026-10-12-phase-d21-pr-audit-tracking.md)。独立面板冒烟：`node scripts/smoke-pr-audit-tracking-ui.cjs`；完整多轮桌面冒烟：`node scripts/smoke-pr-audit-tracking.cjs`，两者均已通过。前者使用真实 Electron 和受控历史替身，后者还使用真实临时 Git；全量回归及失败用例复验结果见实施记录。

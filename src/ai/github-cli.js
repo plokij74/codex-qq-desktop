@@ -509,13 +509,15 @@ function createGithubCli(opts = {}) {
     return { ok: true, remote, repoKey: repositoryKey(remote.host, remote.nameWithOwner) };
   }
 
-  async function getCiWatchRepository({ projectPath, signal, timeoutMs: queryTimeout, getHostCooldownMs }) {
+  async function getCiWatchRepository({ projectPath, signal, timeoutMs: queryTimeout, getHostCooldownMs, localOnly = false }) {
     const top = await git(projectPath, ['rev-parse', '--show-toplevel'], { signal, timeoutMs: queryTimeout });
     if (!top.ok || !top.stdout) return { ok: false, code: 'CI_WATCH_REPOSITORY_INVALID' };
     const repoRoot = path.resolve(top.stdout.trim());
     const origin = await getCiWatchOrigin({ repoRoot, signal, timeoutMs: queryTimeout });
     if (!origin.ok) return origin;
     const { host, owner, repo, nameWithOwner } = origin.remote;
+    // Tracking local history needs the origin identity even when GitHub is offline.
+    if (localOnly) return { ok: true, repository: { repoRoot, host, owner, repo, nameWithOwner, repoKey: origin.repoKey } };
     const cooldown = getHostCooldownMs?.(host);
     if (Number.isFinite(cooldown) && cooldown > 0) {
       return { ok: false, code: 'CI_WATCH_RATE_LIMITED', rateLimited: true, retryAfterMs: cooldown, host };

@@ -1971,6 +1971,14 @@ html, body {
   white-space: normal;
 }
 
+.pr-audit-tracking { margin: 10px 0; padding: 10px; border: 1px solid #a6bdd1; background: #f5faff; min-width: 0; }
+.pr-audit-tracking p, .pr-audit-tracking code, .pr-audit-tracking summary { overflow-wrap: anywhere; white-space: normal; }
+.pr-audit-tracking details { margin: 7px 0; padding: 7px; border: 1px solid #c9d9e6; background: #fff; }
+.pr-audit-tracking summary { cursor: pointer; }
+.pr-audit-tracking button { margin: 3px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.tracking-reports { display: flex; flex-wrap: wrap; max-height: 180px; overflow-y: auto; }
+.tracking-check { margin: 7px 0; padding: 6px; border-left: 3px solid #9bbbd5; }
+
 @media (max-width: 480px) {
   .field-row {
     grid-template-columns: minmax(0, 1fr);

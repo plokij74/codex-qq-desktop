@@ -24,6 +24,7 @@ if (!process.versions.electron) {
   const { DEFAULT_SETTINGS } = require('../src/ai/settings');
   const { runRecheck } = require('../src/ai/pr-audit-recheck-runtime');
   const followupMode = process.argv.includes('--recheck-repair');
+  const trackingMode = process.argv.includes('--tracking');
   const recheckMode = followupMode || process.argv.includes('--recheck');
 
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), followupMode ? 'codex-d20-smoke-' : 'codex-d18-smoke-'));
@@ -152,6 +153,8 @@ if (!process.versions.electron) {
     handlers.set(`engineering:pr-audit:${action}`, (event, payload) => engineering[method](event, payload));
   }
   handlers.set('engineering:pr-review:threads', (event, payload) => engineering.prReviewThreads(event, payload));
+  handlers.set('engineering:pr-audit:tracking:list', (event, payload) => engineering.prAuditTrackingList(event, payload));
+  handlers.set('engineering:pr-audit:tracking:get', (event, payload) => engineering.prAuditTrackingGet(event, payload));
   for (const [action, method] of [['list', 'repairList'], ['get', 'repairGet'], ['result', 'repairResult'], ['start', 'repairStart'], ['cancel', 'repairCancel'], ['validate', 'repairValidate']]) handlers.set(`engineering:repair:${action}`, (event, payload) => engineering[method](event, payload));
   for (const [action, method] of [['list', 'ciWatchList'], ['get', 'ciWatchGet'], ['start', 'ciWatchStart'], ['stop', 'ciWatchStop'], ['ack', 'ciWatchAck']]) handlers.set(`engineering:ci-watch:${action}`, (event, payload) => { if (action === 'start') state.watches++; return engineering[method](event, payload); });
   handlers.set('chat:approve', (event, payload) => ({ ok: engineering.resolveApproval(event, payload.approvalId, payload.decision) }));
@@ -312,6 +315,7 @@ if (!process.versions.electron) {
           for (const size of sizes) assert.ok(size.scroll <= size.width + 1, JSON.stringify(size));
         }
         if (followupMode) await require('./smoke-pr-audit-recheck-repair-flow.cjs')({ js, until, capture, win, engineering, state, git, root, localHead, beforeRefs, validationProfile });
+        if (trackingMode) await require('./smoke-pr-audit-tracking-flow.cjs')({ js, until, capture, win, state });
         win.setContentSize(900, 580);
         const originalGet = github.getAuditPr; github.getAuditPr = async () => ({ ...(await originalGet()), body: 'changed description' });
         await js("prAuditRecheckUi.refresh()"); await until("document.querySelector('[data-recheck-detail]')?.textContent.includes('结论已过期')");
@@ -347,6 +351,12 @@ if (!process.versions.electron) {
         assert.equal(await js("[...document.querySelectorAll('[data-recheck-repair-id]')].some(n=>n.checked)"), false);
         const final = engineering.prAuditRecheckManager.store.list().sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
         await js(`prAuditRecheckUi.select('${final.recheckRef}')`);
+        if (trackingMode) {
+          await js('prAuditTrackingUi.refresh()');
+          await until("document.querySelector('.tracking-detail')?.textContent.includes('完整轮次历史（3）')");
+          assert.equal(await js("document.querySelectorAll('[data-tracking-open^=finding-]').length"), 2);
+          await capture('tracking-after-reload-900x580');
+        }
       }
       if (recheckMode) {
         await js("prAuditRecheckUi.refresh()"); await until("document.querySelector('.pr-audit-recheck-findings')?.textContent.includes('AI 判断已解决')");

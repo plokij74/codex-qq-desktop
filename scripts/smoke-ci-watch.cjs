@@ -82,6 +82,7 @@ if (!process.versions.electron) {
   handlers.set('engineering:remote-ci:failures', () => ({ ok: true, failures: [], unsupported: [] }));
   handlers.set('engineering:pr-review:threads', (_event, payload) => ({ ok: true, prNumber: payload.prNumber, threads: [], total: 0, truncated: false }));
   handlers.set('engineering:pr-audit:list', () => ({ ok: true, audits: [], projectKey: repoKey }));
+  handlers.set('engineering:pr-audit:tracking:list', () => ({ ok: true, reports: [], projectKey: repoKey }));
   handlers.set('engineering:pr-audit:recheck:list', () => ({ ok: true, rechecks: [], deliveries: [], projectKey: repoKey }));
   for (const [channel, result] of [
     ['engineering:index:ensure', { ok: true, state: 'ready' }], ['engineering:index:status', { ok: true, state: 'ready' }],

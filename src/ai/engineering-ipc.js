@@ -14,6 +14,7 @@ const AuditState = require('./pr-audit-state');
 const { createPrAuditRepairManager } = require('./pr-audit-repair-manager');
 const { PrAuditRecheckManager } = require('./pr-audit-recheck-manager');
 const { PrAuditRecheckRepairManager } = require('./pr-audit-recheck-repair-manager');
+const { PrAuditTracking } = require('./pr-audit-tracking');
 const { createRemoteCiStore } = require('./remote-ci-store');
 const { createGithubCli } = require('./github-cli');
 const { createCiWatchManager } = require('./ci-watch-manager');
@@ -205,6 +206,11 @@ function createEngineeringIpcHandlers(options = {}) {
       return result;
     } catch (cause) { return AuditState.error(cause); }
     finally { if (!retained) release(); }
+  }
+
+  function getPrAuditTracking() {
+    return new PrAuditTracking({ audits: getPrAudits(), auditRepairs: getPrAuditRepairs(),
+      followups: getPrAuditRecheckRepairs(), rechecks: getPrAuditRechecks(), repairs: getRepairs(), worktree: options.worktreeManager });
   }
 
   async function reviewRequest(event, payload, fields, fn, mutation = false) {
@@ -482,6 +488,8 @@ function createEngineeringIpcHandlers(options = {}) {
   }
 
   return {
+    prAuditTrackingList: (event, payload) => auditRequest(event, payload, ['prNumber'], (_m, b, c) => getPrAuditTracking().list(b.projectPath, payload.prNumber, c)),
+    prAuditTrackingGet: (event, payload) => auditRequest(event, payload, ['auditRef'], (_m, b, c) => getPrAuditTracking().get(b.projectPath, payload.auditRef, c)),
     prAuditRecheckStart: (event, payload) => auditRequest(event, payload, ['resultId'], async (_m, b, c) => {
       await refreshAuditRepairProtection(b.projectPath);
       return getPrAuditRechecks().start(b.projectPath, payload.resultId, c);

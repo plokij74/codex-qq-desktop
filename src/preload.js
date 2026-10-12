@@ -208,6 +208,8 @@ contextBridge.exposeInMainWorld('codex', {
   resolvePrReview: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:resolve', { projectBindingId: payload?.projectBindingId, threadRef: payload?.threadRef, revision: payload?.revision }),
   updatePrReviewPr: (payload = {}) => ipcRenderer.invoke('engineering:pr-review:update-pr', { projectBindingId: payload?.projectBindingId, resultId: payload?.resultId, subject: payload?.subject }),
   startPrAudit: (payload = {}) => ipcRenderer.invoke('engineering:pr-audit:start', { projectBindingId: payload?.projectBindingId, prNumber: payload?.prNumber, note: payload?.note }),
+  listPrAuditTracking: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:tracking:list', { projectBindingId: p?.projectBindingId, prNumber: p?.prNumber }),
+  getPrAuditTracking: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:tracking:get', { projectBindingId: p?.projectBindingId, auditRef: p?.auditRef }),
   startPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:start', { projectBindingId: p?.projectBindingId, resultId: p?.resultId }),
   listPrAuditRechecks: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:list', { projectBindingId: p?.projectBindingId, prNumber: p?.prNumber }),
   getPrAuditRecheck: (p = {}) => ipcRenderer.invoke('engineering:pr-audit:recheck:get', { projectBindingId: p?.projectBindingId, recheckRef: p?.recheckRef }),

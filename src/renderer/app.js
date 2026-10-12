@@ -46,6 +46,7 @@ let ciWatchUi = null;
 let prReviewUi = null;
 let prAuditUi = null;
 let prAuditRecheckUi = null;
+let prAuditTrackingUi = null;
 const pullRequestDrafts = new Map();
 let pullRequestForm = null;
 const worktreePreviews = new Map();
@@ -1428,6 +1429,7 @@ async function worktreeAction(session, ref, action) {
       response = await update({ projectBindingId: token, resultId: ref.id, subject });
       if (response?.result) updateWorktreeRef(session, { ...response.result, projectId: project.id, sessionId: ref.sessionId });
       if (response?.ok) toast(['pr_audit', 'pr_audit_recheck'].includes(ref.originKind) ? 'PR 已更新，可手动复审本次修复或跟踪 CI' : 'PR 已更新，可点击「跟踪 CI」观察新提交');
+      void prAuditTrackingUi?.refresh();
     } else if (action === 'createPr') {
       const method = ref.canRetryPr ? window.codex.retryWorktreePr : window.codex.createWorktreePr;
       response = await method({ projectBindingId: token, resultId: ref.id, title: prTitle, body: prBody, draft: true, ...workflowGatePayload(project, 'create_pr', gateScope) });
@@ -2527,6 +2529,8 @@ async function renderEngineeringCenter() {
   prAuditUi?.mountCenter(document.getElementById('engineering-pr-audits'), sessionProject()?.id);
   body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div id="engineering-pr-rechecks"></div></section>');
   prAuditRecheckUi?.mount(document.getElementById('engineering-pr-rechecks'), { projectId: sessionProject()?.id });
+  body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div id="engineering-pr-tracking"></div></section>');
+  prAuditTrackingUi?.mount(document.getElementById('engineering-pr-tracking'), { projectId: sessionProject()?.id });
   body.insertAdjacentHTML('afterbegin', '<section class="engineering-section"><div class="work-card-title">CI 跟踪</div><div id="engineering-ci-watches"></div></section>');
   ciWatchUi?.mountCenter(document.getElementById('engineering-ci-watches'), sessionProject()?.id);
   document.getElementById('engineering-index-rebuild')?.addEventListener('click', async () => { const result = await window.codex.engineeringIndexRebuild({ projectBindingId: token }); if (!result?.ok) toast(result?.error || '索引重建失败'); await refresh(); });
@@ -2962,6 +2966,7 @@ async function deleteProject(id) {
   prReviewUi?.forgetProject(id);
   prAuditUi?.forgetProject(id);
   prAuditRecheckUi?.forgetProject(id);
+  prAuditTrackingUi?.forgetProject(id);
   for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
   if (worktreeBindingId) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
@@ -2997,6 +3002,7 @@ async function bindProjectPath(id) {
     prReviewUi?.forgetProject(id);
     prAuditUi?.forgetProject(id);
     prAuditRecheckUi?.forgetProject(id);
+    prAuditTrackingUi?.forgetProject(id);
     for (const [key, value] of pullRequestDrafts) if (value.projectId === id) pullRequestDrafts.delete(key);
     pullRequestForm = null;
     resetPullRequestView(null);
@@ -3427,6 +3433,7 @@ function setView(view) {
   capturePullRequestDraft();
   if (view !== 'prs') { pullRequestForm = null; prReviewUi?.unmount(); prAuditUi?.unmount(); }
   prAuditRecheckUi?.unmount();
+  prAuditTrackingUi?.unmount();
   currentView = view;
   document.querySelectorAll('#main-toolbar .tb-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
   document.querySelectorAll('#left-nav .nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
@@ -3609,6 +3616,7 @@ function renderPullRequestView() {
       </section>
       <div id="pr-audit-panel"></div>
       <div id="pr-audit-recheck-panel"></div>
+      <div id="pr-audit-tracking-panel"></div>
       <div id="pr-review-panel"></div>
       <section class="pr-detail-section"><h2>文件${pr.filesTruncated ? '（前 200 条）' : ''}</h2><ul class="pr-file-list">${filesHtml}</ul></section>
       <section class="pr-detail-section"><h2>评论${pr.commentsTruncated ? '（前 50 条）' : ''}</h2>${commentsHtml}
@@ -3636,6 +3644,7 @@ function renderPullRequestView() {
   ciWatchUi?.mountPr(document.getElementById('pr-ci-watch'), { projectId: project.id, prNumber: pr?.number, state: pr?.state });
   prAuditUi?.mountPr(document.getElementById('pr-audit-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha, profiles: pullRequestView.remoteProfiles });
   prAuditRecheckUi?.mount(document.getElementById('pr-audit-recheck-panel'), { projectId: project.id, prNumber: pr?.number });
+  prAuditTrackingUi?.mount(document.getElementById('pr-audit-tracking-panel'), { projectId: project.id, prNumber: pr?.number });
   prReviewUi?.mountPr(document.getElementById('pr-review-panel'), { projectId: project.id, prNumber: pr?.number, state: pr?.state, headSha: pr?.headSha, profiles: pullRequestView.remoteProfiles });
   if (pr) {
     const fields = { title: body.querySelector('.pr-edit-title'), body: body.querySelector('.pr-edit-body'), comment: body.querySelector('.pr-comment-input'), merge: body.querySelector('.pr-merge-method') };
@@ -5805,8 +5814,44 @@ function boot() {
     openRepair: openEngineeringRepair,
     isVisible: (id, prNumber) => sessionProject()?.id === id && (prNumber ? currentView === 'prs' && pullRequestView.detail?.number === prNumber : currentView === 'scheduled'),
   });
+  prAuditTrackingUi = window.PrAuditTrackingUi?.create({ api: window.codex, document, getProject,
+    getToken: (id) => worktreeBindings.get(id), openRepair: openEngineeringRepair,
+    isVisible: (id, number) => sessionProject()?.id === id && (number ? currentView === 'prs' && pullRequestView.detail?.number === number : currentView === 'scheduled'),
+    openOriginal: async ({ auditRef, findingId }) => {
+      if (await prAuditUi?.select(auditRef)) {
+        prAuditUi?.focusFindings([findingId]);
+        document.getElementById('pr-audit-panel')?.scrollIntoView({ block: 'start' });
+      }
+    },
+    openRecheck: async ({ recheckRef }) => {
+      if (await prAuditRecheckUi?.select(recheckRef)) document.getElementById('pr-audit-recheck-panel')?.scrollIntoView({ block: 'start' });
+    },
+    openResult: async ({ projectId, resultId }) => {
+      const project = getProject(projectId); const token = worktreeBindings.get(projectId); const projectPath = project?.path;
+      const number = pullRequestView.detail?.number;
+      await reconcileWorktreeResults(project);
+      if (getProject(projectId)?.path !== projectPath || worktreeBindings.get(projectId) !== token || sessionProject()?.id !== projectId
+        || currentView !== 'prs' || pullRequestView.detail?.number !== number) return;
+      setView('chat'); renderMessages();
+      const card = document.querySelector(`.worktree-result-card[data-result-id="${CSS.escape(resultId)}"]`);
+      if (card) { card.scrollIntoView({ block: 'center' }); card.querySelector('button')?.focus(); }
+      else toast('结果卡暂不可用，可从修复详情查看结果引用。');
+    },
+    navigateToPr: async ({ projectId, prNumber, auditRef }) => {
+      const projectPath = getProject(projectId)?.path; const token = worktreeBindings.get(projectId);
+      if (!projectPath || !token) return false;
+      if (sessionProject()?.id !== projectId) openProjectChat(projectId);
+      resetPullRequestView(sessionProject()); pullRequestView.selectedNumber = prNumber; pullRequestView.resultId = '';
+      setView('prs'); await loadPullRequestDetail(prNumber);
+      if (getProject(projectId)?.path !== projectPath || worktreeBindings.get(projectId) !== token || sessionProject()?.id !== projectId
+        || currentView !== 'prs' || pullRequestView.detail?.number !== prNumber) return false;
+      await prAuditTrackingUi?.refresh();
+      if (await prAuditTrackingUi?.select(auditRef)) document.getElementById('pr-audit-tracking-panel')?.scrollIntoView({ block: 'start' });
+      return true;
+    },
+  });
   const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);
-  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); prAuditRecheckUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
+  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); prAuditRecheckUi?.close(); prAuditTrackingUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
   renderEmojiPanel();
   bindEvents();
   bindTerminalPanel();
