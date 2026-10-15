@@ -952,3 +952,11 @@ D18 或 D20 的 PR 更新核对成功后，在结果卡、修复详情或 PR 的
 - 按原始报告独立追踪，不自动合并不同报告里的相似问题；沿用现有历史容量和加密存储，不新建追踪数据库。
 
 设计与实施记录见 [D21 spec](docs/superpowers/specs/2026-10-12-phase-d21-pr-audit-tracking-design.md) 和 [D21 plan](docs/superpowers/plans/2026-10-12-phase-d21-pr-audit-tracking.md)。独立面板冒烟：`node scripts/smoke-pr-audit-tracking-ui.cjs`；完整多轮桌面冒烟：`node scripts/smoke-pr-audit-tracking.cjs`，两者均已通过。前者使用真实 Electron 和受控历史替身，后者还使用真实临时 Git；全量回归及失败用例复验结果见实施记录。
+
+## Phase E：全功能补齐规划（尚未实施）
+
+[Phase E 总规划：E1–E27](<docs/superpowers/plans/2026-10-15-phase-e-product-readiness.md>) 按依赖顺序安排本次审计的 43 项缺失、部分实现和展示不实问题，**不排具体日期**。
+
+覆盖基础断点、Plan/消息、附件/多模态、隔离/PTY/后台任务、会话恢复、语义检索、多 Agent、MCP/Skills、调度、PR/CI、真实插件与市场、自动修复、桌面生命周期、同步和通信。每个阶段都包含前置条件、具体交付与验收标准；隐藏或标记演示只算止血，不算功能完成。
+
+**当前只完成规划，E1–E27 均未实施。** 真实外部资源或平台能力未就绪的条目保留为阻断，不用模拟结果代替验收。

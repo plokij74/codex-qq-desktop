@@ -2,7 +2,7 @@
 const STORAGE_KEY = 'codex-qq-state-v2';
 const TERM_COLLAPSED_KEY = 'codex-qq-term-collapsed';
 const SEED_KV = [
-  '结构确认没问题：','',
+  '【示例】结构确认没问题：','',
   '- `redeem_codes`、`push_tokens` 与 migration 一致。',
   '- `android_subscriptions` 多了 `free_trial` 字段，这是后续的增量字段，不影响 baseline。',
   '- `d1_migrations` 已存在，但缺少历史记录。','',
@@ -35,8 +35,8 @@ const SCHEDULED = [
 ];
 const FRIENDS = [
   { id: 'codex', name: 'Codex 小蓝', avatar: '🤖', status: '在线', kind: 'bot' },
-  { id: 'randy', name: 'Randy Lu', avatar: '🧑', status: '在线', kind: 'user' },
-  { id: 'maya', name: 'Maya', avatar: '👧', status: '离开', kind: 'user' },
+  { id: 'randy', name: 'Randy Lu（示例）', avatar: '🧑', status: '模拟', kind: 'user' },
+  { id: 'maya', name: 'Maya（示例）', avatar: '👧', status: '模拟', kind: 'user' },
 ];
 let sessions = [];
 let projects = [];
@@ -830,9 +830,9 @@ function defaultProjects() {
 }
 function defaultSessions() {
   return [
-    { id: 'task_kv', title: '优化 KV 读写成本', kind: 'task', peer: 'codex', projectId: null, pinned: true, agentMode: 'agent', messages: [{ role: 'assistant', content: SEED_KV }], updatedAt: Date.now() },
-    { id: 'task_wechat', title: '微信发送 hello world', kind: 'task', peer: 'codex', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '这个任务可以拆成：\n\n1. 确认接口\n2. 写最小发送脚本\n3. 配 token\n\n把代码或报错贴过来。' }], updatedAt: Date.now() - 1000 },
-    { id: 'chat_randy', title: 'Randy Lu', kind: 'friend', peer: 'randy', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '（模拟好友）在的，有事直接说。' }], updatedAt: Date.now() - 2000 },
+    { id: 'task_kv', title: '【示例】优化 KV 读写成本', kind: 'task', peer: 'codex', projectId: null, pinned: true, agentMode: 'agent', messages: [{ role: 'assistant', content: SEED_KV }], updatedAt: Date.now() },
+    { id: 'task_wechat', title: '【示例】微信发送 hello world', kind: 'task', peer: 'codex', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '这个任务可以拆成：\n\n1. 确认接口\n2. 写最小发送脚本\n3. 配 token\n\n把代码或报错贴过来。' }], updatedAt: Date.now() - 1000 },
+    { id: 'chat_randy', title: 'Randy Lu（示例）', kind: 'friend', peer: 'randy', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '（模拟好友：真实通信待 E26 接入）在的，有事直接说。' }], updatedAt: Date.now() - 2000 },
   ];
 }
 function loadState() {
@@ -858,15 +858,24 @@ function loadState() {
       : defaultSessions();
     sessions.forEach(ensureSessionCandidateState);
     sessions.forEach(ensureSessionWorktreeState);
-    projects = Array.isArray(data.projects) && data.projects.length ? data.projects : defaultProjects();
+    projects = Array.isArray(data.projects) ? data.projects : defaultProjects();
     activeSessionId = data.activeSessionId && sessions.some((s) => s.id === data.activeSessionId) ? data.activeSessionId : sessions[0].id;
     if (data.pluginState) pluginState = { ...pluginState, ...data.pluginState };
-  } catch {
+  } catch (err) {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('codex-qq-sessions-v1');
+      if (raw) {
+        localStorage.setItem(`codex-qq-corrupted-${Date.now()}`, raw);
+      }
+    } catch { /* ignore backup failure */ }
     sessions = defaultSessions();
     sessions.forEach(ensureSessionCandidateState);
     sessions.forEach(ensureSessionWorktreeState);
     projects = defaultProjects();
     activeSessionId = sessions[0].id;
+    setTimeout(() => {
+      toast('本地存储数据异常，已自动备份原数据并加载默认配置', 5000);
+    }, 100);
   }
 }
 function saveState() {
@@ -3486,17 +3495,44 @@ function openTaskModal() {
   setTimeout(() => document.getElementById('task-title').focus(), 50);
 }
 function closeTaskModal() { document.getElementById('task-modal').classList.add('hidden'); }
+let taskModalSubmitting = false;
 function createTaskFromModal() {
+  if (taskModalSubmitting) return;
   const title = document.getElementById('task-title').value.trim();
   const brief = document.getElementById('task-brief').value.trim();
   if (!title) return toast('请填写任务标题');
-  const session = {
-    id: uid('task'), title, kind: 'task', peer: 'codex', projectId: sessionProject()?.id || null, pinned: false,
-    agentMode: defaultAgentModeSeed,
-    messages: [{ role: 'assistant', content: '新任务「' + title + '」已创建。' + (brief ? ('\n\n说明：' + brief + '\n\n') : '\n\n') + '继续补充细节即可。' }], updatedAt: Date.now(),
-  };
-  sessions.unshift(session); activeSessionId = session.id; saveState(); closeTaskModal(); setView('chat'); updateAgentModeToggle(); toast('任务已创建');
-  if (brief) document.getElementById('chat-input').value = brief;
+
+  if (brief && (sending || chatRun)) {
+    return toast('当前有正在执行的生成任务，请等待完成后再开始新任务');
+  }
+
+  taskModalSubmitting = true;
+  const okBtn = document.getElementById('btn-task-ok');
+  if (okBtn) okBtn.disabled = true;
+
+  try {
+    const session = {
+      id: uid('task'), title, kind: 'task', peer: 'codex', projectId: sessionProject()?.id || null, pinned: false,
+      agentMode: defaultAgentModeSeed,
+      messages: [{ role: 'assistant', content: '新任务「' + title + '」已创建。' + (brief ? ('\n\n说明：' + brief + '\n\n') : '\n\n') + '继续补充细节即可。' }], updatedAt: Date.now(),
+    };
+    sessions.unshift(session); activeSessionId = session.id; saveState(); closeTaskModal(); setView('chat'); updateAgentModeToggle();
+    if (brief) {
+      document.getElementById('chat-input').value = brief;
+      toast('任务已创建并开始执行');
+      sendMessage();
+    } else {
+      toast('已创建任务草稿，可在下方输入说明后发送开始');
+      document.getElementById('chat-input').focus();
+    }
+    document.getElementById('task-title').value = '';
+    document.getElementById('task-brief').value = '';
+  } catch (err) {
+    toast('创建任务失败：' + (err.message || String(err)));
+  } finally {
+    taskModalSubmitting = false;
+    if (okBtn) okBtn.disabled = false;
+  }
 }
 
 function resetPullRequestView(project) {
@@ -3978,13 +4014,18 @@ function showWorkView(view) {
     return renderEngineeringCenter().catch(() => {});
   }
   if (view === 'plugins') {
-    body.innerHTML = '<div class="card-list">' + PLUGINS.map((p) => '<div class="work-card"><div class="work-card-title">🧩 ' + escapeHtml(p.name) + '</div><div class="work-card-meta">' + escapeHtml(p.desc) + '</div><label class="switch-row"><input type="checkbox" data-plugin="' + p.id + '" ' + (pluginState[p.id] ? 'checked' : '') + '/><span>' + (pluginState[p.id] ? '已启用' : '已禁用') + '</span></label></div>').join('') + '</div>';
-    body.querySelectorAll('[data-plugin]').forEach((input) => input.addEventListener('change', () => { pluginState[input.dataset.plugin] = input.checked; saveState(); input.parentElement.querySelector('span').textContent = input.checked ? '已启用' : '已禁用'; toast((input.checked ? '启用' : '禁用') + '插件成功'); }));
+    body.innerHTML = '<div class="notice-bar" style="margin-bottom:12px;padding:8px 12px;background:var(--bg-subtle, #f3f4f6);border-radius:6px;font-size:12px;color:var(--text-muted, #6b7280);">ℹ️ 插件后端运行时尚未接通（待 E21 实现），当前开关仅作为本地配置预览。</div><div class="card-list">' + PLUGINS.map((p) => '<div class="work-card"><div class="work-card-title">🧩 ' + escapeHtml(p.name) + '</div><div class="work-card-meta">' + escapeHtml(p.desc) + '</div><label class="switch-row"><input type="checkbox" data-plugin="' + p.id + '" ' + (pluginState[p.id] ? 'checked' : '') + '/><span>' + (pluginState[p.id] ? '已配置开启' : '已配置关闭') + '</span></label></div>').join('') + '</div>';
+    body.querySelectorAll('[data-plugin]').forEach((input) => input.addEventListener('change', () => {
+      pluginState[input.dataset.plugin] = input.checked;
+      saveState();
+      input.parentElement.querySelector('span').textContent = input.checked ? '已配置开启' : '已配置关闭';
+      toast((input.checked ? '开启' : '关闭') + '配置成功（注意：插件后端运行时待 E21 接入）');
+    }));
   }
   if (view === 'sites') {
-    body.innerHTML = '<div class="card-list">' + SITES.map((s) => '<div class="work-card"><div class="work-card-title">🌐 ' + escapeHtml(s.name) + '</div><div class="work-card-meta"><span class="badge ' + s.status + '">' + s.status + '</span> · ' + escapeHtml(s.url) + '</div><div class="work-card-actions"><button type="button" class="ghost-btn" data-site-open="' + s.id + '">复制 URL</button><button type="button" class="ghost-btn" data-site-chat="' + s.id + '">问 Codex</button></div></div>').join('') + '</div>';
+    body.innerHTML = '<div class="notice-bar" style="margin-bottom:12px;padding:8px 12px;background:var(--bg-subtle, #f3f4f6);border-radius:6px;font-size:12px;color:var(--text-muted, #6b7280);">ℹ️ 示例监控站点（未接入持续健康监测，真实监控待 E8/E18 实现）。</div><div class="card-list">' + SITES.map((s) => '<div class="work-card"><div class="work-card-title">🌐 ' + escapeHtml(s.name) + '</div><div class="work-card-meta"><span class="badge neutral">示例配置</span> · ' + escapeHtml(s.url) + '</div><div class="work-card-actions"><button type="button" class="ghost-btn" data-site-open="' + s.id + '">复制 URL</button><button type="button" class="ghost-btn" data-site-chat="' + s.id + '">问 Codex</button></div></div>').join('') + '</div>';
     body.querySelectorAll('[data-site-open]').forEach((btn) => btn.addEventListener('click', async () => { const s = SITES.find((x) => x.id === btn.dataset.siteOpen); try { await navigator.clipboard.writeText(s.url); toast('已复制 URL'); } catch { toast(s.url, 4000); } }));
-    body.querySelectorAll('[data-site-chat]').forEach((btn) => { const s = SITES.find((x) => x.id === btn.dataset.siteChat); btn.addEventListener('click', () => ensureTaskAndAsk('站点 ' + s.name, '站点 ' + s.name + '（' + s.url + '）状态 ' + s.status + '，给出巡检清单。')); });
+    body.querySelectorAll('[data-site-chat]').forEach((btn) => { const s = SITES.find((x) => x.id === btn.dataset.siteChat); btn.addEventListener('click', () => ensureTaskAndAsk('站点 ' + s.name, '站点 ' + s.name + '（' + s.url + '）巡检与配置分析。')); });
   }
   if (view === 'prs') {
     renderPullRequestView();
@@ -4233,13 +4274,22 @@ function readFileAsDataUrl(file) {
 }
 async function handleFiles(fileList, asImage) {
   const files = Array.from(fileList || []);
+  let hasNonImage = false;
   for (const file of files) {
     if (asImage || file.type.startsWith('image/')) {
       if (file.size > 2 * 1024 * 1024) { toast('图片过大（>2MB）：' + file.name); continue; }
       pendingAttaches.push({ name: file.name, type: file.type || 'image/*', dataUrl: await readFileAsDataUrl(file) });
-    } else pendingAttaches.push({ name: file.name, type: file.type || 'file', size: file.size });
+    } else {
+      hasNonImage = true;
+      pendingAttaches.push({ name: file.name, type: file.type || 'file', size: file.size });
+    }
   }
-  renderAttachPreview(); toast('已添加 ' + files.length + ' 个附件');
+  renderAttachPreview();
+  if (hasNonImage) {
+    toast('已添加附件。注意：当前版本仅记录元数据，模型暂无法直接读取非图片文件内容（待 E5/E7 实现完整解析）', 5000);
+  } else {
+    toast('已添加 ' + files.length + ' 个附件');
+  }
 }
 function buildOutgoingText(raw) {
   let text = raw.trim();
@@ -4303,6 +4353,8 @@ function handleSlashCommand(text) {
     saveState(); renderMessages(); return true;
   }
   if (lower === '/clear') { clearCurrentChat(); return true; }
+  if (lower === '/mcp-prompts' || lower.startsWith('/mcp-prompts ')) return handleMcpPromptsListCommand(cmd);
+  if (lower === '/mcp-prompt' || lower.startsWith('/mcp-prompt ')) return handleMcpPromptGetCommand(cmd);
   if (lower === '/mode') {
     updateStatusBar().then(() => { activeSession().messages.push({ role: 'assistant', content: '状态：' + document.getElementById('status-left').textContent + ' / ' + document.getElementById('status-mid').textContent }); saveState(); renderMessages(); });
     return true;
@@ -4600,8 +4652,6 @@ function cloneMcpOAuth(raw) {
     const value = String(raw[key] || '').trim();
     if (value) out[key] = value;
   }
-  if (lower === '/mcp-prompts' || lower.startsWith('/mcp-prompts ')) return handleMcpPromptsListCommand(cmd);
-  if (lower === '/mcp-prompt' || lower.startsWith('/mcp-prompt ')) return handleMcpPromptGetCommand(cmd);
   if (Array.isArray(raw.scopes)) {
     const scopes = raw.scopes.map((value) => String(value || '').trim()).filter(Boolean);
     if (scopes.length) out.scopes = [...new Set(scopes)].slice(0, 32);
@@ -5166,7 +5216,7 @@ async function openSettings() {
   const ae = document.getElementById('set-agent-enabled');
   if (ae) ae.checked = settings.agentEnabled !== false;
   const at = document.getElementById('set-agent-turns');
-  if (at) at.value = settings.maxAgentTurns || 8;
+  if (at) at.value = settings.maxAgentTurns ?? 8;
   const te = document.getElementById('set-terminal-enabled');
   if (te) te.checked = Boolean(settings.terminalEnabled);
   const tc = document.getElementById('set-terminal-confirm');
@@ -5428,13 +5478,15 @@ async function refreshUsageSummaryBox() {
 }
 async function saveSettingsFromForm() {
   const mcpServers = serializeMcpServerList();
+  const turnsRaw = document.getElementById('set-agent-turns')?.value?.trim();
+  const maxAgentTurns = turnsRaw === '' ? 8 : (Number.isFinite(Number(turnsRaw)) && Number(turnsRaw) >= 0 ? Number(turnsRaw) : 8);
   const partial = {
     mode: document.getElementById('set-mode').value,
     baseUrl: document.getElementById('set-base-url').value.trim(),
     model: document.getElementById('set-model').value.trim(),
     permissionMode: document.getElementById('set-permission-mode')?.value || 'confirm-writes',
     agentEnabled: document.getElementById('set-agent-enabled')?.checked !== false,
-    maxAgentTurns: Number(document.getElementById('set-agent-turns')?.value || 8),
+    maxAgentTurns,
     terminalEnabled: Boolean(document.getElementById('set-terminal-enabled')?.checked),
     terminalRequireConfirm: document.getElementById('set-terminal-confirm')?.checked !== false,
     codeIndexEnabled: document.getElementById('set-code-index-enabled')?.checked !== false,
