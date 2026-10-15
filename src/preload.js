@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('codex', {
   approveChat: (payload) => ipcRenderer.invoke('chat:approve', payload),
   approvePlan: (payload) => ipcRenderer.invoke('chat:approvePlan', payload),
   rejectPlan: (payload) => ipcRenderer.invoke('chat:rejectPlan', payload),
+  getPendingPlan: (payload) => ipcRenderer.invoke('chat:getPendingPlan', payload),
   selectDirectory: () => ipcRenderer.invoke('dialog:selectDirectory'),
   openPath: (p) => ipcRenderer.invoke('shell:openPath', p),
   listTree: (projectPath) => ipcRenderer.invoke('project:listTree', projectPath),

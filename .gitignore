@@ -10,3 +10,5 @@ fetch-meta.js
 run-npm-install.ps1
 .DS_Store
 .idea/
+*.tmp
+

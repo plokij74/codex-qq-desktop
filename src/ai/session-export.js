@@ -7,6 +7,8 @@
  * to whatever path the user picked in the save dialog.
  */
 
+const { projectToStorageJson, normalizeMessage, PART_TYPES } = require('./message-schema');
+
 /** Keys never written to an export, at any nesting depth. */
 const SECRET_KEYS = new Set(['apikey', 'authorization', 'token', 'password', 'secret', 'accesstoken', 'refreshtoken']);
 
@@ -48,23 +50,49 @@ function exportSessionMarkdown(session) {
   lines.push('');
   lines.push('---');
 
-  messages.forEach((m, i) => {
-    const who = roleLabel(m?.role);
+  messages.forEach((rawMsg, i) => {
+    const norm = normalizeMessage(rawMsg);
+    const who = roleLabel(norm.role);
     const marks = [];
-    if (m?.compact) marks.push(`摘要（已压缩 ${m.compactedCount ?? 0} 条）`);
-    if (m?.error) marks.push('错误');
+    if (norm.compact) marks.push(`摘要（已压缩 ${norm.compactedCount ?? 0} 条）`);
+    if (norm.error) marks.push('错误');
     lines.push('');
     lines.push(`### ${i + 1} · ${who}${marks.length ? ' · ' + marks.join(' · ') : ''}`);
     lines.push('');
-    lines.push(String(m?.content ?? ''));
-    if (m?.tool) {
-      lines.push('');
-      lines.push(`- 工具 \`${String(m.tool)}\`：${String(m.toolSummary ?? '').slice(0, 500)}`);
+    lines.push(String(norm.content ?? ''));
+
+    // Plan parts
+    for (const part of norm.parts || []) {
+      if (part.type === PART_TYPES.PLAN && part.markdown) {
+        lines.push('');
+        lines.push(`#### 实施计划：${part.title || '实施计划'} [状态: ${part.status || 'proposed'}]`);
+        lines.push(part.markdown);
+      } else if (part.type === PART_TYPES.ATTACHMENT_REF) {
+        lines.push('');
+        lines.push(`- 📎 附件：${part.name} (${part.mimeType || 'file'}, ${part.size || 0} 字节)`);
+      }
     }
-    if (Array.isArray(m?.fileChanges) && m.fileChanges.length) {
+
+    // Trajectory
+    if (Array.isArray(norm.trajectory) && norm.trajectory.length) {
       lines.push('');
-      for (const fc of m.fileChanges) {
-        lines.push(`- 文件改动：${String(fc?.path ?? fc ?? '')}`);
+      lines.push('#### 执行轨迹');
+      for (const t of norm.trajectory) {
+        if (t.tool) lines.push(`- 工具 \`${t.tool}\`：${t.argsSummary || ''} (${t.status || 'done'})`);
+        else if (t.kind === 'verify') lines.push(`- 校验：${t.passed ? '通过' : '未通过'}`);
+        else if (t.subagentId) lines.push(`- 子代理 [${t.kindName || 'explore'}]：${t.goal || ''}`);
+        else if (t.kind === 'file_change') lines.push(`- 文件改动：${t.path} (${t.op})`);
+      }
+    } else {
+      if (rawMsg?.tool) {
+        lines.push('');
+        lines.push(`- 工具 \`${String(rawMsg.tool)}\`：${String(rawMsg.toolSummary ?? '').slice(0, 500)}`);
+      }
+      if (Array.isArray(rawMsg?.fileChanges) && rawMsg.fileChanges.length) {
+        lines.push('');
+        for (const fc of rawMsg.fileChanges) {
+          lines.push(`- 文件改动：${String(fc?.path ?? fc ?? '')}`);
+        }
       }
     }
   });
@@ -85,7 +113,7 @@ function exportSessionJson(session) {
     pinned: s.pinned === true,
     createdAt: s.createdAt ?? null,
     updatedAt: s.updatedAt ?? null,
-    messages: sessionMessages(s),
+    messages: sessionMessages(s).map(projectToStorageJson),
   });
   return JSON.stringify(
     { version: 1, exportedAt: new Date().toISOString(), session: safe },

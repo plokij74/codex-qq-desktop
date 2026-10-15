@@ -1409,6 +1409,73 @@ html, body {
   font-size: 11px;
   color: #567;
 }
+.plan-card .plan-result-approved {
+  color: #2b743a;
+  font-weight: 600;
+}
+.plan-card .plan-result-rejected {
+  color: #a04040;
+  font-weight: 600;
+}
+.plan-card .plan-result-superseded {
+  color: #788;
+  font-style: italic;
+}
+
+/* Trajectory collapse */
+.trajectory-details {
+  margin: 6px 0 2px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: #fcfdfe;
+  font-size: 11px;
+}
+.trajectory-summary {
+  padding: 4px 8px;
+  cursor: pointer;
+  color: #57606a;
+  font-weight: 500;
+  user-select: none;
+}
+.trajectory-summary:hover {
+  color: #0969da;
+}
+.trajectory-body {
+  padding: 4px 8px;
+  border-top: 1px dashed #e1e4e8;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.trajectory-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  line-height: 1.4;
+  color: #333;
+}
+.trajectory-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.trajectory-text code {
+  background: #f0f3f6;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+
+/* Attachment badge */
+.msg-attachment-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  margin: 2px 4px 4px 0;
+  border-radius: 3px;
+  border: 1px solid #c8d8ea;
+  background: #f0f6ff;
+  font-size: 11px;
+  color: #21568b;
+}
 
 /* Verify strip */
 .verify-strip {

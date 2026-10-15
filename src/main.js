@@ -61,6 +61,11 @@ const {
   defaultExportFilename,
 } = require('./ai/session-export');
 const {
+  projectToModelMessages,
+  createMessageV2,
+  PLAN_STATUS,
+} = require('./ai/message-schema');
+const {
   memoryList,
   memoryAdd,
   memoryDelete,
@@ -87,32 +92,15 @@ const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
 
 /**
- * Clone messages for the model; expand @refs on the last user message only.
- * Renderer history keeps the original text (not this expanded copy).
+ * Canonical model projection: project versioned messages for LLM completion;
+ * expand @refs on the last user message only.
+ * Renderer history keeps the original text/parts (not this expanded copy).
  */
 function messagesForModel(messages, projectPath) {
-  const out = (Array.isArray(messages) ? messages : []).map((m) => ({
-    role: m.role,
-    content: String(m.content || ''),
-  }));
-  if (!projectPath) return out;
-  for (let i = out.length - 1; i >= 0; i -= 1) {
-    if (out[i].role !== 'user') continue;
-    const userText = out[i].content;
-    try {
-      const expanded = expandAtRefs(projectPath, userText);
-      if (expanded.contextBlock) {
-        out[i] = {
-          role: 'user',
-          content: `${userText}\n\n${expanded.contextBlock}`,
-        };
-      }
-    } catch {
-      // leave original text if expand fails
-    }
-    break;
-  }
-  return out;
+  return projectToModelMessages(messages, {
+    projectPath,
+    expandAtRefs,
+  });
 }
 
 /**
@@ -1721,12 +1709,24 @@ async function startChatRun(event, payload = {}, opts = {}) {
 
   const emit = (e) => {
     if (e && e.type === AGENT_EVENTS.PLAN_READY && sessionId) {
+      const prev = pendingPlansBySession.get(sessionId);
+      if (prev && prev.planId && prev.planId !== e.planId) {
+        safeSend(sender, 'chat:event', {
+          runId,
+          sessionId,
+          type: 'plan-superseded',
+          planId: prev.planId,
+          newPlanId: e.planId,
+        });
+      }
       pendingPlansBySession.set(sessionId, {
         planId: e.planId,
         title: e.title,
         markdown: e.markdown,
         steps: e.steps,
         sessionId,
+        status: PLAN_STATUS.PROPOSED,
+        createdAt: Date.now(),
       });
     }
     if (e && e.type === AGENT_EVENTS.USAGE) {
@@ -2156,7 +2156,12 @@ ipcMain.handle('chat:approvePlan', async (event, payload = {}) => {
     title: pending.title,
     markdown: pending.markdown,
   });
-  const userMessage = { role: 'user', content };
+  const userMessage = createMessageV2({
+    sessionId,
+    role: 'user',
+    content,
+    createdAt: Date.now(),
+  });
 
   safeSend(event.sender, 'chat:event', {
     type: AGENT_EVENTS.PLAN_APPROVED,
@@ -2218,9 +2223,22 @@ ipcMain.handle('chat:rejectPlan', async (event, payload = {}) => {
       type: AGENT_EVENTS.PLAN_REJECTED,
       planId: pending.planId,
       sessionId,
+      reason: payload.reason ? String(payload.reason) : null,
     });
   }
   return { ok: true };
+});
+
+ipcMain.handle('chat:getPendingPlan', async (_event, payload = {}) => {
+  const sessionId = payload.sessionId;
+  if (!sessionId) {
+    return { ok: false, error: '缺少 sessionId' };
+  }
+  const pending = pendingPlansBySession.get(sessionId);
+  if (!pending) {
+    return { ok: true, plan: null };
+  }
+  return { ok: true, plan: { ...pending } };
 });
 
 ipcMain.handle('web:fetch', async (_event, payload = {}) => {

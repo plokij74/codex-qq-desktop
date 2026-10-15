@@ -835,11 +835,42 @@ function defaultSessions() {
     { id: 'chat_randy', title: 'Randy Lu（示例）', kind: 'friend', peer: 'randy', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '（模拟好友：真实通信待 E26 接入）在的，有事直接说。' }], updatedAt: Date.now() - 2000 },
   ];
 }
+function normalizeSessionMessageClient(m) {
+  if (!m || typeof m !== 'object') return { role: 'user', content: '' };
+  const content = typeof m.content === 'string' ? m.content : String(m.content || '');
+  const parts = Array.isArray(m.parts) && m.parts.length
+    ? m.parts
+    : [{ type: 'text', text: content }];
+
+  if (m.planId && !parts.some((p) => p && p.type === 'plan')) {
+    parts.push({
+      type: 'plan',
+      planId: m.planId,
+      title: m.planTitle || '实施计划',
+      markdown: m.planMarkdown || '',
+      steps: Array.isArray(m.planSteps) ? m.planSteps : [],
+      status: m.planStatus || 'proposed',
+    });
+  }
+
+  return {
+    ...m,
+    role: m.role || 'user',
+    content,
+    schemaVersion: 2,
+    parts,
+    trajectory: Array.isArray(m.trajectory) ? m.trajectory : [],
+  };
+}
+
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('codex-qq-sessions-v1');
     if (!raw) {
-      sessions = defaultSessions();
+      sessions = defaultSessions().map((s) => ({
+        ...s,
+        messages: (s.messages || []).map(normalizeSessionMessageClient),
+      }));
       sessions.forEach(ensureSessionCandidateState);
       sessions.forEach(ensureSessionWorktreeState);
       projects = defaultProjects();
@@ -850,12 +881,16 @@ function loadState() {
     sessions = Array.isArray(data.sessions) && data.sessions.length
       ? data.sessions.map((s) => {
         const mode = normalizeSessionAgentMode(s.agentMode);
-        const session = { pinned: false, projectId: null, ...s, agentMode: mode };
+        const msgs = (s.messages || []).map(normalizeSessionMessageClient);
+        const session = { pinned: false, projectId: null, ...s, agentMode: mode, messages: msgs };
         ensureSessionCandidateState(session);
         ensureSessionWorktreeState(session);
         return session;
       })
-      : defaultSessions();
+      : defaultSessions().map((s) => ({
+        ...s,
+        messages: (s.messages || []).map(normalizeSessionMessageClient),
+      }));
     sessions.forEach(ensureSessionCandidateState);
     sessions.forEach(ensureSessionWorktreeState);
     projects = Array.isArray(data.projects) ? data.projects : defaultProjects();
@@ -1621,6 +1656,121 @@ function bindFileChangesToggles(root) {
   });
 }
 
+function renderAttachmentsHtml(parts) {
+  if (!Array.isArray(parts)) return '';
+  const atts = parts.filter((p) => p && p.type === 'attachment_ref');
+  if (!atts.length) return '';
+  const items = atts.map((a) => {
+    const sz = a.size ? ` (${Math.round(a.size / 1024)} KB)` : '';
+    return `<span class="msg-attachment-badge">📎 ${escapeHtml(a.name || '附件')}${sz}</span>`;
+  }).join(' ');
+  return `<div class="msg-attachments">${items}</div>`;
+}
+
+function renderPlanCardHtml(plan, sessionId) {
+  if (!plan) return '';
+  const title = plan.title || '实施计划';
+  const stepsHtml = Array.isArray(plan.steps) && plan.steps.length
+    ? '<ol class="plan-steps">' + plan.steps.map((s) => '<li>' + escapeHtml(String(s)) + '</li>').join('') + '</ol>'
+    : '';
+  const status = plan.status || 'proposed';
+  let actionsHtml = '';
+  if (status === 'proposed') {
+    actionsHtml = '<div class="plan-actions">' +
+      '<button type="button" class="plan-btn plan-approve" data-plan-id="' + escapeHtml(plan.planId) + '" data-session-id="' + escapeHtml(sessionId || '') + '">批准执行</button>' +
+      '<button type="button" class="plan-btn plan-reject" data-plan-id="' + escapeHtml(plan.planId) + '" data-session-id="' + escapeHtml(sessionId || '') + '">驳回</button>' +
+      '</div>';
+  } else if (status === 'approved') {
+    actionsHtml = '<div class="plan-result plan-result-approved">✓ 已批准执行</div>';
+  } else if (status === 'rejected') {
+    actionsHtml = '<div class="plan-result plan-result-rejected">✕ 已驳回</div>';
+  } else if (status === 'superseded') {
+    actionsHtml = '<div class="plan-result plan-result-superseded">已被更新计划替代</div>';
+  }
+  return '<div class="plan-card' + (status !== 'proposed' ? ' resolved' : '') + '" data-plan-id="' + escapeHtml(plan.planId) + '" data-session-id="' + escapeHtml(sessionId || '') + '" data-status="' + escapeHtml(status) + '">' +
+    '<div class="plan-title">' + escapeHtml(title) + '</div>' +
+    '<div class="plan-body">' + escapeHtml(plan.markdown || '') + '</div>' +
+    stepsHtml +
+    actionsHtml +
+    '</div>';
+}
+
+function renderTrajectoryHtml(trajectory) {
+  if (!Array.isArray(trajectory) || !trajectory.length) return '';
+  const rows = trajectory.map((t) => {
+    let icon = '⚡';
+    let text = '';
+    if (t.kind === 'tool' || t.tool) {
+      icon = t.status === 'error' ? '❌' : '🔧';
+      text = '工具: <code>' + escapeHtml(t.tool || '') + '</code> ' + escapeHtml(t.argsSummary || t.summary || '');
+    } else if (t.kind === 'approval') {
+      icon = '🛡️';
+      text = '授权: ' + escapeHtml(t.tool || '') + ' (' + (t.decision === 'approved' ? '已批准' : '已拒绝') + ')';
+    } else if (t.kind === 'verify') {
+      icon = t.passed ? '✅' : '⚠️';
+      text = '校验: ' + (t.passed ? '通过' : '未通过');
+    } else if (t.kind === 'subagent') {
+      icon = '🤖';
+      text = '子代理 [' + escapeHtml(t.kindName || 'explore') + ']: ' + escapeHtml(t.goal || '');
+    } else if (t.kind === 'file_change') {
+      icon = '📝';
+      text = '改动: ' + escapeHtml(t.path || '') + ' (' + escapeHtml(t.op || '') + ')';
+    } else {
+      text = escapeHtml(t.kind || '操作');
+    }
+    return '<div class="trajectory-row"><span class="trajectory-icon">' + icon + '</span> <span class="trajectory-text">' + text + '</span></div>';
+  }).join('');
+  return '<details class="trajectory-details"><summary class="trajectory-summary">执行轨迹（' + trajectory.length + ' 步）</summary><div class="trajectory-body">' + rows + '</div></details>';
+}
+
+function bindPlanCardActions(root) {
+  if (!root) return;
+  root.querySelectorAll('.plan-card:not(.resolved) .plan-approve').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const card = btn.closest('.plan-card');
+      approvePlanFromCard(card, { planId: btn.dataset.planId, sessionId: btn.dataset.sessionId });
+    };
+  });
+  root.querySelectorAll('.plan-card:not(.resolved) .plan-reject').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const card = btn.closest('.plan-card');
+      const planId = btn.dataset.planId;
+      const sessId = btn.dataset.sessionId || activeSessionId;
+      if (card) {
+        card.classList.add('resolved');
+        card.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        let resEl = card.querySelector('.plan-result');
+        if (!resEl) {
+          resEl = document.createElement('div');
+          resEl.className = 'plan-result plan-result-rejected';
+          card.appendChild(resEl);
+        }
+        resEl.textContent = '已驳回';
+      }
+      try {
+        if (window.codex?.rejectPlan) {
+          await window.codex.rejectPlan({ sessionId: sessId, planId });
+        }
+      } catch { /* ignore */ }
+      const session = sessions.find((s) => s.id === sessId) || activeSession();
+      if (session) {
+        for (const m of session.messages) {
+          if (Array.isArray(m.parts)) {
+            for (const p of m.parts) {
+              if (p.type === 'plan' && p.planId === planId) p.status = 'rejected';
+            }
+          }
+          if (m.planId === planId) m.planStatus = 'rejected';
+        }
+        saveState();
+      }
+      toast('已驳回计划');
+    };
+  });
+}
+
 function renderMessages() {
   const list = document.getElementById('message-list'); if (!list) return;
   const session = activeSession(); const msgs = session?.messages || [];
@@ -1633,10 +1783,21 @@ function renderMessages() {
     const compactClass = msg.compact ? ' msg-compact' : '';
     const who = msg.role === 'user' ? '我' : (msg.compact ? '会话摘要' : botName);
     const strip = msg.role === 'assistant' ? fileChangesStripHtml(msg.fileChanges) : '';
-    return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+strip+renderMarkdownLite(msg.content)+'</div></div>';
+    const attHtml = renderAttachmentsHtml(msg.parts);
+    const planPart = (Array.isArray(msg.parts) && msg.parts.find((p) => p && p.type === 'plan')) || (msg.planId ? {
+      planId: msg.planId,
+      title: msg.planTitle,
+      markdown: msg.planMarkdown,
+      steps: msg.planSteps,
+      status: msg.planStatus,
+    } : null);
+    const planHtml = planPart ? renderPlanCardHtml(planPart, session?.id) : '';
+    const trajHtml = renderTrajectoryHtml(msg.trajectory);
+    return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+attHtml+strip+renderMarkdownLite(msg.content)+planHtml+trajHtml+'</div></div>';
   }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '') + renderInlineMcpTasks();
   renderWorktreeCards(list, session);
   bindFileChangesToggles(list);
+  bindPlanCardActions(list);
   if (liveRun && chatRun.el) {
     list.appendChild(chatRun.el);
   }
@@ -1683,6 +1844,8 @@ function createAssistantRunPlaceholder(sessionId) {
     applied: null,
     fileChanges: [],
     pendingPlanId: null,
+    trajectory: [],
+    planPart: null,
     verifyState: null,
     doneEvent: false,
     invokeDone: false,
@@ -1696,6 +1859,15 @@ function createAssistantRunPlaceholder(sessionId) {
 function renderPlanCard(ev) {
   if (!chatRun?.timelineEl || !ev) return;
   chatRun.pendingPlanId = ev.planId;
+  chatRun.planPart = {
+    type: 'plan',
+    planId: ev.planId,
+    title: ev.title || '实施计划',
+    markdown: ev.markdown || '',
+    steps: Array.isArray(ev.steps) ? ev.steps : [],
+    status: 'proposed',
+    createdAt: Date.now(),
+  };
   // Invalidate previous unresolved plan cards
   chatRun.el.querySelectorAll('.plan-card:not(.resolved)').forEach((c) => {
     c.classList.add('resolved');
@@ -1704,7 +1876,7 @@ function renderPlanCard(ev) {
     let res = c.querySelector('.plan-result');
     if (!res) {
       res = document.createElement('div');
-      res.className = 'plan-result';
+      res.className = 'plan-result plan-result-superseded';
       c.appendChild(res);
     }
     res.textContent = '已被更新计划替代';
@@ -1713,6 +1885,7 @@ function renderPlanCard(ev) {
   const card = document.createElement('div');
   card.className = 'plan-card';
   card.dataset.planId = ev.planId || '';
+  card.dataset.sessionId = chatRun?.sessionId || activeSessionId;
   const title = ev.title || '实施计划';
   let stepsHtml = '';
   if (Array.isArray(ev.steps) && ev.steps.length) {
@@ -1725,8 +1898,8 @@ function renderPlanCard(ev) {
     + '<div class="plan-body">' + escapeHtml(String(ev.markdown || '')) + '</div>'
     + stepsHtml
     + '<div class="plan-actions">'
-    + '<button type="button" class="plan-btn plan-approve">批准执行</button>'
-    + '<button type="button" class="plan-btn plan-reject">驳回</button>'
+    + '<button type="button" class="plan-btn plan-approve" data-plan-id="' + escapeHtml(ev.planId || '') + '" data-session-id="' + escapeHtml(chatRun?.sessionId || activeSessionId) + '">批准执行</button>'
+    + '<button type="button" class="plan-btn plan-reject" data-plan-id="' + escapeHtml(ev.planId || '') + '" data-session-id="' + escapeHtml(chatRun?.sessionId || activeSessionId) + '">驳回</button>'
     + '</div>';
 
   const approveBtn = card.querySelector('.plan-approve');
@@ -1745,10 +1918,13 @@ function renderPlanCard(ev) {
       }
     } catch { /* ignore */ }
     card.classList.add('resolved');
-    const res = document.createElement('div');
-    res.className = 'plan-result';
+    let res = card.querySelector('.plan-result');
+    if (!res) {
+      res = document.createElement('div');
+      res.className = 'plan-result plan-result-rejected';
+      card.appendChild(res);
+    }
     res.textContent = '已驳回';
-    card.appendChild(res);
     toast('已驳回计划');
   });
 
@@ -1757,16 +1933,13 @@ function renderPlanCard(ev) {
 }
 
 async function approvePlanFromCard(card, planEv) {
-  if (!chatRun || chatRun.finalized || card.classList.contains('resolved')) return;
-  if (sending && chatRun && !chatRun.finalized) {
-    // still in same run that produced the plan — wait for finalize first is safer;
-    // allow approve after plan-ready while invoke may still be open? Spec: if activeRun, main rejects.
-    // After plan submit model often continues to final text; user may click after done.
-  }
-  const session = sessions.find((s) => s.id === chatRun.sessionId) || activeSession();
-  if (!session) return;
+  if (card && card.classList.contains('resolved')) return;
+  const planId = (card && card.dataset.planId) || planEv?.planId;
+  const sessId = (card && card.dataset.sessionId) || planEv?.sessionId || chatRun?.sessionId || activeSessionId;
+  const session = sessions.find((s) => s.id === sessId) || activeSession();
+  if (!session || !planId) return;
 
-  const btns = card.querySelectorAll('button');
+  const btns = card ? card.querySelectorAll('button') : [];
   btns.forEach((b) => { b.disabled = true; });
 
   // If still streaming this plan-producing run, stop first so approve can start new run
@@ -1778,7 +1951,7 @@ async function approvePlanFromCard(card, planEv) {
 
   const history = session.messages
     .filter((m) => !m.error)
-    .map((m) => ({ role: m.role, content: m.content }));
+    .map((m) => ({ role: m.role, content: m.content, parts: m.parts }));
   // Include live assistant buffer if not yet finalized into messages
   if (chatRun && !chatRun.finalized) {
     const partial = chatRun.contentFinal || chatRun.textBuffer;
@@ -1791,7 +1964,7 @@ async function approvePlanFromCard(card, planEv) {
   try {
     const res = await window.codex.approvePlan({
       sessionId: session.id,
-      planId: planEv.planId,
+      planId,
       messages: history,
       project: proj?.path ? { name: proj.name, path: proj.path } : null,
       projectBindingId,
@@ -1805,19 +1978,40 @@ async function approvePlanFromCard(card, planEv) {
 
     session.agentMode = 'agent';
     updateAgentModeToggle();
-    card.classList.add('resolved');
-    let resultEl = card.querySelector('.plan-result');
-    if (!resultEl) {
-      resultEl = document.createElement('div');
-      resultEl.className = 'plan-result';
-      card.appendChild(resultEl);
+
+    // Mark plan as approved in session messages
+    for (const m of session.messages) {
+      if (Array.isArray(m.parts)) {
+        for (const p of m.parts) {
+          if (p.type === 'plan' && p.planId === planId) {
+            p.status = 'approved';
+            p.resolvedAt = Date.now();
+          }
+        }
+      }
+      if (m.planId === planId) {
+        m.planStatus = 'approved';
+      }
     }
-    resultEl.textContent = '已批准，正在执行…';
+
+    if (card) {
+      card.classList.add('resolved');
+      let resultEl = card.querySelector('.plan-result');
+      if (!resultEl) {
+        resultEl = document.createElement('div');
+        resultEl.className = 'plan-result plan-result-approved';
+        card.appendChild(resultEl);
+      }
+      resultEl.textContent = '已批准，正在执行…';
+    }
 
     if (res.userMessage) {
       session.messages.push({
         role: res.userMessage.role || 'user',
         content: res.userMessage.content,
+        schemaVersion: 2,
+        parts: [{ type: 'text', text: res.userMessage.content }],
+        createdAt: Date.now(),
       });
     }
     session.updatedAt = Date.now();
@@ -2136,12 +2330,34 @@ function finalizeChatRun(opts = {}) {
   const fileChanges = Array.isArray(chatRun.fileChanges) && chatRun.fileChanges.length
     ? chatRun.fileChanges.slice()
     : undefined;
-  session.messages.push({
+  const trajectory = Array.isArray(chatRun.trajectory) && chatRun.trajectory.length
+    ? chatRun.trajectory.slice()
+    : [];
+  const parts = [];
+  if (content) {
+    parts.push({ type: 'text', text: content });
+  }
+  if (chatRun.planPart) {
+    parts.push(chatRun.planPart);
+  }
+  const assistantMsg = {
     role: 'assistant',
     content,
+    schemaVersion: 2,
+    parts,
+    trajectory,
     error: Boolean(error && !aborted),
+    createdAt: Date.now(),
     ...(fileChanges ? { fileChanges } : {}),
-  });
+    ...(chatRun.planPart ? {
+      planId: chatRun.planPart.planId,
+      planTitle: chatRun.planPart.title,
+      planMarkdown: chatRun.planPart.markdown,
+      planSteps: chatRun.planPart.steps,
+      planStatus: chatRun.planPart.status,
+    } : {}),
+  };
+  session.messages.push(assistantMsg);
   session.updatedAt = Date.now();
   chatRun.finalized = true;
   const applied = opts.applied || chatRun.applied;
@@ -2718,6 +2934,14 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'tool-end') {
+    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
+    chatRun.trajectory.push({
+      kind: 'tool',
+      tool: ev.tool,
+      summary: ev.summary || '',
+      status: ev.ok === false ? 'error' : 'success',
+      timestamp: Date.now(),
+    });
     if (ev.subagent && ev.subagentId && chatRun?.subagentBlocks?.get(ev.subagentId)) {
       const rec = chatRun.subagentBlocks.get(ev.subagentId);
       const line = document.createElement('div');
@@ -2735,11 +2959,25 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'approval-resolved') {
+    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
+    chatRun.trajectory.push({
+      kind: 'approval',
+      approvalId: ev.approvalId,
+      decision: ev.decision,
+      timestamp: Date.now(),
+    });
     markApprovalResolved(ev.approvalId, ev.decision);
     setRunStatus('生成中…');
     return;
   }
   if (type === 'file-change') {
+    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
+    chatRun.trajectory.push({
+      kind: 'file_change',
+      path: ev.path,
+      op: ev.op,
+      timestamp: Date.now(),
+    });
     if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
     mergeFileChangeEntry(chatRun.fileChanges, {
       path: ev.path,
@@ -2762,6 +3000,14 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'verify-result') {
+    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
+    chatRun.trajectory.push({
+      kind: 'verify',
+      command: ev.command,
+      passed: Boolean(ev.ok),
+      summary: ev.summary || '',
+      timestamp: Date.now(),
+    });
     renderVerifyStrip(ev);
     return;
   }
@@ -2771,6 +3017,16 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'subagent-end') {
+    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
+    chatRun.trajectory.push({
+      kind: 'subagent',
+      subagentId: ev.subagentId,
+      kindName: ev.kind,
+      goal: ev.goal,
+      passed: Boolean(ev.ok),
+      summary: ev.summary || '',
+      timestamp: Date.now(),
+    });
     const rec = ensureSubagentBlock(ev);
     if (rec) {
       rec.statusEl.className = 'sa-status ' + (ev.ok ? 'is-ok' : 'is-fail');
@@ -5568,7 +5824,26 @@ async function sendMessage() {
   if (proj?.path && !projectBindingId) {
     return toast('项目绑定已失效，请重新绑定目录');
   }
-  session.messages.push({ role: 'user', content: text }); session.updatedAt = Date.now();
+  const userParts = [{ type: 'text', text }];
+  if (Array.isArray(pendingAttaches) && pendingAttaches.length) {
+    for (const a of pendingAttaches) {
+      userParts.push({
+        type: 'attachment_ref',
+        name: a.name || 'attachment',
+        size: a.size || 0,
+        mime: a.type || 'application/octet-stream',
+        attachmentId: a.id || a.name,
+      });
+    }
+  }
+  session.messages.push({
+    role: 'user',
+    content: text,
+    schemaVersion: 2,
+    parts: userParts,
+    createdAt: Date.now(),
+  });
+  session.updatedAt = Date.now();
   sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
   input.value = ''; pendingAttaches = []; renderAttachPreview(); hideAtComplete(); setSending(true); saveState();
   if (session.peer && session.peer !== 'codex') {
@@ -5599,7 +5874,12 @@ async function sendMessage() {
   let invokeError = null;
   try {
     const payload = {
-      messages: session.messages.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })),
+      messages: session.messages.filter((m) => !m.error).map((m) => ({
+        role: m.role,
+        content: m.content,
+        schemaVersion: m.schemaVersion || 2,
+        parts: m.parts,
+      })),
       project: proj?.path ? { name: proj.name, path: proj.path } : null,
       projectBindingId,
       sessionId: session.id,

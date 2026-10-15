@@ -1,6 +1,7 @@
 'use strict';
 
 const { generateMemoryCandidates } = require('./memory-candidates');
+const { createMessageV2, normalizeMessage, PART_TYPES } = require('./message-schema');
 
 /**
  * Phase D.1 — structured session compaction.
@@ -24,9 +25,17 @@ function approxTokensFromText(s) {
 
 function messageText(m) {
   if (!m || typeof m !== 'object') return '';
-  let t = typeof m.content === 'string' ? m.content : String(m.content || '');
-  if (m.tool) t += '\n' + String(m.tool);
-  if (m.toolSummary) t += '\n' + String(m.toolSummary);
+  const norm = normalizeMessage(m);
+  let t = norm.content || '';
+  if (Array.isArray(norm.trajectory) && norm.trajectory.length) {
+    for (const item of norm.trajectory) {
+      if (item.tool) t += `\n${item.tool} ${item.argsSummary || ''}`;
+      if (item.goal) t += `\n${item.goal}`;
+    }
+  } else {
+    if (m.tool) t += '\n' + String(m.tool);
+    if (m.toolSummary) t += '\n' + String(m.toolSummary);
+  }
   return t;
 }
 
@@ -81,13 +90,23 @@ function serializeOlderTranscript(older, opts = {}) {
   const parts = [];
   for (const m of list) {
     if (!m || typeof m !== 'object') continue;
-    const role = m.role || 'unknown';
-    if (m.tool || role === 'tool') {
+    const norm = normalizeMessage(m);
+    const role = norm.role || 'unknown';
+
+    if (Array.isArray(norm.trajectory) && norm.trajectory.length) {
+      const trajDesc = norm.trajectory.map((t) => {
+        if (t.tool) return `[tool:${t.tool}] ${t.argsSummary || ''} (${t.status || 'done'})`;
+        if (t.subagentId) return `[subagent:${t.kindName || 'explore'}] ${t.goal || ''} (${t.status || 'done'})`;
+        if (t.kind === 'verify') return `[verify] passed=${t.passed}`;
+        return `[action:${t.kind}]`;
+      }).join('\n');
+      parts.push(`[${role}]\n${norm.content || ''}\n【执行轨迹】\n${trajDesc}`);
+    } else if (m.tool || role === 'tool') {
       const name = m.tool || m.name || 'tool';
       const body = String(m.toolSummary || m.content || '').slice(0, TOOL_SUMMARY_MAX);
       parts.push(`[tool:${name}]\n${body}`);
     } else {
-      parts.push(`[${role}]\n${String(m.content || '')}`);
+      parts.push(`[${role}]\n${String(norm.content || '')}`);
     }
   }
   let text = parts.join('\n\n');
@@ -99,15 +118,16 @@ function serializeOlderTranscript(older, opts = {}) {
 
 /** Replace `plan.older` with a single summary bubble; returns a new array. */
 function applyCompact(messages, plan, summary) {
-  const keep = plan && Array.isArray(plan.keep) ? plan.keep : [];
+  const keep = plan && Array.isArray(plan.keep) ? plan.keep.map(normalizeMessage) : [];
   const olderLen = plan && Array.isArray(plan.older) ? plan.older.length : 0;
-  const summaryMsg = {
+  const summaryMsg = createMessageV2({
     role: 'assistant',
     content: `${SUMMARY_PREFIX.replace('%d', String(olderLen))}\n${String(summary || '').trim()}`,
     compact: true,
     compactAt: Date.now(),
     compactedCount: olderLen,
-  };
+    createdAt: Date.now(),
+  });
   return [summaryMsg, ...keep];
 }
 
