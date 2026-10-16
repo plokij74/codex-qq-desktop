@@ -1,4 +1,6 @@
 const { normalizeAgentMode, isPlanBlockedRisk } = require('./agent-mode');
+const { defaultScopedSessionStore, evaluateToolExecution } = require('./execution-policy');
+const { redactSecrets } = require('./secret-manager');
 
 const READ_TOOLS = new Set([
   'list_dir', 'read_file', 'grep', 'glob',
@@ -48,8 +50,9 @@ function makeAbortedError() {
   return err;
 }
 
-function rememberSessionRisk(sessionKey, risk) {
+function rememberSessionRisk(sessionKey, risk, projectId) {
   if (!sessionKey || !risk) return;
+  defaultScopedSessionStore.grant(projectId, sessionKey, risk);
   let set = globalSessionAllows.get(sessionKey);
   if (!set) {
     set = new Set();
@@ -58,8 +61,11 @@ function rememberSessionRisk(sessionKey, risk) {
   set.add(risk);
 }
 
-function isSessionRiskAllowed(sessionKey, risk) {
+function isSessionRiskAllowed(sessionKey, risk, projectId) {
   if (!sessionKey) return false;
+  if (projectId) {
+    return defaultScopedSessionStore.isGranted(projectId, sessionKey, risk);
+  }
   const set = globalSessionAllows.get(sessionKey);
   return !!(set && set.has(risk));
 }
@@ -69,6 +75,7 @@ function isSessionRiskAllowed(sessionKey, risk) {
  * @param {string} [sessionKey] - when omitted, clears all sessions
  */
 function clearSessionAllows(sessionKey) {
+  defaultScopedSessionStore.clear(sessionKey);
   if (sessionKey == null || sessionKey === '') {
     globalSessionAllows.clear();
     return;
@@ -96,18 +103,22 @@ function createPermissionGate({
   // full-auto mode. The risk branch below also gives them server-scoped
   // allow_session memory without weakening ordinary tool policy.
   agentMode = 'agent',
+  projectRoot,
+  projectId,
+  policyLevel,
+  isElevated,
   onApprovalNeeded,
 } = {}) {
   const gateAgentMode = normalizeAgentMode(agentMode);
   /** @type {Map<string, { resolve: (v: any) => void, reject: (e: Error) => void }>} */
   const pending = new Map();
 
-  function rememberSession(sessionKey, risk) {
-    rememberSessionRisk(sessionKey, risk);
+  function rememberSession(sessionKey, risk, pId) {
+    rememberSessionRisk(sessionKey, risk, pId || projectId);
   }
 
-  function isSessionAllowed(sessionKey, risk) {
-    return isSessionRiskAllowed(sessionKey, risk);
+  function isSessionAllowed(sessionKey, risk, pId) {
+    return isSessionRiskAllowed(sessionKey, risk, pId || projectId);
   }
 
   function nextApprovalId() {
@@ -164,8 +175,8 @@ function createPermissionGate({
           approvalId,
           tool: payload.tool,
           risk: payload.risk,
-          summary: payload.summary,
-          detail: payload.detail,
+          summary: typeof payload.summary === 'string' ? redactSecrets(payload.summary) : payload.summary,
+          detail: typeof payload.detail === 'string' ? redactSecrets(payload.detail) : payload.detail,
           path: payload.path,
           scope: payload.scope,
           diff: payload.diff, // may be undefined
@@ -191,9 +202,19 @@ function createPermissionGate({
   }
 
   async function authorize({
-    tool, risk, summary, detail, path, scope, sessionKey, signal, diff, source, server, context,
+    tool, args, risk, summary, detail, path, scope, sessionKey,
+    projectId: callProjectId,
+    projectRoot: callProjectRoot,
+    policyLevel: callPolicyLevel,
+    isElevated: callIsElevated,
+    signal, diff, source, server, context,
     agentMode: callAgentMode,
   } = {}) {
+    const effProjectRoot = callProjectRoot || projectRoot;
+    const effProjectId = callProjectId || projectId;
+    const effPolicyLevel = callPolicyLevel || policyLevel;
+    const effIsElevated = callIsElevated !== undefined ? callIsElevated : isElevated;
+
     const allowedWithDecision = (decision) => {
       const result = { allowed: true };
       if (decision) Object.defineProperty(result, 'decision', { value: decision, enumerable: false });
@@ -206,6 +227,24 @@ function createPermissionGate({
 
     if (signal?.aborted) {
       throw makeAbortedError();
+    }
+
+    if (tool && effProjectRoot) {
+      const evalResult = evaluateToolExecution(tool, args || { path }, {
+        projectRoot: effProjectRoot,
+        projectId: effProjectId,
+        sessionKey,
+        policyLevel: effPolicyLevel,
+        isElevated: effIsElevated,
+      });
+      if (!evalResult.allowed) {
+        return {
+          allowed: false,
+          requiresElevation: evalResult.requiresElevation,
+          code: evalResult.code,
+          reason: evalResult.reason,
+        };
+      }
     }
 
     // Plan mode second gate: never write/delete/terminal
@@ -230,13 +269,13 @@ function createPermissionGate({
     // to the server by the caller's scope string.
     if (effectiveRisk === 'mcp-sampling') {
       const allowKey = scope ? `mcp-sampling:${scope}` : 'mcp-sampling';
-      if (isSessionAllowed(sessionKey, allowKey)) return { allowed: true };
+      if (isSessionAllowed(sessionKey, allowKey, effProjectId)) return { allowed: true };
       const decision = await waitForApproval(
         { tool, risk: effectiveRisk, summary, detail, path, scope, diff, source, server, context },
         signal,
       );
       if (decision.decision === 'allow_session') {
-        rememberSession(sessionKey, allowKey);
+        rememberSession(sessionKey, allowKey, effProjectId);
         return allowedWithDecision('allow_session');
       }
       if (decision.decision === 'allow') return allowedWithDecision('allow');
@@ -253,7 +292,7 @@ function createPermissionGate({
         return { allowed: true };
       }
       const allowKey = scope ? `network:${scope}` : 'network';
-      if (isSessionAllowed(sessionKey, allowKey)) {
+      if (isSessionAllowed(sessionKey, allowKey, effProjectId)) {
         return { allowed: true };
       }
       const decision = await waitForApproval(
@@ -261,7 +300,7 @@ function createPermissionGate({
         signal,
       );
       if (decision.decision === 'allow_session') {
-        rememberSession(sessionKey, allowKey);
+        rememberSession(sessionKey, allowKey, effProjectId);
         return allowedWithDecision('allow_session');
       }
       if (decision.decision === 'allow') return allowedWithDecision('allow');
@@ -304,7 +343,7 @@ function createPermissionGate({
       return { allowed: true };
     }
 
-    if (isSessionAllowed(sessionKey, effectiveRisk)) {
+    if (isSessionAllowed(sessionKey, effectiveRisk, effProjectId)) {
       return { allowed: true };
     }
 
@@ -314,7 +353,7 @@ function createPermissionGate({
     );
 
     if (decisionResult.decision === 'allow_session') {
-      rememberSession(sessionKey, effectiveRisk);
+      rememberSession(sessionKey, effectiveRisk, effProjectId);
       return allowedWithDecision('allow_session');
     }
     if (decisionResult.decision === 'allow') {

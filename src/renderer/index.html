@@ -14,6 +14,7 @@
         <span class="qq-title-text">Codex 2007 - <span id="session-title">优化 KV 读写成本</span></span>
       </div>
       <div class="qq-titlebar-right">
+        <span class="isolation-badge" id="isolation-badge" title="OS 隔离状态: 严格沙箱隔离">🛡️ 沙箱隔离</span>
         <button type="button" class="win-btn" id="btn-settings" title="设置">⚙</button>
         <div class="window-controls" aria-label="窗口控制">
           <button type="button" class="window-control" id="btn-window-minimize" title="最小化" aria-label="最小化">−</button>
@@ -214,6 +215,14 @@
             <option value="full-auto">全自动</option>
           </select>
         </label>
+        <label class="field">
+          <span>OS 隔离与执行策略（E.3）</span>
+          <select id="set-execution-policy">
+            <option value="strict-isolated" selected>严格隔离（仅限项目根目录沙箱 + 环境变量过滤）</option>
+            <option value="workspace-write">工作区写入（允许工作区内写操作，拦截越界）</option>
+            <option value="host-unconfined">主机未受限（仅限特殊调试，需显式确认）</option>
+          </select>
+        </label>
         <label class="switch-row"><input type="checkbox" id="set-agent-enabled" checked /> <span>启用多轮 Agent（list/read/write/grep/replace 循环）</span></label>
         <label class="field"><span>最大 Agent 轮数</span><input id="set-agent-turns" type="number" min="0" max="50" value="8" title="0 表示不限制轮数" /></label>
         <label class="switch-row"><input type="checkbox" id="set-terminal-enabled" /> <span>允许终端命令（默认关）</span></label>
@@ -321,6 +330,20 @@
       <div class="modal-actions">
         <button type="button" id="btn-settings-cancel" class="btn-secondary">取消</button>
         <button type="button" id="btn-settings-save" class="btn-primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Elevation Request Modal (E.3) -->
+  <div id="elevation-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="elevation-title">
+    <div class="modal-card">
+      <div class="modal-title" id="elevation-title">⚠️ 主机未受限执行策略提示</div>
+      <p class="elevation-desc" id="elevation-desc">
+        当前尝试将执行策略提升为「主机未受限（host-unconfined）」。在未受限模式下，Agent 与终端可能会访问项目工作区之外的敏感路径或执行全局命令。是否确认提升？
+      </p>
+      <div class="modal-actions">
+        <button type="button" id="btn-elevation-cancel" class="btn-secondary">保持隔离</button>
+        <button type="button" id="btn-elevation-confirm" class="btn-primary btn-danger">确认提升至未受限</button>
       </div>
     </div>
   </div>

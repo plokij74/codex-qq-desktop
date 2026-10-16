@@ -479,8 +479,10 @@ function toPublicSettings(s, senderId) {
     mode: s.mode,
     baseUrl: s.baseUrl,
     model: s.model,
-    apiKeySet: Boolean(s.apiKey),
+    apiKeySet: Boolean(s.apiKeyConfigured || s.apiKey),
     apiKey: '',
+    secretRef: s.secretRef || (s.apiKeyConfigured ? 'sec_main_api_key' : ''),
+    executionPolicy: s.executionPolicy || 'strict-isolated',
     agentEnabled: s.agentEnabled !== false,
     maxAgentTurns: s.maxAgentTurns ?? 8,
     permissionMode: PERMISSION_MODES.has(s.permissionMode) ? s.permissionMode : 'confirm-writes',
@@ -742,6 +744,11 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
       delete nextPartial.permissionMode;
     }
   }
+  if ('executionPolicy' in nextPartial) {
+    if (!['strict-isolated', 'workspace-write', 'host-unconfined'].includes(nextPartial.executionPolicy)) {
+      delete nextPartial.executionPolicy;
+    }
+  }
   if ('defaultAgentMode' in nextPartial) {
     nextPartial.defaultAgentMode = normalizeAgentMode(nextPartial.defaultAgentMode);
   }
@@ -806,6 +813,32 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
     );
   }
   return toPublicSettings(saved, event.sender.id);
+});
+
+ipcMain.handle('isolation:getStatus', async () => {
+  const { probeIsolationCapabilities } = require('./ai/os-isolation');
+  const caps = probeIsolationCapabilities();
+  const settings = loadSettings(userDataPath());
+  return {
+    ok: true,
+    capabilities: caps,
+    executionPolicy: settings.executionPolicy || 'strict-isolated',
+  };
+});
+
+ipcMain.handle('isolation:requestElevation', async (_event, payload = {}) => {
+  const { ScopedSessionStore } = require('./ai/execution-policy');
+  const { targetPolicy, reason, projectId, sessionKey } = payload;
+  if (!['strict-isolated', 'workspace-write', 'host-unconfined'].includes(targetPolicy)) {
+    return { ok: false, error: '无效的目标提升策略' };
+  }
+  const key = `${projectId || 'global'}::${sessionKey || 'default'}::elevation`;
+  ScopedSessionStore.set(key, targetPolicy);
+  return {
+    ok: true,
+    policy: targetPolicy,
+    elevated: targetPolicy === 'host-unconfined',
+  };
 });
 
 ipcMain.handle('mcp:testServer', async (_e, rawCfg) => {

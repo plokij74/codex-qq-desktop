@@ -5459,6 +5459,60 @@ function applyMcpImportJson() {
   toast(`已导入 ${mcpServerDrafts.length} 项（保存时校验）`);
 }
 
+async function updateIsolationBadge() {
+  const badge = document.getElementById('isolation-badge');
+  if (!badge || !window.codex?.getIsolationStatus) return;
+  try {
+    const res = await window.codex.getIsolationStatus();
+    const policy = res?.executionPolicy || 'strict-isolated';
+    if (policy === 'host-unconfined') {
+      badge.textContent = '⚠️ 主机未受限';
+      badge.className = 'isolation-badge unconfined';
+      badge.title = '当前执行策略: 主机未受限 (host-unconfined) - 请注意命令越界风险';
+    } else if (policy === 'workspace-write') {
+      badge.textContent = '📂 工作区写入';
+      badge.className = 'isolation-badge';
+      badge.title = '当前执行策略: 工作区写入 (workspace-write) - 允许项目内写入';
+    } else {
+      badge.textContent = '🛡️ 沙箱隔离';
+      badge.className = 'isolation-badge';
+      badge.title = '当前执行策略: 严格隔离 (strict-isolated) - 沙箱工作区保护 + 环境变量过滤';
+    }
+  } catch (err) {
+    console.warn('Failed to update isolation badge:', err);
+  }
+}
+
+function promptElevation(targetPolicy, onConfirm) {
+  const modal = document.getElementById('elevation-modal');
+  if (!modal) {
+    if (onConfirm) onConfirm();
+    return;
+  }
+  modal.classList.remove('hidden');
+  const btnCancel = document.getElementById('btn-elevation-cancel');
+  const btnConfirm = document.getElementById('btn-elevation-confirm');
+
+  const cleanup = () => {
+    modal.classList.add('hidden');
+    if (btnCancel) btnCancel.onclick = null;
+    if (btnConfirm) btnConfirm.onclick = null;
+  };
+
+  if (btnCancel) {
+    btnCancel.onclick = () => {
+      cleanup();
+    };
+  }
+
+  if (btnConfirm) {
+    btnConfirm.onclick = () => {
+      cleanup();
+      if (onConfirm) onConfirm();
+    };
+  }
+}
+
 async function openSettings() {
   const settings = await window.codex.getSettings();
   mcpSavedFingerprint = mcpConfigFingerprint(settings.mcpServers);
@@ -5469,6 +5523,8 @@ async function openSettings() {
   document.getElementById('set-api-hint').textContent = settings.apiKeySet ? '已配置 API Key（留空保存则保留原 Key）' : '尚未配置 API Key';
   const pm = document.getElementById('set-permission-mode');
   if (pm) pm.value = settings.permissionMode || 'confirm-writes';
+  const ep = document.getElementById('set-execution-policy');
+  if (ep) ep.value = settings.executionPolicy || 'strict-isolated';
   const ae = document.getElementById('set-agent-enabled');
   if (ae) ae.checked = settings.agentEnabled !== false;
   const at = document.getElementById('set-agent-turns');
@@ -5783,28 +5839,40 @@ async function saveSettingsFromForm() {
       }).filter((row) => row.modelPrefix),
     usageCurrency: (document.getElementById('set-usage-currency')?.value || '$').slice(0, 4),
   };
-  const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
-  const saved = await window.codex.saveSettings(partial);
-  if (saved?.ok === false) {
-    if (saved.code === 'MCP_TASKS_CONFIG_LOCKED') {
-      closeSettings();
-      showWorkView('scheduled');
+  const targetExecutionPolicy = document.getElementById('set-execution-policy')?.value || 'strict-isolated';
+  const doSave = async () => {
+    partial.executionPolicy = targetExecutionPolicy;
+    const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
+    const saved = await window.codex.saveSettings(partial);
+    if (saved?.ok === false) {
+      if (saved.code === 'MCP_TASKS_CONFIG_LOCKED') {
+        closeSettings();
+        showWorkView('scheduled');
+      }
+      toast(saved.error || '设置保存失败');
+      return;
     }
-    toast(saved.error || '设置保存失败');
-    return;
+    mcpSavedFingerprint = mcpConfigFingerprint(saved?.mcpServers || mcpServers);
+    if (Array.isArray(saved?.mcpServers)) setMcpServerDrafts(saved.mcpServers);
+    await refreshMcpOAuthStatuses();
+    usageDisplayEnabled = partial.usageEnabled !== false;
+    currencySymbol = partial.usageCurrency || '$';
+    defaultAgentModeSeed = partial.defaultAgentMode === 'plan' ? 'plan' : 'agent';
+    closeSettings();
+    renderUsageBar();
+    renderContextMeter();
+    await updateStatusBar();
+    await updateIsolationBadge();
+    toast('设置已保存');
+  };
+
+  if (targetExecutionPolicy === 'host-unconfined') {
+    promptElevation('host-unconfined', () => {
+      doSave().catch((err) => toast('保存失败: ' + err.message));
+    });
+  } else {
+    await doSave();
   }
-  mcpSavedFingerprint = mcpConfigFingerprint(saved?.mcpServers || mcpServers);
-  if (Array.isArray(saved?.mcpServers)) setMcpServerDrafts(saved.mcpServers);
-  await refreshMcpOAuthStatuses();
-  usageDisplayEnabled = partial.usageEnabled !== false;
-  currencySymbol = partial.usageCurrency || '$';
-  defaultAgentModeSeed = partial.defaultAgentMode === 'plan' ? 'plan' : 'agent';
-  closeSettings();
-  renderUsageBar();
-  renderContextMeter();
-  await updateStatusBar();
-  toast('设置已保存');
-  // Refresh terminal input enablement hint via status only; gate still enforces at run time.
 }
 async function sendMessage() {
   if (sending) return;
@@ -6234,6 +6302,10 @@ function boot() {
   for (const project of projects) if (project.path) reconcileWorktreeResults(project);
   updateAgentModeToggle();
   updateStatusBar();
+  updateIsolationBadge();
+  document.getElementById('isolation-badge')?.addEventListener('click', () => {
+    openSettings();
+  });
   updateClock();
   setInterval(updateClock, 30000);
   // Load defaultAgentMode seed for new sessions (non-blocking)

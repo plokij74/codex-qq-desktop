@@ -2,11 +2,15 @@ const fs = require('fs');
 const path = require('path');
 const { sanitizeMcpServers } = require('./mcp-config');
 const crypto = require('crypto');
+const { SecretManager, defaultSecretManager, migrateSettingsFile } = require('./secret-manager');
 
 const DEFAULT_SETTINGS = {
   mode: 'local',
   baseUrl: 'https://api.openai.com/v1',
   apiKey: '',
+  apiKeyConfigured: false,
+  secretRef: '',
+  executionPolicy: 'strict-isolated', // strict-isolated | workspace-write | host-unconfined
   model: 'gpt-4o-mini',
   // Agent
   agentEnabled: true,
@@ -222,12 +226,41 @@ function clampVerificationSettings(s) {
   return s;
 }
 
-function loadSettings(userDataPath) {
+const secretManagersByPath = new Map();
+function getOrCreateSecretManager(userDataPath) {
+  if (!userDataPath || typeof userDataPath !== 'string') return defaultSecretManager;
+  const normalized = path.resolve(userDataPath);
+  if (!secretManagersByPath.has(normalized)) {
+    secretManagersByPath.set(normalized, new SecretManager({
+      vaultPath: path.join(normalized, 'secrets.vault.json'),
+    }));
+  }
+  return secretManagersByPath.get(normalized);
+}
+
+function loadSettings(userDataPath, options = {}) {
   const file = getSettingsPath(userDataPath);
+  const secMgr = options.secretManager || getOrCreateSecretManager(userDataPath);
   try {
+    if (userDataPath) {
+      migrateSettingsFile(userDataPath, secMgr);
+    }
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
+
+    if (secMgr && secMgr.hasSecret('main_api_key')) {
+      merged.apiKey = secMgr.getSecret('main_api_key') || '';
+      merged.apiKeyConfigured = true;
+      merged.secretRef = 'sec_main_api_key';
+    } else if (merged.apiKey) {
+      if (secMgr) {
+        secMgr.setSecret('main_api_key', merged.apiKey, { label: 'OpenAI API Key' });
+      }
+      merged.apiKeyConfigured = true;
+      merged.secretRef = 'sec_main_api_key';
+    }
+
     merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
     // Paths are retained only from the settings file written by main. JSON
     // imports are sanitized before they reach this loader and cannot grant a
@@ -239,12 +272,40 @@ function loadSettings(userDataPath) {
     clampVerificationSettings(merged);
     return clampMcpD10Settings(clampUsageSettings(merged));
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    const fallback = { ...DEFAULT_SETTINGS };
+    if (secMgr && secMgr.hasSecret('main_api_key')) {
+      fallback.apiKey = secMgr.getSecret('main_api_key') || '';
+      fallback.apiKeyConfigured = true;
+      fallback.secretRef = 'sec_main_api_key';
+    }
+    return fallback;
   }
 }
 
-function saveSettings(userDataPath, partial) {
-  const next = { ...loadSettings(userDataPath), ...partial };
+function saveSettings(userDataPath, partial, options = {}) {
+  const secMgr = options.secretManager || getOrCreateSecretManager(userDataPath);
+  const incoming = { ...partial };
+
+  if (typeof incoming.apiKey === 'string' && incoming.apiKey.trim().length > 0) {
+    if (secMgr) {
+      secMgr.setSecret('main_api_key', incoming.apiKey.trim(), { label: 'OpenAI API Key' });
+    }
+    incoming.apiKeyConfigured = true;
+    incoming.secretRef = 'sec_main_api_key';
+  } else if ('apiKey' in incoming && (!incoming.apiKey || incoming.apiKey.trim().length === 0)) {
+    incoming.apiKeyConfigured = Boolean(secMgr && secMgr.hasSecret('main_api_key'));
+    if (incoming.apiKeyConfigured) {
+      incoming.secretRef = 'sec_main_api_key';
+    }
+  }
+
+  const current = loadSettings(userDataPath, { secretManager: secMgr });
+  const next = { ...current, ...incoming };
+
+  // Strip plaintext apiKey from disk representation
+  const diskCopy = { ...next };
+  delete diskCopy.apiKey;
+
   next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
   next.mcpServers = sanitizeMcpServers(next.mcpServers, { allowRootPaths: true });
   clampCompactSettings(next);
@@ -253,7 +314,13 @@ function saveSettings(userDataPath, partial) {
   clampUsageSettings(next);
   clampVerificationSettings(next);
   fs.mkdirSync(userDataPath, { recursive: true });
-  fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(next, null, 2), 'utf8');
+  fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(diskCopy, null, 2), 'utf8');
+
+  // In-memory returned object retains decrypted apiKey
+  if (secMgr && secMgr.hasSecret('main_api_key')) {
+    next.apiKey = secMgr.getSecret('main_api_key') || '';
+  }
+
   return clampMcpD10Settings(next);
 }
 

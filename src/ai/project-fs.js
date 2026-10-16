@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { isIgnored } = require('./gitignore');
+const { verifyPathSandbox } = require('./os-isolation');
 
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '.nuxt', 'coverage',
@@ -8,14 +9,9 @@ const SKIP_DIRS = new Set([
   '.idea', '.vscode', '.npm-cache',
 ]);
 
-function resolveSafe(projectRoot, relPath = '.') {
-  const root = path.resolve(projectRoot);
-  const target = path.resolve(root, relPath || '.');
-  const rel = path.relative(root, target);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`路径越界，禁止访问项目外文件: ${relPath}`);
-  }
-  return target;
+function resolveSafe(projectRoot, relPath = '.', mode = 'read') {
+  const verified = verifyPathSandbox(projectRoot, relPath, { mode });
+  return verified.canonicalTarget;
 }
 
 /**
@@ -325,7 +321,7 @@ function previewSearchReplace(projectRoot, relPath, oldString, newString, opts =
   const oldS = String(oldString ?? '');
   const newS = String(newString ?? '');
   if (!oldS) throw new Error('old_string 为空');
-  const full = resolveSafe(projectRoot, relPath);
+  const full = resolveSafe(projectRoot, relPath, 'write');
   if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
     throw new Error(`文件不存在，请用 write_file 创建: ${relPath}`);
   }
@@ -357,7 +353,7 @@ function previewSearchReplace(projectRoot, relPath, oldString, newString, opts =
 
 function searchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
   const preview = previewSearchReplace(projectRoot, relPath, oldString, newString, opts);
-  const full = resolveSafe(projectRoot, relPath);
+  const full = resolveSafe(projectRoot, relPath, 'write');
   fs.writeFileSync(full, preview.after, 'utf8');
   return {
     path: preview.path,
@@ -367,14 +363,14 @@ function searchReplace(projectRoot, relPath, oldString, newString, opts = {}) {
 }
 
 function writeFile(projectRoot, relPath, content) {
-  const full = resolveSafe(projectRoot, relPath);
+  const full = resolveSafe(projectRoot, relPath, 'write');
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, String(content ?? ''), 'utf8');
   return { path: relPath.replace(/\\/g, '/'), bytes: Buffer.byteLength(String(content ?? ''), 'utf8') };
 }
 
 function deletePath(projectRoot, relPath) {
-  const full = resolveSafe(projectRoot, relPath);
+  const full = resolveSafe(projectRoot, relPath, 'delete');
   if (!fs.existsSync(full)) {
     throw new Error(`不存在: ${relPath}`);
   }

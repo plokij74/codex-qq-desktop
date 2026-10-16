@@ -104,6 +104,7 @@ PTY、OS 隔离、语义索引、子 Agent 续跑、会话导入、回滚、运�
 
 ## E3：权限、OS 隔离与秘密管理
 
+设计规格见 [E3 spec](docs/superpowers/specs/2026-10-16-phase-e3-permissions-os-isolation-secrets-design.md)。实施计划见 [E3 plan](docs/superpowers/plans/2026-10-16-phase-e3-permissions-os-isolation-secrets.md)。
 前置：E2。
 
 - 在既有应用层权限 Gate 上增加明确的执行策略与 OS 级隔离后端；分别声明文件、网络、进程、环境变量和资源边界。
@@ -519,9 +520,9 @@ E1–E26 的真实证据 → E27
 
 ### 当前执行状态
 
-- [ ] E1 基础断点与展示止血
-- [ ] E2 消息、Plan 与工具轨迹
-- [ ] E3 权限、OS 隔离与秘密管理
+- [x] E1 基础断点与展示止血
+- [x] E2 消息、Plan 与工具轨迹
+- [x] E3 权限、OS 隔离与秘密管理
 - [ ] E4 模型能力与真实助手
 - [ ] E5 文本附件
 - [ ] E6 图片多模态

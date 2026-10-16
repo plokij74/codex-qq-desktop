@@ -64,6 +64,48 @@ html, body {
 .window-control:hover { background: rgba(255,255,255,.25); }
 .window-control.window-close:hover { background: #d74d57; border-color: #ef8b91; }
 
+.isolation-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  user-select: none;
+}
+.isolation-badge:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+.isolation-badge.unconfined {
+  background: #fdf2e9;
+  color: #b95000;
+  border-color: #f6c38f;
+  font-weight: 600;
+}
+.elevation-desc {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #333;
+  margin: 12px 0 16px;
+  padding: 8px 12px;
+  background: #fff8e6;
+  border-left: 4px solid #ff9800;
+  border-radius: 2px;
+}
+.btn-danger {
+  background: linear-gradient(#f77079, #d74d57) !important;
+  border-color: #ba323c !important;
+  color: #fff !important;
+}
+.btn-danger:hover {
+  filter: brightness(1.1) !important;
+}
+
 /* Toolbar */
 .qq-toolbar {
   display: flex;

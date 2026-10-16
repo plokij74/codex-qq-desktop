@@ -281,4 +281,6 @@ contextBridge.exposeInMainWorld('codex', {
     ipcRenderer.on('engineering:repair:event', listener);
     return () => ipcRenderer.removeListener('engineering:repair:event', listener);
   },
+  getIsolationStatus: () => ipcRenderer.invoke('isolation:getStatus'),
+  requestIsolationElevation: (payload = {}) => ipcRenderer.invoke('isolation:requestElevation', payload),
 });
