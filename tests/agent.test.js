@@ -1201,7 +1201,9 @@ describe('agent tools', () => {
       return;
     }
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'term-'));
-    const r = await runTerminal(root, 'Write-Output "hello-agent"', { timeoutMs: 15000 });
+    const command = 'Write-Output "hello-agent"';
+    const hostExecutionGrant = await require('../src/ai/host-execution').authorizeHostExecution({projectRoot:root,command,sessionKey:'agent-test',confirm:async()=>true});
+    const r = await runTerminal(root, command, { timeoutMs: 15000,hostExecutionGrant,sessionKey:'agent-test' });
     assert.equal(r.ok, true);
     assert.match(r.stdout, /hello-agent/);
   });

@@ -51,6 +51,13 @@ function hasAlternateDataStream(targetPath) {
  * Verify that targetPath is strictly inside projectRoot using canonical physical paths.
  * Resolves symlinks/junctions to prevent directory traversal escapes.
  */
+function pathEntryExists(target) {
+  try { fs.lstatSync(target); return true; } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return false;
+    throw err;
+  }
+}
+
 function verifyPathSandbox(projectRoot, targetPath = '.', options = {}) {
   const mode = options.mode || 'read'; // 'read' | 'write' | 'delete'
   if (!projectRoot || typeof projectRoot !== 'string') {
@@ -66,7 +73,7 @@ function verifyPathSandbox(projectRoot, targetPath = '.', options = {}) {
   }
 
   // Check for ADS and reserved device names
-  if (hasAlternateDataStream(targetPath) || hasWindowsDeviceName(targetPath)) {
+  if (typeof targetPath !== 'string' || /[\x00-\x1f\x7f]/.test(targetPath) || hasAlternateDataStream(targetPath) || hasWindowsDeviceName(targetPath)) {
     const err = new Error(`检测到不合规的文件路径或保留设备名: ${targetPath}`);
     err.code = SECURITY_CODES.INVALID_PATH;
     throw err;
@@ -76,23 +83,23 @@ function verifyPathSandbox(projectRoot, targetPath = '.', options = {}) {
   try {
     canonicalRoot = fs.realpathSync.native ? fs.realpathSync.native(projectRoot) : fs.realpathSync(projectRoot);
   } catch (e) {
-    canonicalRoot = path.resolve(projectRoot);
+    throw Object.assign(new Error('无法验证项目物理路径'), { code: SECURITY_CODES.INVALID_PATH });
   }
 
   const resolved = path.resolve(projectRoot, targetPath);
 
   let canonicalTarget;
-  if (fs.existsSync(resolved)) {
+  if (pathEntryExists(resolved)) {
     try {
       canonicalTarget = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
     } catch (e) {
-      canonicalTarget = resolved;
+      throw Object.assign(new Error('无法验证目标物理路径'), { code: SECURITY_CODES.INVALID_PATH });
     }
   } else {
     // If target doesn't exist yet (e.g. file creation), resolve its closest existing ancestor
     let cur = path.dirname(resolved);
     const subParts = [path.basename(resolved)];
-    while (!fs.existsSync(cur)) {
+    while (!pathEntryExists(cur)) {
       const parent = path.dirname(cur);
       if (parent === cur) break;
       subParts.unshift(path.basename(cur));
@@ -109,7 +116,7 @@ function verifyPathSandbox(projectRoot, targetPath = '.', options = {}) {
     try {
       canonicalAncestor = fs.realpathSync.native ? fs.realpathSync.native(cur) : fs.realpathSync(cur);
     } catch (e) {
-      canonicalAncestor = cur;
+      throw Object.assign(new Error('无法验证祖先物理路径'), { code: SECURITY_CODES.INVALID_PATH });
     }
 
     canonicalTarget = path.join(canonicalAncestor, ...subParts);
@@ -119,7 +126,7 @@ function verifyPathSandbox(projectRoot, targetPath = '.', options = {}) {
   const targetComp = process.platform === 'win32' ? canonicalTarget.toLowerCase() : canonicalTarget;
 
   const rel = path.relative(rootComp, targetComp);
-  const isOutside = rel.startsWith('..') || path.isAbsolute(rel);
+  const isOutside = rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel);
 
   if (isOutside) {
     const err = new Error(`路径越界，禁止访问项目外文件: ${targetPath}`);
@@ -152,7 +159,7 @@ function sanitizePathString(rawPath) {
   for (const entry of entries) {
     const trimmed = entry.trim();
     if (!trimmed) continue;
-    if (trimmed === '.' || trimmed === './' || trimmed === '.\\') continue;
+    if (!path.isAbsolute(trimmed) || /(^|[\\/])downloads([\\/]|$)/i.test(trimmed)) continue;
     cleaned.push(trimmed);
   }
   return cleaned.join(path.delimiter);
@@ -187,8 +194,8 @@ function buildSanitizedEnv(customEnv = {}, options = {}) {
   if (customEnv && typeof customEnv === 'object') {
     for (const [k, v] of Object.entries(customEnv)) {
       if (v === undefined || v === null) continue;
-      if (!options.allowSecrets && SENSITIVE_KEY_PATTERN.test(k)) {
-        continue; // drop unauthorized sensitive custom environment variable
+      if (SENSITIVE_KEY_PATTERN.test(k) || /^(NODE_OPTIONS|NODE_PATH|PYTHONPATH|LD_PRELOAD|LD_LIBRARY_PATH|BASH_ENV|ENV|COMSPEC|PATH|PATHEXT)$/i.test(k)) {
+        continue;
       }
       sanitized[k] = String(v);
     }
@@ -293,15 +300,24 @@ function probeIsolationCapabilities() {
     })()
   );
 
+  const native = require('./windows-isolation').getWindowsIsolationStatus();
+  const available = native.available === true;
   return {
-    supported: true,
+    supported: available,
     platform: process.platform,
-    activeMode: 'strict-isolated',
-    containerAvailable: false,
-    processIsolation: process.platform === 'win32' ? 'job-object-or-taskkill' : 'process-group',
-    networkFiltering: true,
+    activeMode: available ? 'strict-isolated' : 'host-unconfined',
+    osIsolationAvailable: available,
+    requiresHostConfirmation: !available,
+    containerAvailable: available,
+    processIsolation: available ? 'job-with-kill-on-close' : 'none',
+    networkFiltering: available,
+    networkPolicy: available ? 'deny-all' : 'unfiltered',
+    backend: available ? native.backend : null,
+    resourceLimits: available ? native : null,
     safeStorageAvailable,
-    recommendation: '已启用项目目录沙箱与敏感变量环境过滤',
+    recommendation: available
+      ? 'Windows AppContainer/Job 后端可用；每次执行重新核验并绑定一次性授权，网络全部拒绝。宿主执行须单次确认'
+      : `OS 强隔离不可用；终端须单次确认宿主执行。${native.reason || ''}`,
     features: {
       pathSandbox: true,
       envSanitization: true,

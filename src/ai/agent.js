@@ -1,3 +1,4 @@
+const { randomUUID } = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
@@ -800,6 +801,7 @@ async function authorizeTool({
   diff,
   agentMode,
   scope,
+  args, projectRoot, projectId,
 }) {
   const effectiveRisk = risk || riskForTool(name);
   if (effectiveRisk === 'network' && !scope) {
@@ -809,6 +811,7 @@ async function authorizeTool({
   if (gate && typeof gate.authorize === 'function') {
     return gate.authorize({
       tool: name,
+      args, projectRoot, projectId,
       risk,
       summary,
       detail,
@@ -1119,6 +1122,9 @@ async function executeTool(name, args, ctx) {
       };
       try {
         const result = await runTerminal(root, command, {
+          hostExecutionGrant: ctx.hostExecutionGrant,
+          sessionKey: ctx.sessionKey,
+          cwd: args.cwd,
           timeoutMs: settings.terminalTimeoutMs || 60000,
           signal: ctx.signal,
           onStdout: (chunk) => ctx.onEvent?.({
@@ -1318,7 +1324,8 @@ async function applyWriteFencesWithGate(projectRoot, content, {
     assertNotAborted(signal);
     const risk = 'write';
     const summary = `写入 ${op.path}`;
-    onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: 'write_fence', args: { path: op.path } });
+    const callId = randomUUID();
+    onEvent?.({ type: AGENT_EVENTS.TOOL_START, callId, tool: 'write_fence', args: { path: op.path } });
     let auth;
     let endEmitted = false;
     try {
@@ -1329,7 +1336,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
         if (!checked?.allowed) {
           const reason = checked?.reason || '隔离写入路径不安全';
           applied.push({ path: op.path, ok: false, error: reason });
-          onEvent?.({ type: AGENT_EVENTS.TOOL_END, tool: 'write_fence', ok: false, summary: reason });
+          onEvent?.({ type: AGENT_EVENTS.TOOL_END, callId, tool: 'write_fence', ok: false, summary: reason });
           endEmitted = true;
           continue;
         }
@@ -1372,6 +1379,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
         applied.push({ path: op.path, ok: false, error: reason });
         onEvent?.({
           type: AGENT_EVENTS.TOOL_END,
+          callId,
           tool: 'write_fence',
           ok: false,
           summary: reason,
@@ -1400,6 +1408,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
         });
         onEvent?.({
           type: AGENT_EVENTS.TOOL_END,
+          callId,
           tool: 'write_fence',
           ok: true,
           summary: `wrote ${r.path} (${r.bytes}b)`,
@@ -1409,6 +1418,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
         applied.push({ path: op.path, ok: false, error: err.message || String(err) });
         onEvent?.({
           type: AGENT_EVENTS.TOOL_END,
+          callId,
           tool: 'write_fence',
           ok: false,
           summary: err.message || String(err),
@@ -1420,6 +1430,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
       if (!endEmitted) {
         onEvent?.({
           type: AGENT_EVENTS.TOOL_END,
+          callId,
           tool: 'write_fence',
           ok: false,
           summary: err?.code === 'ABORTED' || err?.name === 'AbortError' ? '已停止' : (err.message || String(err)),
@@ -1763,7 +1774,9 @@ async function runAgentLoop({
           const relPath = toolPath(name, args);
           const scope = toolScope(name, args);
 
-          onEvent?.({ type: AGENT_EVENTS.TOOL_START, tool: name, args });
+          // Model IDs may repeat across rounds; event pairing identifies executions.
+          const callId = randomUUID();
+          onEvent?.({ type: AGENT_EVENTS.TOOL_START, callId, tool: name, args });
 
           let resultStr;
           let authAllowed = true;
@@ -1856,6 +1869,8 @@ async function runAgentLoop({
               }
               return registry.execute(name, effectiveArgs, {
                 ...runCtx,
+                hostExecutionGrant,
+                sessionKey,
                 project,
                 settings,
                 signal,
@@ -1864,6 +1879,7 @@ async function runAgentLoop({
               });
             }
 
+            let hostExecutionGrant;
             async function authorizeOnce({
               authSummary,
               authDetail,
@@ -1881,6 +1897,9 @@ async function runAgentLoop({
                   confirmTerminal,
                   settings,
                   name,
+                  args: effectiveArgs,
+                  projectRoot: project?.path,
+                  projectId: project?.id,
                   risk,
                   summary: authSummary,
                   detail: authDetail,
@@ -1891,6 +1910,7 @@ async function runAgentLoop({
                   agentMode: mode,
                   scope: authScope,
                 });
+                hostExecutionGrant = auth.hostExecutionGrant;
                 return {
                   allowed: !!auth.allowed,
                   reason: auth.reason,
@@ -2169,6 +2189,7 @@ async function runAgentLoop({
 
             onEvent?.({
               type: AGENT_EVENTS.TOOL_END,
+              callId,
               tool: name,
               ok,
               summary: stepSummary,
@@ -2194,6 +2215,7 @@ async function runAgentLoop({
               const aborted = err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted;
               onEvent?.({
                 type: AGENT_EVENTS.TOOL_END,
+                callId,
                 tool: name,
                 ok: false,
                 summary: aborted ? '已停止' : (err.message || String(err)),

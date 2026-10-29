@@ -91,24 +91,16 @@ function createAttachmentId() {
 /**
  * Strip sensitive keys recursively from any object or array.
  */
-function stripSecrets(value) {
-  if (Array.isArray(value)) return value.map(stripSecrets);
+function stripSecrets(value, depth = 0) {
+  if (depth > 12) return '[TRUNCATED]';
+  if (typeof value === 'string') return truncateString(require('./secret-manager').redactSecrets(value), 64000);
+  if (Array.isArray(value)) return value.slice(0, 256).map((v) => stripSecrets(v, depth + 1));
   if (!value || typeof value !== 'object') return value;
   const out = {};
-  for (const [k, v] of Object.entries(value)) {
-    const lowerKey = String(k).toLowerCase();
-    if (
-      SECRET_KEYS.has(lowerKey) ||
-      lowerKey.includes('secret') ||
-      lowerKey.includes('token') ||
-      lowerKey.includes('password') ||
-      lowerKey.includes('apikey') ||
-      lowerKey.includes('api_key')
-    ) {
-      out[k] = '[REDACTED]';
-    } else {
-      out[k] = v && typeof v === 'object' ? stripSecrets(v) : v;
-    }
+  for (const [k, v] of Object.entries(value).slice(0, 256)) {
+    const lowerKey = k.toLowerCase();
+    if (SECRET_KEYS.has(lowerKey) || /(?:secret|password|apikey|api_key)/i.test(k) || /(?:^|_)token$/i.test(k)) out[k] = '[REDACTED]';
+    else out[k] = stripSecrets(v, depth + 1);
   }
   return out;
 }
@@ -434,7 +426,7 @@ function migrateSessionMessages(messages) {
  * Project a message for UI display.
  */
 function projectToUiModel(msg) {
-  const normalized = normalizeMessage(msg);
+  const normalized = projectToStorageJson(msg);
   const textParts = [];
   const attachments = [];
   let plan = null;
@@ -529,7 +521,7 @@ function projectToModelMessages(messages, opts = {}) {
     }
   }
 
-  return out;
+  return stripSecrets(out);
 }
 
 // =========================================================================
@@ -550,6 +542,7 @@ function projectToStorageJson(msg) {
       delete safeAtt.localAbsPath;
       return safeAtt;
     }
+    if (p.type === PART_TYPES.TOOL_CALL) return { ...p, args: truncateString(JSON.stringify(stripSecrets(p.args)), LIMITS.MAX_TOOL_ARGS_CHARS) };
     return p;
   });
 

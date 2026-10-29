@@ -836,31 +836,7 @@ function defaultSessions() {
   ];
 }
 function normalizeSessionMessageClient(m) {
-  if (!m || typeof m !== 'object') return { role: 'user', content: '' };
-  const content = typeof m.content === 'string' ? m.content : String(m.content || '');
-  const parts = Array.isArray(m.parts) && m.parts.length
-    ? m.parts
-    : [{ type: 'text', text: content }];
-
-  if (m.planId && !parts.some((p) => p && p.type === 'plan')) {
-    parts.push({
-      type: 'plan',
-      planId: m.planId,
-      title: m.planTitle || '实施计划',
-      markdown: m.planMarkdown || '',
-      steps: Array.isArray(m.planSteps) ? m.planSteps : [],
-      status: m.planStatus || 'proposed',
-    });
-  }
-
-  return {
-    ...m,
-    role: m.role || 'user',
-    content,
-    schemaVersion: 2,
-    parts,
-    trajectory: Array.isArray(m.trajectory) ? m.trajectory : [],
-  };
+  return window.E2Messages.restore(m, window.codex.messageSchema);
 }
 
 function loadState() {
@@ -916,7 +892,7 @@ function loadState() {
 function saveState() {
   sessions.forEach(ensureSessionCandidateState);
   sessions.forEach(ensureSessionWorktreeState);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions, projects, activeSessionId, pluginState }));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions: sessions.map((s) => ({ ...s, messages: s.messages.map((m) => window.codex.messageSchema.projectToStorageJson(m)) })), projects, activeSessionId, pluginState }));
 }
 function activeSession() { return sessions.find((s) => s.id === activeSessionId) || sessions[0]; }
 function getProject(id) { return projects.find((p) => p.id === id) || null; }
@@ -1700,12 +1676,12 @@ function renderTrajectoryHtml(trajectory) {
   const rows = trajectory.map((t) => {
     let icon = '⚡';
     let text = '';
-    if (t.kind === 'tool' || t.tool) {
+    if (t.kind === 'tool') {
       icon = t.status === 'error' ? '❌' : '🔧';
       text = '工具: <code>' + escapeHtml(t.tool || '') + '</code> ' + escapeHtml(t.argsSummary || t.summary || '');
     } else if (t.kind === 'approval') {
       icon = '🛡️';
-      text = '授权: ' + escapeHtml(t.tool || '') + ' (' + (t.decision === 'approved' ? '已批准' : '已拒绝') + ')';
+      text = '授权: ' + escapeHtml(t.tool || '') + ' (' + (['approved', 'allow', 'allow_once', 'allow_session'].includes(t.decision) ? '已批准' : (t.decision === 'pending' ? '待处理' : '已拒绝')) + ')';
     } else if (t.kind === 'verify') {
       icon = t.passed ? '✅' : '⚠️';
       text = '校验: ' + (t.passed ? '通过' : '未通过');
@@ -1720,54 +1696,29 @@ function renderTrajectoryHtml(trajectory) {
     }
     return '<div class="trajectory-row"><span class="trajectory-icon">' + icon + '</span> <span class="trajectory-text">' + text + '</span></div>';
   }).join('');
-  return '<details class="trajectory-details"><summary class="trajectory-summary">执行轨迹（' + trajectory.length + ' 步）</summary><div class="trajectory-body">' + rows + '</div></details>';
+  return '<details class="trajectory-details agent-timeline is-history"><summary class="trajectory-summary">执行轨迹（' + trajectory.length + ' 步）</summary><div class="trajectory-body">' + rows + '</div></details>';
 }
 
+async function rejectPlanFromCard(card, sessionId, planId) {
+  if (!card || card.classList.contains('resolved')) return;
+  const session = sessions.find((s) => s.id === sessionId);
+  const project = sessionProject(session);
+  const buttons = card.querySelectorAll('button');
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    const res = await window.codex.rejectPlan({ sessionId, planId, project: project?.path ? { id: project.id, path: project.path } : null, projectBindingId: project?.id ? (worktreeBindings.get(project.id) || '') : '' });
+    if (!res?.ok) throw new Error(res?.error || '驳回失败');
+    setPersistedPlanStatus(sessionId, planId, 'rejected');
+    saveState(); renderMessages(); toast('已驳回计划');
+  } catch (error) { buttons.forEach((button) => { button.disabled = false; }); toast(error.message); }
+}
 function bindPlanCardActions(root) {
   if (!root) return;
   root.querySelectorAll('.plan-card:not(.resolved) .plan-approve').forEach((btn) => {
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      const card = btn.closest('.plan-card');
-      approvePlanFromCard(card, { planId: btn.dataset.planId, sessionId: btn.dataset.sessionId });
-    };
+    btn.onclick = (e) => { e.stopPropagation(); approvePlanFromCard(btn.closest('.plan-card'), { planId: btn.dataset.planId, sessionId: btn.dataset.sessionId }); };
   });
   root.querySelectorAll('.plan-card:not(.resolved) .plan-reject').forEach((btn) => {
-    btn.onclick = async (e) => {
-      e.stopPropagation();
-      const card = btn.closest('.plan-card');
-      const planId = btn.dataset.planId;
-      const sessId = btn.dataset.sessionId || activeSessionId;
-      if (card) {
-        card.classList.add('resolved');
-        card.querySelectorAll('button').forEach((b) => { b.disabled = true; });
-        let resEl = card.querySelector('.plan-result');
-        if (!resEl) {
-          resEl = document.createElement('div');
-          resEl.className = 'plan-result plan-result-rejected';
-          card.appendChild(resEl);
-        }
-        resEl.textContent = '已驳回';
-      }
-      try {
-        if (window.codex?.rejectPlan) {
-          await window.codex.rejectPlan({ sessionId: sessId, planId });
-        }
-      } catch { /* ignore */ }
-      const session = sessions.find((s) => s.id === sessId) || activeSession();
-      if (session) {
-        for (const m of session.messages) {
-          if (Array.isArray(m.parts)) {
-            for (const p of m.parts) {
-              if (p.type === 'plan' && p.planId === planId) p.status = 'rejected';
-            }
-          }
-          if (m.planId === planId) m.planStatus = 'rejected';
-        }
-        saveState();
-      }
-      toast('已驳回计划');
-    };
+    btn.onclick = (e) => { e.stopPropagation(); rejectPlanFromCard(btn.closest('.plan-card'), btn.dataset.sessionId || activeSessionId, btn.dataset.planId); };
   });
 }
 
@@ -1777,7 +1728,10 @@ function renderMessages() {
   const botName = peerName(session?.peer || 'codex');
   const liveRun = chatRun && chatRun.sessionId === activeSessionId && !chatRun.finalized;
   const showTyping = sending && !liveRun;
-  list.innerHTML = msgs.map((msg) => {
+  list.innerHTML = msgs.map((raw) => {
+    const msg = window.codex.messageSchema.projectToStorageJson(raw);
+    const ui = window.codex.messageSchema.projectToUiModel(msg);
+    msg.content = ui.displayText || ui.content;
     const roleClass = msg.role === 'user' ? 'msg-user' : 'msg-assistant';
     const errClass = msg.error ? ' msg-error' : '';
     const compactClass = msg.compact ? ' msg-compact' : '';
@@ -1817,6 +1771,31 @@ function toolArgsSummary(tool, args) {
   } catch {
     return '';
   }
+}
+
+// invoke replies can overtake chat:event delivery while synchronous schema IPC
+// pumps renderer tasks. Keep the run alive until its terminal event has drained.
+function waitForChatRunEvents(run, timeoutMs = 2000) {
+  if (!run || run.finalized) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      run.onEventsSettled = null;
+      // Leave the event handler (including nested synchronous IPC) before
+      // projecting the completed message and clearing chatRun.
+      setTimeout(resolve, 0);
+    };
+    run.onEventsSettled = finish;
+    timer = setTimeout(() => {
+      if (run.runId && !run.doneEvent) console.warn('Chat terminal event missing; using invoke result', run.runId);
+      finish();
+    }, timeoutMs);
+    if (run.doneEvent) finish();
+  });
 }
 
 function createAssistantRunPlaceholder(sessionId) {
@@ -1905,28 +1884,7 @@ function renderPlanCard(ev) {
   const approveBtn = card.querySelector('.plan-approve');
   const rejectBtn = card.querySelector('.plan-reject');
   approveBtn.addEventListener('click', () => approvePlanFromCard(card, ev));
-  rejectBtn.addEventListener('click', async () => {
-    if (card.classList.contains('resolved')) return;
-    approveBtn.disabled = true;
-    rejectBtn.disabled = true;
-    try {
-      if (window.codex?.rejectPlan) {
-        await window.codex.rejectPlan({
-          sessionId: chatRun?.sessionId || activeSessionId,
-          planId: ev.planId,
-        });
-      }
-    } catch { /* ignore */ }
-    card.classList.add('resolved');
-    let res = card.querySelector('.plan-result');
-    if (!res) {
-      res = document.createElement('div');
-      res.className = 'plan-result plan-result-rejected';
-      card.appendChild(res);
-    }
-    res.textContent = '已驳回';
-    toast('已驳回计划');
-  });
+  rejectBtn.addEventListener('click', () => rejectPlanFromCard(card, card.dataset.sessionId, ev.planId));
 
   chatRun.timelineEl.appendChild(card);
   scrollToBottom();
@@ -1934,141 +1892,51 @@ function renderPlanCard(ev) {
 
 async function approvePlanFromCard(card, planEv) {
   if (card && card.classList.contains('resolved')) return;
-  const planId = (card && card.dataset.planId) || planEv?.planId;
-  const sessId = (card && card.dataset.sessionId) || planEv?.sessionId || chatRun?.sessionId || activeSessionId;
-  const session = sessions.find((s) => s.id === sessId) || activeSession();
+  if (sending) return toast('请先停止当前生成再批准执行');
+  const planId = card?.dataset.planId || planEv?.planId;
+  const sessionId = card?.dataset.sessionId || planEv?.sessionId || activeSessionId;
+  const session = sessions.find((s) => s.id === sessionId);
   if (!session || !planId) return;
-
-  const btns = card ? card.querySelectorAll('button') : [];
-  btns.forEach((b) => { b.disabled = true; });
-
-  // If still streaming this plan-producing run, stop first so approve can start new run
-  if (sending) {
-    try { await window.codex.stopChat(); } catch { /* ignore */ }
-    // small yield for main to clear activeRun
-    await new Promise((r) => setTimeout(r, 50));
-  }
-
-  const history = session.messages
-    .filter((m) => !m.error)
-    .map((m) => ({ role: m.role, content: m.content, parts: m.parts }));
-  // Include live assistant buffer if not yet finalized into messages
-  if (chatRun && !chatRun.finalized) {
-    const partial = chatRun.contentFinal || chatRun.textBuffer;
-    if (partial) history.push({ role: 'assistant', content: String(partial) });
-  }
-
-  const proj = sessionProject(session);
-  const projectBindingId = proj?.path ? engineeringBindingToken() : '';
+  const project = sessionProject(session);
+  if (chatRun && !chatRun.finalized) finalizeChatRun();
+  const history = session.messages.filter((m) => !m.error).map((m) => window.codex.messageSchema.projectToStorageJson(m));
   setSending(true);
+  createAssistantRunPlaceholder(sessionId);
+  const approvalRun = chatRun;
   try {
-    const res = await window.codex.approvePlan({
-      sessionId: session.id,
-      planId,
-      messages: history,
-      project: proj?.path ? { name: proj.name, path: proj.path } : null,
-      projectBindingId,
-    });
-    if (!res?.ok && !res?.userMessage) {
-      btns.forEach((b) => { b.disabled = false; });
+    const res = await window.codex.approvePlan({ sessionId, planId, messages: history, project: project?.path ? { id: project.id, name: project.name, path: project.path } : null, projectBindingId: project?.id ? (worktreeBindings.get(project.id) || '') : '' });
+    await waitForChatRunEvents(approvalRun);
+    if (!res?.ok) {
+      if (res?.isRetryable === true) setPersistedPlanStatus(sessionId, planId, 'proposed');
+      else if (res?.isRetryable === false) setPersistedPlanStatus(sessionId, planId, 'expired');
+      if (chatRun === approvalRun && !chatRun.finalized) {
+        if (res?.userMessage || chatRun.textBuffer || chatRun.trajectory.length) finalizeChatRun({ error: true, errorMessage: res?.error || '批准失败' });
+        else { chatRun.el.remove(); chatRun = null; }
+      }
       toast(res?.error || '批准失败');
-      setSending(false);
       return;
     }
-
-    session.agentMode = 'agent';
-    updateAgentModeToggle();
-
-    // Mark plan as approved in session messages
-    for (const m of session.messages) {
-      if (Array.isArray(m.parts)) {
-        for (const p of m.parts) {
-          if (p.type === 'plan' && p.planId === planId) {
-            p.status = 'approved';
-            p.resolvedAt = Date.now();
-          }
-        }
-      }
-      if (m.planId === planId) {
-        m.planStatus = 'approved';
-      }
-    }
-
-    if (card) {
-      card.classList.add('resolved');
-      let resultEl = card.querySelector('.plan-result');
-      if (!resultEl) {
-        resultEl = document.createElement('div');
-        resultEl.className = 'plan-result plan-result-approved';
-        card.appendChild(resultEl);
-      }
-      resultEl.textContent = '已批准，正在执行…';
-    }
-
-    if (res.userMessage) {
-      session.messages.push({
-        role: res.userMessage.role || 'user',
-        content: res.userMessage.content,
-        schemaVersion: 2,
-        parts: [{ type: 'text', text: res.userMessage.content }],
-        createdAt: Date.now(),
-      });
-    }
-    session.updatedAt = Date.now();
-    saveState();
-
-    // Finalize previous plan-run bubble if still open
-    if (chatRun && !chatRun.finalized) {
+    setPersistedPlanStatus(sessionId, planId, 'approved');
+    session.agentMode = 'agent'; updateAgentModeToggle();
+    if (res.userMessage) session.messages.push(window.codex.messageSchema.projectToStorageJson(res.userMessage));
+    if (chatRun === approvalRun && !chatRun.finalized) {
+      const result = res.result || {};
       chatRun.invokeDone = true;
-      finalizeChatRun({
-        content: chatRun.contentFinal || chatRun.textBuffer || '计划已提交',
-        applied: chatRun.applied,
-      });
-    }
-
-    // New agent run placeholder
-    createAssistantRunPlaceholder(session.id);
-    renderMessages();
-    renderLeftDynamic();
-
-    const invokeResult = res.result;
-    if (chatRun && !chatRun.finalized) {
-      chatRun.invokeDone = true;
-      if (invokeResult) {
-        if (chatRun.contentFinal == null && invokeResult.content != null) {
-          chatRun.contentFinal = String(invokeResult.content);
-        }
-        if (!chatRun.applied && invokeResult.applied) chatRun.applied = invokeResult.applied;
-        if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
-        if (Array.isArray(invokeResult.fileChanges)) {
-          for (const fc of invokeResult.fileChanges) mergeFileChangeEntry(chatRun.fileChanges, fc);
-        }
-        if (chatRun.fileChanges.length) renderFileChangesStrip();
-        const content = chatRun.contentFinal != null
-          ? chatRun.contentFinal
-          : (invokeResult.content || chatRun.textBuffer || '');
-        finalizeChatRun({ content, applied: chatRun.applied || invokeResult.applied });
-      } else if (res.aborted) {
-        finalizeChatRun({ aborted: true, content: chatRun.contentFinal || chatRun.textBuffer || '' });
-      } else if (res.error) {
-        finalizeChatRun({
-          error: true,
-          errorMessage: res.error,
-          content: chatRun.contentFinal || chatRun.textBuffer || '',
-        });
-      } else if (chatRun.doneEvent) {
-        finalizeChatRun({ content: chatRun.contentFinal || chatRun.textBuffer || '' });
-      }
+      finalizeChatRun({ content: result.content || chatRun.contentFinal || chatRun.textBuffer || '', applied: result.applied, error: result.ok === false, errorMessage: result.error, aborted: result.aborted });
     }
   } catch (err) {
-    btns.forEach((b) => { b.disabled = false; });
+    await waitForChatRunEvents(approvalRun);
+    if (chatRun === approvalRun && !chatRun.finalized) finalizeChatRun({ error: true, errorMessage: err?.message || String(err) });
     toast(err?.message || String(err));
-  } finally {
-    setSending(false);
-    saveState();
-    renderMessages();
-    renderLeftDynamic();
+  } finally { setSending(false); saveState(); renderMessages(); renderLeftDynamic(); }
+}
+function setPersistedPlanStatus(sessionId, planId, status) {
+  const session = sessions.find((s) => s.id === sessionId);
+  for (const m of session?.messages || []) {
+    for (const p of m.parts || []) if (p.type === 'plan' && p.planId === planId) { p.status = status; p.resolvedAt = status === 'proposed' ? null : Date.now(); }
+    if (m.planId === planId) m.planStatus = status;
   }
+  if (chatRun?.sessionId === sessionId && chatRun.planPart?.planId === planId) chatRun.planPart.status = status;
 }
 
 function renderVerifyStrip(ev) {
@@ -2357,7 +2225,7 @@ function finalizeChatRun(opts = {}) {
       planStatus: chatRun.planPart.status,
     } : {}),
   };
-  session.messages.push(assistantMsg);
+  session.messages.push(window.codex.messageSchema.projectToStorageJson(assistantMsg));
   session.updatedAt = Date.now();
   chatRun.finalized = true;
   const applied = opts.applied || chatRun.applied;
@@ -2902,6 +2770,12 @@ function handleChatEvent(ev) {
     return;
   }
 
+  if (['plan-approved', 'plan-rejected', 'plan-superseded', 'plan-approval-failed', 'plan-approving'].includes(ev.type)) {
+    const status = ev.type === 'plan-approval-failed'
+      ? (ev.isRetryable === true ? 'proposed' : 'expired')
+      : ({ 'plan-approved': 'approved', 'plan-rejected': 'rejected', 'plan-superseded': 'superseded', 'plan-approving': 'executing' })[ev.type];
+    setPersistedPlanStatus(ev.sessionId, ev.planId, status); saveState(); renderMessages();
+  }
   if (!chatRun || chatRun.finalized) return;
   // Route by active run once runId is known; accept first event to bind runId
   if (chatRun.runId && ev.runId && chatRun.runId !== ev.runId) return;
@@ -2924,6 +2798,9 @@ function handleChatEvent(ev) {
     updateStreamBody();
     return;
   }
+  if (['tool-start', 'tool-end', 'approval-needed', 'approval-resolved', 'verify-result', 'subagent-start', 'subagent-end', 'file-change'].includes(type)) {
+    window.E2Messages.collect(chatRun, ev, window.codex.messageSchema);
+  }
   if (type === 'tool-start') {
     if (ev.subagent && ev.subagentId && chatRun?.subagentBlocks?.get(ev.subagentId)) {
       return;
@@ -2934,14 +2811,7 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'tool-end') {
-    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
-    chatRun.trajectory.push({
-      kind: 'tool',
-      tool: ev.tool,
-      summary: ev.summary || '',
-      status: ev.ok === false ? 'error' : 'success',
-      timestamp: Date.now(),
-    });
+
     if (ev.subagent && ev.subagentId && chatRun?.subagentBlocks?.get(ev.subagentId)) {
       const rec = chatRun.subagentBlocks.get(ev.subagentId);
       const line = document.createElement('div');
@@ -2959,25 +2829,13 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'approval-resolved') {
-    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
-    chatRun.trajectory.push({
-      kind: 'approval',
-      approvalId: ev.approvalId,
-      decision: ev.decision,
-      timestamp: Date.now(),
-    });
+
     markApprovalResolved(ev.approvalId, ev.decision);
     setRunStatus('生成中…');
     return;
   }
   if (type === 'file-change') {
-    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
-    chatRun.trajectory.push({
-      kind: 'file_change',
-      path: ev.path,
-      op: ev.op,
-      timestamp: Date.now(),
-    });
+
     if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
     mergeFileChangeEntry(chatRun.fileChanges, {
       path: ev.path,
@@ -3000,14 +2858,7 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'verify-result') {
-    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
-    chatRun.trajectory.push({
-      kind: 'verify',
-      command: ev.command,
-      passed: Boolean(ev.ok),
-      summary: ev.summary || '',
-      timestamp: Date.now(),
-    });
+
     renderVerifyStrip(ev);
     return;
   }
@@ -3017,16 +2868,7 @@ function handleChatEvent(ev) {
     return;
   }
   if (type === 'subagent-end') {
-    if (!Array.isArray(chatRun.trajectory)) chatRun.trajectory = [];
-    chatRun.trajectory.push({
-      kind: 'subagent',
-      subagentId: ev.subagentId,
-      kindName: ev.kind,
-      goal: ev.goal,
-      passed: Boolean(ev.ok),
-      summary: ev.summary || '',
-      timestamp: Date.now(),
-    });
+
     const rec = ensureSubagentBlock(ev);
     if (rec) {
       rec.statusEl.className = 'sa-status ' + (ev.ok ? 'is-ok' : 'is-fail');
@@ -5464,21 +5306,15 @@ async function updateIsolationBadge() {
   if (!badge || !window.codex?.getIsolationStatus) return;
   try {
     const res = await window.codex.getIsolationStatus();
-    const policy = res?.executionPolicy || 'strict-isolated';
-    if (policy === 'host-unconfined') {
-      badge.textContent = '⚠️ 主机未受限';
-      badge.className = 'isolation-badge unconfined';
-      badge.title = '当前执行策略: 主机未受限 (host-unconfined) - 请注意命令越界风险';
-    } else if (policy === 'workspace-write') {
-      badge.textContent = '📂 工作区写入';
-      badge.className = 'isolation-badge';
-      badge.title = '当前执行策略: 工作区写入 (workspace-write) - 允许项目内写入';
-    } else {
-      badge.textContent = '🛡️ 沙箱隔离';
-      badge.className = 'isolation-badge';
-      badge.title = '当前执行策略: 严格隔离 (strict-isolated) - 沙箱工作区保护 + 环境变量过滤';
-    }
+    const selectedPolicy = String(res?.executionPolicy || 'strict-isolated').toLowerCase().replace(/_/g, '-');
+    const isolated = res?.capabilities?.osIsolationAvailable === true && selectedPolicy !== 'host-unconfined';
+    badge.textContent = isolated ? '🛡️ Windows OS 隔离可用' : selectedPolicy === 'host-unconfined' ? '⚠️ 宿主执行模式（未隔离）' : '⚠️ OS 隔离不可用';
+    badge.className = isolated ? 'isolation-badge' : 'isolation-badge unconfined';
+    badge.title = isolated ? '终端使用已核验的 LPAC/Job 后端；网络全部拒绝，每次启动仍须核验，失败不自动退回宿主' : '宿主执行没有 OS 文件或网络隔离，必须为具体命令单次明确确认';
   } catch (err) {
+    badge.textContent = '⚠️ 隔离状态未知';
+    badge.className = 'isolation-badge unconfined';
+    badge.title = '无法核对当前隔离能力，不将旧状态视为本次执行授权或隔离证明';
     console.warn('Failed to update isolation badge:', err);
   }
 }
@@ -5486,7 +5322,7 @@ async function updateIsolationBadge() {
 function promptElevation(targetPolicy, onConfirm) {
   const modal = document.getElementById('elevation-modal');
   if (!modal) {
-    if (onConfirm) onConfirm();
+    toast('无法显示宿主执行确认，操作已取消');
     return;
   }
   modal.classList.remove('hidden');
@@ -5934,7 +5770,7 @@ async function sendMessage() {
   await maybeAutoCompact(session);
 
   // Live assistant placeholder driven by onChatEvent
-  createAssistantRunPlaceholder(session.id);
+  const sendingRun = createAssistantRunPlaceholder(session.id);
   renderMessages();
   renderLeftDynamic();
 
@@ -5966,8 +5802,9 @@ async function sendMessage() {
     localSendToken = null;
   }
 
+  await waitForChatRunEvents(sendingRun);
   // Merge carefully: prefer done-event content, then invoke result
-  if (chatRun && !chatRun.finalized) {
+  if (chatRun === sendingRun && !chatRun.finalized) {
     chatRun.invokeDone = true;
     if (invokeResult) {
       if (chatRun.contentFinal == null && invokeResult.content != null) {
@@ -6259,7 +6096,9 @@ function boot() {
   // One global chat:event listener; routes by active chatRun / runId (+ terminal-*)
   if (window.codex?.onChatEvent) {
     window.codex.onChatEvent((ev) => {
+      const run = chatRun;
       try { handleChatEvent(ev); } catch (e) { console.error('chat event handler', e); }
+      finally { if (run?.doneEvent) run.onEventsSettled?.(); }
     });
   }
   window.codex?.onMcpTaskEvent?.((event) => {

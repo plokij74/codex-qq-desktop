@@ -226,6 +226,96 @@ function clampVerificationSettings(s) {
   return s;
 }
 
+function registerSettingsSecrets(value, manager, key = '') {
+  if (typeof value === 'string') {
+    if (/key|token|secret|password|authorization|credential/i.test(key)) {
+      manager.registerSecret(value, 'CONFIG_SECRET');
+      if (/^Bearer\s+/i.test(value)) manager.registerSecret(value.replace(/^Bearer\s+/i, ''), 'CONFIG_SECRET');
+    }
+    return;
+  }
+  if (value && typeof value === 'object') for (const [childKey, child] of Object.entries(value)) registerSettingsSecrets(child, manager, childKey);
+}
+
+const MCP_CREDENTIAL_REF = /^mcp_credentials_[a-f0-9]{32}$/;
+
+function mcpCredentialError(cause) {
+  const error = new Error('MCP credential storage is unavailable');
+  error.code = 'MCP_CREDENTIAL_STORE_UNAVAILABLE';
+  error.cause = cause;
+  return error;
+}
+
+function registerMcpCredentialValues(value, manager) {
+  if (typeof value === 'string') {
+    manager.registerSecret(value, 'MCP_CREDENTIAL');
+    if (/^Bearer\s+/i.test(value)) manager.registerSecret(value.replace(/^Bearer\s+/i, ''), 'MCP_CREDENTIAL');
+  } else if (value && typeof value === 'object') {
+    for (const child of Object.values(value)) registerMcpCredentialValues(child, manager);
+  }
+}
+
+function hydrateMcpServers(servers, manager) {
+  try {
+    return (Array.isArray(servers) ? servers : []).map((server) => {
+      if (!server?.credentialsRef) return server;
+      if (!MCP_CREDENTIAL_REF.test(server.credentialsRef)) throw new Error('Invalid MCP credential reference');
+      const secret = manager.getSecret(server.credentialsRef);
+      if (!secret) throw new Error('Missing MCP credentials');
+      const credentials = JSON.parse(secret);
+      if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) throw new Error('Invalid MCP credentials');
+      return { ...server, ...('env' in credentials ? { env: credentials.env } : {}), ...('headers' in credentials ? { headers: credentials.headers } : {}) };
+    });
+  } catch (error) { throw mcpCredentialError(error); }
+}
+
+// References are accepted only from the previous main-owned disk snapshot,
+// never from incoming UI/import data. Fresh refs keep a failed settings write
+// from replacing credentials still referenced by the previous settings file.
+function protectMcpServers(servers, previous, manager) {
+  const byName = new Map((Array.isArray(previous) ? previous : []).filter(Boolean).map((server) => [server.name, server]));
+  try {
+    return servers.map((server) => {
+      const disk = { ...server };
+      const credentials = {};
+      for (const field of ['env', 'headers']) {
+        if (server[field] !== undefined) credentials[field] = server[field];
+        delete disk[field];
+      }
+      if (!Object.keys(credentials).length) return disk;
+      registerMcpCredentialValues(credentials, manager);
+      const payload = JSON.stringify(credentials);
+      const old = byName.get(server.name);
+      let ref = old?.transport === server.transport && MCP_CREDENTIAL_REF.test(old?.credentialsRef || '') ? old.credentialsRef : '';
+      if (!ref || manager.getSecret(ref) !== payload) {
+        ref = `mcp_credentials_${crypto.randomBytes(16).toString('hex')}`;
+        manager.setSecret(ref, payload, { label: 'MCP credentials' });
+      }
+      disk.credentialsRef = ref;
+      return disk;
+    });
+  } catch (error) { throw mcpCredentialError(error); }
+}
+
+function retireMcpCredentials(previous, next, manager) {
+  const retained = new Set(next.map((server) => server.credentialsRef).filter(Boolean));
+  for (const server of Array.isArray(previous) ? previous : []) {
+    const ref = server?.credentialsRef;
+    if (MCP_CREDENTIAL_REF.test(ref || '') && !retained.has(ref)) manager.deleteSecret(ref);
+  }
+}
+
+function writeSettingsFile(file, settings) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${crypto.randomBytes(12).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(settings, null, 2), 'utf8');
+    fs.renameSync(temporary, file);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
 const secretManagersByPath = new Map();
 function getOrCreateSecretManager(userDataPath) {
   if (!userDataPath || typeof userDataPath !== 'string') return defaultSecretManager;
@@ -247,7 +337,22 @@ function loadSettings(userDataPath, options = {}) {
     }
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
-    const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    const runtimeServers = sanitizeMcpServers(hydrateMcpServers(parsed.mcpServers, secMgr), { allowRootPaths: true });
+    for (const server of runtimeServers) {
+      registerMcpCredentialValues(server.env, secMgr);
+      registerMcpCredentialValues(server.headers, secMgr);
+    }
+    if (Array.isArray(parsed.mcpServers)) {
+      const diskServers = protectMcpServers(runtimeServers, parsed.mcpServers, secMgr);
+      if (JSON.stringify(diskServers) !== JSON.stringify(parsed.mcpServers)) {
+        try {
+          writeSettingsFile(file, { ...parsed, mcpServers: diskServers });
+          retireMcpCredentials(parsed.mcpServers, diskServers, secMgr);
+        } catch (error) { throw mcpCredentialError(error); }
+      }
+    }
+    const merged = { ...DEFAULT_SETTINGS, ...parsed, mcpServers: runtimeServers };
+    registerSettingsSecrets(merged, secMgr);
 
     if (secMgr && secMgr.hasSecret('main_api_key')) {
       merged.apiKey = secMgr.getSecret('main_api_key') || '';
@@ -271,7 +376,8 @@ function loadSettings(userDataPath, options = {}) {
     clampWebSettings(merged);
     clampVerificationSettings(merged);
     return clampMcpD10Settings(clampUsageSettings(merged));
-  } catch {
+  } catch (error) {
+    if (error.code === 'MCP_CREDENTIAL_STORE_UNAVAILABLE') throw error;
     const fallback = { ...DEFAULT_SETTINGS };
     if (secMgr && secMgr.hasSecret('main_api_key')) {
       fallback.apiKey = secMgr.getSecret('main_api_key') || '';
@@ -285,6 +391,7 @@ function loadSettings(userDataPath, options = {}) {
 function saveSettings(userDataPath, partial, options = {}) {
   const secMgr = options.secretManager || getOrCreateSecretManager(userDataPath);
   const incoming = { ...partial };
+  registerSettingsSecrets(incoming, secMgr);
 
   if (typeof incoming.apiKey === 'string' && incoming.apiKey.trim().length > 0) {
     if (secMgr) {
@@ -302,10 +409,6 @@ function saveSettings(userDataPath, partial, options = {}) {
   const current = loadSettings(userDataPath, { secretManager: secMgr });
   const next = { ...current, ...incoming };
 
-  // Strip plaintext apiKey from disk representation
-  const diskCopy = { ...next };
-  delete diskCopy.apiKey;
-
   next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
   next.mcpServers = sanitizeMcpServers(next.mcpServers, { allowRootPaths: true });
   clampCompactSettings(next);
@@ -313,8 +416,12 @@ function saveSettings(userDataPath, partial, options = {}) {
   clampWebSettings(next);
   clampUsageSettings(next);
   clampVerificationSettings(next);
-  fs.mkdirSync(userDataPath, { recursive: true });
-  fs.writeFileSync(getSettingsPath(userDataPath), JSON.stringify(diskCopy, null, 2), 'utf8');
+  const file = getSettingsPath(userDataPath);
+  const previousServers = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers : [];
+  const diskCopy = { ...next, mcpServers: protectMcpServers(next.mcpServers, previousServers, secMgr) };
+  delete diskCopy.apiKey;
+  writeSettingsFile(file, diskCopy);
+  retireMcpCredentials(previousServers, diskCopy.mcpServers, secMgr);
 
   // In-memory returned object retains decrypted apiKey
   if (secMgr && secMgr.hasSecret('main_api_key')) {

@@ -176,6 +176,7 @@ function tokenFromResponse(data, context, previous = null, now = Date.now, error
     ? now() + Math.floor(expiresIn * 1000)
     : null;
   const refreshToken = String(data?.refresh_token || previous?.refreshToken || '').trim();
+  for (const value of [accessToken, refreshToken, context?.clientSecret]) require('./secret-manager').defaultSecretManager.registerSecret(value, 'MCP_OAUTH');
   const scope = typeof data?.scope === 'string'
     ? data.scope.slice(0, 4096)
     : (previous?.scope || '');
@@ -261,6 +262,9 @@ function createMcpOAuthManager(options = {}) {
         throw new Error('invalid payload');
       }
       records = new Map(Object.entries(parsed.records));
+      for (const record of records.values()) {
+        for (const key of ['accessToken', 'refreshToken', 'clientSecret']) require('./secret-manager').defaultSecretManager.registerSecret(record?.[key], 'MCP_OAUTH');
+      }
     } catch (error) {
       loadError = makeError('MCP_OAUTH_STORE_CORRUPT', 'OAuth credential store could not be decrypted');
       loadError.cause = error;

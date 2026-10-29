@@ -53,6 +53,7 @@ function makeAbortedError() {
 function rememberSessionRisk(sessionKey, risk, projectId) {
   if (!sessionKey || !risk) return;
   defaultScopedSessionStore.grant(projectId, sessionKey, risk);
+  if (projectId) return;
   let set = globalSessionAllows.get(sessionKey);
   if (!set) {
     set = new Set();
@@ -107,6 +108,7 @@ function createPermissionGate({
   projectId,
   policyLevel,
   isElevated,
+  requestHostExecution,
   onApprovalNeeded,
 } = {}) {
   const gateAgentMode = normalizeAgentMode(agentMode);
@@ -211,7 +213,13 @@ function createPermissionGate({
     agentMode: callAgentMode,
   } = {}) {
     const effProjectRoot = callProjectRoot || projectRoot;
-    const effProjectId = callProjectId || projectId;
+    let effProjectId = projectId || callProjectId;
+    if (effProjectRoot) {
+      try {
+        const physicalRoot = require('./os-isolation').verifyPathSandbox(effProjectRoot, '.').canonicalRoot;
+        effProjectId = JSON.stringify([effProjectId || '', process.platform === 'win32' ? physicalRoot.toLowerCase() : physicalRoot]);
+      } catch (err) { return { allowed: false, code: err.code, reason: err.message }; }
+    }
     const effPolicyLevel = callPolicyLevel || policyLevel;
     const effIsElevated = callIsElevated !== undefined ? callIsElevated : isElevated;
 
@@ -227,6 +235,17 @@ function createPermissionGate({
 
     if (signal?.aborted) {
       throw makeAbortedError();
+    }
+
+    if (tool === 'run_terminal') {
+      if (mode === 'plan' || permissionMode === 'read-only' || !terminalEnabled) return { allowed: false, reason: '当前模式不允许终端执行' };
+      if (typeof requestHostExecution !== 'function' || !effProjectRoot || !sessionKey) return { allowed: false, code: 'OS_ISOLATION_UNAVAILABLE', requiresElevation: true, reason: 'OS 强隔离不可用；缺少单次宿主确认通道' };
+      try {
+        const hostExecutionGrant = await requestHostExecution({ projectRoot: effProjectRoot, sessionKey, command: args?.command, cwd: args?.cwd, signal, policyLevel: effPolicyLevel || 'strict-isolated', needsConfirmation: permissionMode !== 'full-auto' || terminalRequireConfirm !== false });
+        if (!hostExecutionGrant) return { allowed: false, reason: '未获得终端执行确认' };
+        const isolated = require('./windows-isolation').isIsolatedExecutionGrant(hostExecutionGrant);
+        return { allowed: true, hostExecutionGrant, executionMode: isolated ? 'strict-isolated' : 'host-unconfined', isolated };
+      } catch (err) { return { allowed: false, code: err.code, reason: err.message }; }
     }
 
     if (tool && effProjectRoot) {
@@ -364,6 +383,7 @@ function createPermissionGate({
 
   return {
     authorize,
+    authorizeHostExecution: (request) => authorize({ ...request, tool: 'run_terminal', args: { command: request.command, cwd: request.cwd } }),
     resolveApproval,
     cancelPending,
     rememberSession,

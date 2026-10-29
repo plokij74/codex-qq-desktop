@@ -305,22 +305,13 @@ describe('permission', () => {
     assert.equal(r.reason, '用户拒绝');
   });
 
-  it('full-auto with terminalRequireConfirm still needs approval for terminal', async () => {
-    let pendingId;
-    const gate = createPermissionGate({
-      permissionMode: 'full-auto',
-      terminalEnabled: true,
-      terminalRequireConfirm: true,
-      onApprovalNeeded: async (p) => { pendingId = p.approvalId; },
-    });
-    const p = gate.authorize({
-      tool: 'run_terminal', risk: 'terminal', summary: 'ls', sessionKey: 's1',
-    });
-    await new Promise((r) => setImmediate(r));
-    assert.ok(pendingId, 'should request approval for terminal');
-    gate.resolveApproval(pendingId, 'allow');
-    const r = await p;
-    assert.equal(r.allowed, true);
+  it('full-auto cannot use ordinary approval as host execution authority', async () => {
+    let prompted = false;
+    const gate = createPermissionGate({ permissionMode:'full-auto',terminalEnabled:true,terminalRequireConfirm:false,onApprovalNeeded:async()=>{prompted=true;} });
+    const result = await gate.authorize({tool:'run_terminal',args:{command:'echo hello'},sessionKey:'s1'});
+    assert.equal(result.allowed,false);
+    assert.equal(result.code,'OS_ISOLATION_UNAVAILABLE');
+    assert.equal(prompted,false);
   });
 
   it('resolveApproval returns true when pending, false when missing', async () => {

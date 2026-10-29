@@ -1,6 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('codex', {
+  messageSchema: {
+    normalizeMessage: (message) => ipcRenderer.sendSync('message:project', { kind: 'normalize', message }),
+    projectToStorageJson: (message) => ipcRenderer.sendSync('message:project', { kind: 'storage', message }),
+    projectToUiModel: (message) => ipcRenderer.sendSync('message:project', { kind: 'ui', message }),
+  },
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),

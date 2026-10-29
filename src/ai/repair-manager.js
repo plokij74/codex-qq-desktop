@@ -654,7 +654,7 @@ class RepairManager {
           profileId: item.validationProfile.profileId,
           profileFingerprint: item.validationProfile.profileFingerprint,
           signal: abort.signal,
-          runProfile: (profileOptions) => this.verification.runFrozenProfile({ ...profileOptions, settings, preAuthorized: true }),
+          runProfile: (profileOptions) => this.verification.runFrozenProfile({ ...profileOptions, settings, preAuthorized: true, permissionGate: gate, sessionKey: context.sessionKey }),
         });
       } catch (error) { output = { ok: false, status: abort.signal.aborted ? 'cancelled' : 'error', errorCode: error.code, statusMessage: error.message }; }
       const rawStatus = String(output?.status || '');

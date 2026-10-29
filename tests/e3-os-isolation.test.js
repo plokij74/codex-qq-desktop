@@ -153,7 +153,12 @@ test('E3 OS Isolation - checkOutboundPolicy enforces network boundaries', () => 
 
 test('E3 OS Isolation - probeIsolationCapabilities reports truthful status', () => {
   const caps = probeIsolationCapabilities();
-  assert.equal(caps.supported, true);
+  const native = require('../src/ai/windows-isolation').getWindowsIsolationStatus();
+  assert.equal(caps.supported, native.available);
+  assert.equal(caps.osIsolationAvailable, native.available);
+  assert.equal(caps.networkFiltering, native.available);
+  assert.equal(caps.activeMode, native.available ? 'strict-isolated' : 'host-unconfined');
+  if (native.available) assert.equal(caps.networkPolicy, 'deny-all');
   assert.equal(caps.features.pathSandbox, true);
   assert.equal(caps.features.envSanitization, true);
   assert.equal(caps.features.processTreeTracking, true);

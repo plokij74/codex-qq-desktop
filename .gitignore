@@ -11,4 +11,6 @@ run-npm-install.ps1
 .DS_Store
 .idea/
 *.tmp
+src/native/windows-isolation/Launcher.exe
+src/native/windows-isolation/Launcher.manifest.json
 

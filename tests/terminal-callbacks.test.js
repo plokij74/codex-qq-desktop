@@ -4,7 +4,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { runTerminal } = require('../src/ai/terminal');
+const { runTerminal: rawRunTerminal } = require('../src/ai/terminal');
+const { authorizeHostExecution } = require('../src/ai/host-execution');
+async function runTerminal(root, command, options) {
+  const hostExecutionGrant = await authorizeHostExecution({projectRoot:root,command,sessionKey:'callbacks',confirm:async()=>true});
+  return rawRunTerminal(root,command,{...options,sessionKey:'callbacks',hostExecutionGrant});
+}
 const { executeToolFixed } = require('../src/ai/agent');
 const { createPermissionGate } = require('../src/ai/permission');
 const { AGENT_EVENTS } = require('../src/ai/agent-events');
@@ -62,12 +67,14 @@ describe('agent run_terminal terminal events', () => {
       terminalRequireConfirm: false,
       onApprovalNeeded: async () => {},
     });
+    const hostExecutionGrant = await authorizeHostExecution({projectRoot:root,command:'Write-Output "agent-term"',sessionKey:'events',confirm:async()=>true});
     const resultStr = await executeToolFixed('run_terminal', {
       command: hasPowerShell() ? 'Write-Output "agent-term"' : 'Write-Output "agent-term"',
     }, {
       project: { name: 't', path: root },
       settings: { terminalEnabled: true, terminalTimeoutMs: 15000 },
       gate,
+      hostExecutionGrant, sessionKey: 'events',
       onEvent: (e) => events.push(e),
     });
 

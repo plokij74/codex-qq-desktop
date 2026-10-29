@@ -2,6 +2,17 @@
 
 日期：2026-10-16。对应 [实施规划](../plans/2026-10-15-phase-e-product-readiness.md) 与 [E3 实施记录](../plans/2026-10-16-phase-e3-permissions-os-isolation-secrets.md)。
 
+## 当前生产实现补注（2026-10-28）
+
+以下正文保留原设计约束与示例；当前生产入口以 [Windows 原生桥](<../../../src/ai/windows-isolation.js>)、[LPAC/Job 启动器](<../../../src/native/windows-isolation/Launcher.cs>) 和 [终端入口](<../../../src/ai/terminal.js>) 为准。旧 `spawn` / `taskkill` 骨架及 `opts.isElevated` 布尔值不是当前强隔离或宿主授权的依据。
+
+- 原生进程挂起创建，核验 LPAC 令牌与 Job 归属之后才恢复执行；默认严格策略只读，可写工作区必须明确选择；网络不授予出站能力，失败不自动退回宿主。
+- 授权由主进程签发一次性 capability，绑定项目、会话、命令、规范化目录及目录对象身份；模型、渲染进程和普通 `opts` 字段不能伪造或扩大它。
+- 文件权限以 LPAC 与 Windows ACL 落实，除获准工作区与私有临时数据之外，仍需要明确的 Windows 运行时访问；不把操作系统的公开共享资源说成被虚拟化隐藏的全磁盘命名空间。
+- 状态栏只表示已核验后端是否可用；每条命令的 `isolated` / `executionMode` / cleanup 字段才是该次执行证据。明确宿主模式与未知状态不展示为已隔离。
+
+已通过的实机反向测试、资源/生命周期限制、真实 Electron 验收，以及仍未通过的仓库全量稳定性，统一记录在 [10 月 28 日前置闭环记录](<../plans/2026-10-28-e2-e3-frontgate-closure.md>)；不据专项绿灯宣称 E3 整阶段全部完成。
+
 ---
 
 ## 一、设计目标与定位
@@ -19,6 +30,15 @@ Phase E3 落实全功能补齐规划中的核心安全基础与边界隔离缺�
 ---
 
 ## 二、详细设计与规范
+
+### 2026-10-27 强隔离设计修正（后端未完成）
+
+下述 `realpath`、环境清理、URL 守卫、直接 spawn 和 `taskkill /T` 是应用层措施，不能单独满足第一节的 OS 边界。`realpath` 复验不能消除恶意并发路径替换；URL 守卫不拦截 shell 的原始套接字；taskkill 不保证回收已经脱离或在父进程退出后继续存活的后代。第 1.3 节应视为宿主模式的尽力回收方案。
+
+Windows 原生候选后端需要独立 launcher：使用 AppContainer/经验证兼容的 LPAC、无网络 capability、严格限定继承句柄、独立临时目录和范围受限的目录权限；以挂起状态创建子进程，先加入禁止 breakaway 且设置 KILL_ON_JOB_CLOSE 与资源限制的 Job Object，再恢复运行。任一步失败必须拒绝执行，不能静默切换宿主。普通 AppContainer 可访问授予 ALL APPLICATION PACKAGES 的资源，因此必须明确允许的系统运行时读范围，不能据名称声称严格项目独占。修改真实项目 ACL 前必须证明权限和路径竞争安全；必要时使用私有 staging 与受控 copy-out。
+
+后端验收需实际启动可执行程序验证：项目内读写正向对照；项目外/第二项目/凭据 canary 与 junction 越界拒绝；原始 TCP/UDP、IPv4/IPv6、DNS、回环/私网出站拒绝并具有可达的未隔离对照；父进程提前退出、孙进程、breakaway、取消/超时和 launcher 崩溃后无遗留进程；资源限制生效。所有证据取得前能力保持 `supported: false`，宿主执行继续独立确认。
+
 
 ### 1. OS 隔离后端架构（`src/ai/os-isolation.js`）
 

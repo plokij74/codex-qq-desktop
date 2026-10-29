@@ -71,14 +71,9 @@ function evaluateToolExecution(toolName, args = {}, context = {}) {
     isElevated = false,
   } = context;
 
-  // If in HOST_UNCONFINED and elevated explicitly by the user
-  if (policyLevel === ExecutionPolicyLevel.HOST_UNCONFINED && isElevated) {
-    return {
-      allowed: true,
-      policyLevel: ExecutionPolicyLevel.HOST_UNCONFINED,
-      elevated: true,
-      reason: 'Host unconfined execution permitted by user elevation',
-    };
+  // A policy string or boolean is not an execution capability.
+  if (toolName === 'run_terminal') {
+    return { allowed: false, requiresElevation: true, code: 'OS_ISOLATION_UNAVAILABLE', reason: 'OS 强隔离不可用；终端需要单次宿主执行确认' };
   }
 
   // 1. Filesystem path tools

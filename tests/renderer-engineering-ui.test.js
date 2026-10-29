@@ -145,7 +145,20 @@ describe('D11 renderer engineering center contract', () => {
     const start = app.indexOf('function saveState()');
     const body = app.slice(start, app.indexOf('function activeSession()', start));
     assert.ok(start >= 0);
-    assert.match(body, /JSON\.stringify\(\{ sessions, projects, activeSessionId, pluginState \}\)/);
+    let stored;
+    const schema = require('../src/ai/message-schema');
+    require('node:vm').runInNewContext(`${body}\nsaveState();`, {
+      sessions: [{ id: 's1', messages: [{ role: 'assistant', content: 'hello', diagnostic: 'must-not-persist' }] }],
+      projects: [], activeSessionId: 's1', pluginState: {},
+      engineering: { command: 'must-not-persist' }, verification: { stdout: 'must-not-persist' },
+      ensureSessionCandidateState() {}, ensureSessionWorktreeState() {},
+      window: { codex: { messageSchema: schema } }, STORAGE_KEY: 'test',
+      localStorage: { setItem(key, value) { assert.equal(key, 'test'); stored = JSON.parse(value); } },
+    });
+    assert.deepEqual(Object.keys(stored).sort(), ['activeSessionId', 'pluginState', 'projects', 'sessions']);
+    assert.equal(stored.sessions[0].messages[0].schemaVersion, 2);
+    assert.equal(stored.sessions[0].messages[0].content, 'hello');
+    assert.ok(!JSON.stringify(stored).includes('must-not-persist'));
     assert.doesNotMatch(body, /engineering|verification|diagnostic/i);
     assert.doesNotMatch(app, /localStorage\.setItem\([^)]*engineering/i);
   });

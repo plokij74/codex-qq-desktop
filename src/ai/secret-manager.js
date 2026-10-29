@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
+const registeredSecrets = new Map();
 let electronSafeStorage = null;
 try {
   const electron = require('electron');
@@ -38,7 +39,7 @@ class SecretManager {
       secrets: {},
     };
 
-    this.registeredSecrets = new Map(); // secretText -> label
+    this.registeredSecrets = registeredSecrets; // Process-wide: settings, tools and exports share registrations.
     if (this.vaultPath) {
       this.load();
     }
@@ -274,11 +275,48 @@ function migrateSettingsFile(settingsPathOrDir, secretManager) {
 
 const defaultSecretManager = new SecretManager();
 
-function redactSecrets(text) {
-  return defaultSecretManager.redactSecrets(text);
+function redactSecrets(text, seen = new WeakSet()) {
+  if (!text || typeof text !== 'object') return defaultSecretManager.redactSecrets(text);
+  if (seen.has(text)) return '[Circular]';
+  seen.add(text);
+  const result = Array.isArray(text) ? [] : {};
+  for (const [key, value] of Object.entries(text)) {
+    result[key] = /^(api_?key|password|secret|token|authorization|access_?token|refresh_?token)$/i.test(key)
+      ? '[REDACTED]' : redactSecrets(value, seen);
+  }
+  seen.delete(text);
+  return result;
+}
+
+// A bounded output window is published only at flush. This intentionally trades
+// live latency for confidentiality across arbitrary chunk and UTF-8 boundaries.
+function createSecretOutputBuffer(onOutput, maxBytes = 20000) {
+  const chunks = [];
+  let bytes = 0;
+  let truncated = false;
+  let done = false;
+  return {
+    write(chunk) {
+      if (done) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (bytes + data.length > maxBytes) { truncated = true; return; }
+      chunks.push(data); bytes += data.length;
+    },
+    flush() {
+      if (done) return '';
+      done = true;
+      // Overflow may cut a secret at the boundary: discard rather than expose
+      // a partial credential that cannot be matched by the redactor.
+      const text = truncated ? '[OUTPUT OMITTED: limit exceeded]' : redactSecrets(Buffer.concat(chunks).toString('utf8'));
+      chunks.length = 0;
+      if (text && typeof onOutput === 'function') { try { onOutput(text); } catch (_) {} }
+      return text;
+    },
+  };
 }
 
 module.exports = {
+  createSecretOutputBuffer,
   SecretManager,
   defaultSecretManager,
   redactSecrets,

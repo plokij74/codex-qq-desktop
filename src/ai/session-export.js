@@ -16,11 +16,12 @@ const ROLE_LABELS = { user: '我', assistant: '助手', system: '系统', tool: 
 
 function stripSecrets(value) {
   if (Array.isArray(value)) return value.map(stripSecrets);
+  if (typeof value === 'string') return require('./secret-manager').redactSecrets(value);
   if (!value || typeof value !== 'object') return value;
   const out = {};
   for (const [k, v] of Object.entries(value)) {
     if (SECRET_KEYS.has(String(k).toLowerCase())) continue;
-    out[k] = v && typeof v === 'object' ? stripSecrets(v) : v;
+    out[k] = stripSecrets(v);
   }
   return out;
 }
@@ -51,7 +52,7 @@ function exportSessionMarkdown(session) {
   lines.push('---');
 
   messages.forEach((rawMsg, i) => {
-    const norm = normalizeMessage(rawMsg);
+    const norm = projectToStorageJson(rawMsg);
     const who = roleLabel(norm.role);
     const marks = [];
     if (norm.compact) marks.push(`摘要（已压缩 ${norm.compactedCount ?? 0} 条）`);
@@ -98,7 +99,7 @@ function exportSessionMarkdown(session) {
   });
 
   lines.push('');
-  return lines.join('\n');
+  return require('./secret-manager').redactSecrets(lines.join('\n'));
 }
 
 function exportSessionJson(session) {

@@ -72,7 +72,7 @@ function createTaskEventEnvelope(opts = {}) {
     projectId: opts.projectId ? String(opts.projectId) : null,
     type: String(opts.type || 'task-event'),
     timestamp: typeof opts.timestamp === 'number' ? opts.timestamp : Date.now(),
-    data: opts.data || {},
+    data: require('./message-schema').stripSecrets(opts.data || {}),
   };
 }
 
@@ -126,8 +126,8 @@ class TaskHandle {
   }
 
   complete() {
-    this.completedAt = Date.now();
     this.transitionTo(TASK_STATES.COMPLETED);
+    this.completedAt = Date.now();
     return this;
   }
 

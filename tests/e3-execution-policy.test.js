@@ -83,6 +83,5 @@ test('E3 ExecutionPolicy - evaluateToolExecution blocks traversal and SSRF under
     isElevated: true,
   };
   const evalElevated = evaluateToolExecution('read_file', { path: '../outside.txt' }, elevatedCtx);
-  assert.equal(evalElevated.allowed, true);
-  assert.equal(evalElevated.elevated, true);
+  assert.equal(evalElevated.allowed, false);
 });

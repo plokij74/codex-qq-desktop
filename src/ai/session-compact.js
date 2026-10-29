@@ -1,7 +1,7 @@
 'use strict';
 
 const { generateMemoryCandidates } = require('./memory-candidates');
-const { createMessageV2, normalizeMessage, PART_TYPES } = require('./message-schema');
+const { createMessageV2, projectToStorageJson, normalizeMessage, PART_TYPES } = require('./message-schema');
 
 /**
  * Phase D.1 — structured session compaction.
@@ -25,7 +25,7 @@ function approxTokensFromText(s) {
 
 function messageText(m) {
   if (!m || typeof m !== 'object') return '';
-  const norm = normalizeMessage(m);
+  const norm = projectToStorageJson(m);
   let t = norm.content || '';
   if (Array.isArray(norm.trajectory) && norm.trajectory.length) {
     for (const item of norm.trajectory) {
@@ -90,7 +90,7 @@ function serializeOlderTranscript(older, opts = {}) {
   const parts = [];
   for (const m of list) {
     if (!m || typeof m !== 'object') continue;
-    const norm = normalizeMessage(m);
+    const norm = projectToStorageJson(m);
     const role = norm.role || 'unknown';
 
     if (Array.isArray(norm.trajectory) && norm.trajectory.length) {
@@ -113,7 +113,7 @@ function serializeOlderTranscript(older, opts = {}) {
   if (text.length > maxChars) {
     text = '…[transcript truncated]…\n' + text.slice(text.length - maxChars);
   }
-  return text;
+  return require('./secret-manager').redactSecrets(text);
 }
 
 /** Replace `plan.older` with a single summary bubble; returns a new array. */

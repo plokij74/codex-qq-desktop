@@ -20,6 +20,10 @@ const {
 const { createMemoryOnlyRegistry } = require('./ai/providers');
 const { AGENT_EVENTS } = require('./ai/agent-events');
 const { createPermissionGate } = require('./ai/permission');
+const { TaskHandle, TASK_KINDS, createTaskEventEnvelope } = require('./ai/task-contract');
+const { PlanStateManager } = require('./ai/plan-state');
+const { authorizeHostExecution } = require('./ai/host-execution');
+const { redactSecrets } = require('./ai/secret-manager');
 const { runTerminal } = require('./ai/terminal');
 const {
   listTree,
@@ -113,7 +117,52 @@ let activeRun = null;
  * Pending plan per session (from submit_plan / plan-ready).
  * @type {Map<string, { planId: string, title?: string, markdown: string, steps?: string[], sessionId: string }>}
  */
-const pendingPlansBySession = new Map();
+const planState = new PlanStateManager();
+
+function resolvePlanBinding(event, payload = {}) {
+  const sessionId = String(payload.sessionId || '');
+  const token = String(payload.projectBindingId || '');
+  const requestedPath = payload.project?.path || payload.projectPath || '';
+  const binding = token ? worktreeIpc.resolveBinding(event, { projectBindingId: token }) : null;
+  if (!sessionId || !event.sender?.id || ((requestedPath || token) && (!binding || (requestedPath && canonicalDirectory(requestedPath) !== binding.projectPath)))) {
+    throw Object.assign(new Error('项目绑定已失效，请重新打开项目并生成计划'), { code: 'PLAN_BINDING_CHANGED' });
+  }
+  return { sessionId, senderId: event.sender.id, projectId: binding?.projectId || '', projectPath: binding?.projectPath || '', projectBindingId: token };
+}
+
+async function requestHostExecution(sender, request) {
+  const native = require('./ai/windows-isolation');
+  const policy = String(request.policyLevel || 'strict-isolated').toLowerCase().replace(/_/g, '-');
+  if (policy !== 'host-unconfined' && native.getWindowsIsolationStatus().available) {
+    return native.authorizeIsolatedExecution({
+      ...request,
+      confirm: async (scope) => {
+        if (!sender || sender.isDestroyed() || request.signal?.aborted) return false;
+        if (request.needsConfirmation === false) return true;
+        const result = await dialog.showMessageBox(BrowserWindow.fromWebContents(sender), {
+          type: 'question', title: '确认单次隔离执行',
+          message: '此命令使用 Windows AppContainer 与 Job 对象运行，网络全部拒绝。',
+          detail: redactSecrets(`项目：${scope.projectRoot}\n目录：${scope.cwd}\n命令：${scope.command}\n工作区：${scope.workspacePolicy === 'workspace-write' ? '允许项目内读写' : '只读'}\n\n只允许项目与本次私有临时目录；后代进程受同一隔离和资源限制。执行失败不会自动改为宿主运行。`),
+          buttons: ['取消', '允许这一次'], defaultId: 0, cancelId: 0, noLink: true,
+        });
+        return result.response === 1 && !sender.isDestroyed() && !request.signal?.aborted;
+      },
+    });
+  }
+  return authorizeHostExecution({
+    ...request,
+    confirm: async (scope) => {
+      if (!sender || sender.isDestroyed() || request.signal?.aborted) return false;
+      const result = await dialog.showMessageBox(BrowserWindow.fromWebContents(sender), {
+        type: 'warning', title: '确认单次宿主执行',
+        message: '此命令将在宿主机执行，没有操作系统文件或网络隔离。',
+        detail: redactSecrets(`项目：${scope.projectRoot}\n目录：${scope.cwd}\n命令：${scope.command}\n定向凭据：${scope.secretNames?.length ? scope.secretNames.join(', ') : '无'}\n\n仅授权这一次命令；子进程可访问当前账户的文件和网络。`),
+        buttons: ['取消', '允许这一次'], defaultId: 0, cancelId: 0, noLink: true,
+      });
+      return result.response === 1 && !sender.isDestroyed() && !request.signal?.aborted;
+    },
+  });
+}
 
 /**
  * Manual terminal run (panel). Independent from activeRun / chat:stop.
@@ -205,6 +254,9 @@ function getEngineeringIpc() {
     },
     isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
     createPermissionGate: (event, settings) => createPermissionGate({
+      projectId: `engineering:${event.sender.id}`,
+      policyLevel: settings.executionPolicy,
+      requestHostExecution: (request) => requestHostExecution(event.sender, request),
       permissionMode: PERMISSION_MODES.has(settings.permissionMode) ? settings.permissionMode : 'confirm-writes',
       terminalEnabled: settings.terminalEnabled === true,
       terminalRequireConfirm: true,
@@ -555,7 +607,7 @@ function makeRunId() {
 function safeSend(sender, channel, data) {
   try {
     if (sender && !sender.isDestroyed()) {
-      sender.send(channel, data);
+      sender.send(channel, redactSecrets(data));
     }
   } catch {
     /* ignore destroyed sender */
@@ -600,14 +652,18 @@ function createWindow() {
       sandbox: true,
     },
   });
-  const worktreeSenderId = win.webContents.id;
+  const windowSender = win.webContents;
+  const worktreeSenderId = windowSender.id;
   win.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
     if (isMainFrame !== false) {
       worktreeIpc.dropSender(worktreeSenderId);
+      planState.expireSender(worktreeSenderId);
+      if (activeRun?.sender === windowSender) abortActiveRun();
+      if (manualTerm?.sender === windowSender) abortManualTerm();
       engineeringIpc?.dropSender?.(worktreeSenderId);
     }
   });
-  win.webContents.once('destroyed', () => worktreeIpc.dropSender(worktreeSenderId));
+  win.webContents.once('destroyed', () => { worktreeIpc.dropSender(worktreeSenderId); planState.expireSender(worktreeSenderId); if (activeRun?.sender === windowSender) abortActiveRun(); if (manualTerm?.sender === windowSender) abortManualTerm(); });
   win.webContents.once('destroyed', () => engineeringIpc?.dropSender?.(worktreeSenderId));
   win.webContents.once('destroyed', () => cancelOAuthFlowsForSender(worktreeSenderId));
   win.webContents.once('destroyed', () => mcpElicitationController?.cancelOwner?.(worktreeSenderId));
@@ -819,26 +875,30 @@ ipcMain.handle('isolation:getStatus', async () => {
   const { probeIsolationCapabilities } = require('./ai/os-isolation');
   const caps = probeIsolationCapabilities();
   const settings = loadSettings(userDataPath());
+  const executionPolicy = settings.executionPolicy || 'strict-isolated';
+  const hostSelected = String(executionPolicy).toLowerCase().replace(/_/g, '-') === 'host-unconfined';
   return {
     ok: true,
-    capabilities: caps,
-    executionPolicy: settings.executionPolicy || 'strict-isolated',
+    capabilities: { ...caps, activeMode: hostSelected ? 'host-unconfined' : caps.activeMode, requiresHostConfirmation: hostSelected || caps.requiresHostConfirmation },
+    executionPolicy,
+    modeSource: 'configured-default; actual isolation evidence is returned per command',
   };
 });
 
-ipcMain.handle('isolation:requestElevation', async (_event, payload = {}) => {
-  const { ScopedSessionStore } = require('./ai/execution-policy');
-  const { targetPolicy, reason, projectId, sessionKey } = payload;
-  if (!['strict-isolated', 'workspace-write', 'host-unconfined'].includes(targetPolicy)) {
-    return { ok: false, error: '无效的目标提升策略' };
-  }
-  const key = `${projectId || 'global'}::${sessionKey || 'default'}::elevation`;
-  ScopedSessionStore.set(key, targetPolicy);
-  return {
-    ok: true,
-    policy: targetPolicy,
-    elevated: targetPolicy === 'host-unconfined',
-  };
+ipcMain.handle('isolation:requestElevation', async () => ({
+  ok: false, code: 'COMMAND_REQUIRED',
+  error: '宿主执行只在运行具体命令时逐次确认，不能授予会话级无限制权限。',
+}));
+
+// Sandboxed preload cannot require local modules. Only these bounded, pure
+// projections are exposed synchronously; no filesystem or asynchronous work.
+ipcMain.on?.('message:project', (event, payload = {}) => {
+  const schema = require('./ai/message-schema');
+  const methods = { storage: schema.projectToStorageJson, ui: schema.projectToUiModel, normalize: schema.normalizeMessage };
+  try {
+    const method = Object.hasOwn(methods, payload.kind) ? methods[payload.kind] : null;
+    event.returnValue = method ? method(payload.message) : null;
+  } catch { event.returnValue = null; }
 });
 
 ipcMain.handle('mcp:testServer', async (_e, rawCfg) => {
@@ -1309,6 +1369,7 @@ ipcMain.handle('worktree:bind', async (event, payload = {}) => {
   const previousPaths = worktreeIpc.listProjectPaths(event);
   const result = worktreeIpc.bind(event, payload);
   if (result?.ok) {
+    planState.expireBinding({ senderId: event.sender.id, projectId: payload.projectId });
     const engineering = getEngineeringIpc();
     for (const root of previousPaths) {
       if (!worktreeIpc.hasProjectBinding(event, root)) engineering.dropProject(event, root);
@@ -1320,6 +1381,7 @@ ipcMain.handle('worktree:bind', async (event, payload = {}) => {
 ipcMain.handle('worktree:unbind', async (event, payload = {}) => {
   const binding = worktreeIpc.resolveBinding(event, payload);
   const result = worktreeIpc.unbind(event, payload);
+  if (result?.ok) planState.expireBinding({ senderId: event.sender.id, projectBindingId: payload.projectBindingId });
   if (result?.ok && binding?.projectPath && !worktreeIpc.hasProjectBinding(event, binding.projectPath)) {
     engineeringIpc?.dropProject(event, binding.projectPath);
   }
@@ -1548,6 +1610,8 @@ ipcMain.handle('terminal:run', async (event, payload = {}) => {
   const termId = makeTermId();
 
   const gate = createPermissionGate({
+    policyLevel: settings.executionPolicy,
+    requestHostExecution: (request) => requestHostExecution(sender, request),
     permissionMode: PERMISSION_MODES.has(settings.permissionMode)
       ? settings.permissionMode
       : 'confirm-writes',
@@ -1574,7 +1638,7 @@ ipcMain.handle('terminal:run', async (event, payload = {}) => {
       tool: 'run_terminal',
       risk: 'terminal',
       summary: `手动执行: ${command.slice(0, 120)}`,
-      detail: command,
+      detail: command, args: { command, cwd: cwdOpt }, projectRoot: projectPath,
       path: '.',
       sessionKey: sessionId,
       signal,
@@ -1598,6 +1662,8 @@ ipcMain.handle('terminal:run', async (event, payload = {}) => {
     let result;
     try {
       result = await runTerminal(projectPath, command, {
+        sessionKey: sessionId, hostExecutionGrant: auth.hostExecutionGrant,
+        policyLevel: settings.executionPolicy,
         cwd: cwdOpt,
         timeoutMs: settings.terminalTimeoutMs || 60000,
         signal,
@@ -1651,8 +1717,9 @@ ipcMain.handle('terminal:run', async (event, payload = {}) => {
   }
 });
 
-ipcMain.handle('terminal:stop', async (_e, payload = {}) => {
+ipcMain.handle('terminal:stop', async (event, payload = {}) => {
   if (!manualTerm) return { ok: true, stopped: false };
+  if (manualTerm.sender !== event.sender) return { ok: false, error: '终端属于其他窗口' };
   if (payload?.sessionId && manualTerm.sessionId !== payload.sessionId) {
     return { ok: false, error: '会话不匹配' };
   }
@@ -1714,7 +1781,12 @@ async function startChatRun(event, payload = {}, opts = {}) {
   const sessionId = payload.sessionId || '';
 
   const settings = loadSettings(userDataPath());
+  const planBinding = agentMode === 'plan' ? resolvePlanBinding(event, payload) : null;
   const gate = createPermissionGate({
+    projectRoot: payload.project?.path,
+    projectId: JSON.stringify([sender.id, payload.projectBindingId || '', payload.project?.id || '']),
+    policyLevel: settings.executionPolicy,
+    requestHostExecution: (request) => requestHostExecution(sender, request),
     permissionMode: PERMISSION_MODES.has(settings.permissionMode)
       ? settings.permissionMode
       : 'confirm-writes',
@@ -1738,34 +1810,35 @@ async function startChatRun(event, payload = {}, opts = {}) {
     },
   });
 
-  activeRun = { abort, gate, runId, sender };
+  const task = new TaskHandle({ taskId: runId, kind: TASK_KINDS.CHAT_RUN, sessionId, projectId: payload.project?.id, ownerId: sender.id, abortController: abort,
+    onStatusChange: (status) => safeSend(sender, 'chat:event', { runId, sessionId, type: 'task-status', task: createTaskEventEnvelope({ ...status, sessionId, projectId: payload.project?.id, type: 'status', data: status }) }),
+  });
+  // Once a run is accepted, side effects are possible even if no tool-end
+  // event arrives. Spend its Plan authority before any asynchronous work.
+  opts.onExecutionStarted?.(runId);
+  activeRun = { abort, gate, runId, sender, task };
+  task.start();
 
   const emit = (e) => {
     if (e && e.type === AGENT_EVENTS.PLAN_READY && sessionId) {
-      const prev = pendingPlansBySession.get(sessionId);
-      if (prev && prev.planId && prev.planId !== e.planId) {
-        safeSend(sender, 'chat:event', {
-          runId,
-          sessionId,
-          type: 'plan-superseded',
-          planId: prev.planId,
-          newPlanId: e.planId,
-        });
-      }
-      pendingPlansBySession.set(sessionId, {
-        planId: e.planId,
-        title: e.title,
-        markdown: e.markdown,
-        steps: e.steps,
-        sessionId,
-        status: PLAN_STATUS.PROPOSED,
-        createdAt: Date.now(),
+      const binding = planBinding || resolvePlanBinding(event, payload);
+      // Revalidate opaque binding after asynchronous model work.
+      resolvePlanBinding(event, payload);
+      const prev = planState.getPending(sessionId, binding);
+      const plan = planState.propose({ ...e, ...binding });
+      if (prev && prev.planId !== plan.planId) safeSend(sender, 'chat:event', {
+        runId, sessionId, type: 'plan-superseded', planId: prev.planId, newPlanId: plan.planId,
       });
     }
     if (e && e.type === AGENT_EVENTS.USAGE) {
       persistUsageEvent(settings, sessionId, e);
     }
-    safeSend(sender, 'chat:event', { runId, sessionId, ...e });
+    if (!task.isTerminal()) {
+      if (e?.type === AGENT_EVENTS.DONE) task.complete();
+      else if (e?.type === AGENT_EVENTS.ABORTED) task.cancel();
+      else if (e?.type === AGENT_EVENTS.ERROR) task.fail(e.message);
+    }
+    safeSend(sender, 'chat:event', { runId, sessionId, ...e, task: createTaskEventEnvelope({ taskId: runId, kind: TASK_KINDS.CHAT_RUN, sessionId, projectId: payload.project?.id, type: e?.type, data: { state: task.state } }) });
   };
 
   try {
@@ -2158,8 +2231,12 @@ async function startChatRun(event, payload = {}, opts = {}) {
       type: AGENT_EVENTS.ERROR,
       message: err instanceof Error ? err.message : String(err),
     });
-    throw err instanceof Error ? err : new Error(String(err));
+    const publicError = err instanceof Error ? err : new Error(String(err));
+    publicError.message = redactSecrets(publicError.message);
+    if (publicError.stack) publicError.stack = redactSecrets(publicError.stack);
+    throw publicError;
   } finally {
+    if (!task.isTerminal()) { if (signal.aborted) task.cancel(); else task.complete(); }
     if (activeRun && activeRun.runId === runId) {
       activeRun = null;
     }
@@ -2169,109 +2246,53 @@ async function startChatRun(event, payload = {}, opts = {}) {
 ipcMain.handle('chat:send', async (event, payload = {}) => startChatRun(event, payload));
 
 ipcMain.handle('chat:approvePlan', async (event, payload = {}) => {
-  const sessionId = payload.sessionId;
-  const planId = payload.planId;
-  if (!sessionId || !planId) {
-    return { ok: false, error: '缺少 sessionId 或 planId' };
-  }
-  if (worktreeMutation) {
-    return { ok: false, code: 'BUSY', error: '隔离改动正在应用或清理，请稍后重试' };
-  }
-  const pending = pendingPlansBySession.get(sessionId);
-  if (!pending || pending.planId !== planId) {
-    return { ok: false, error: '计划不存在或已更新' };
-  }
-  if (activeRun) {
-    return { ok: false, error: '请先停止当前生成再批准执行' };
-  }
-
-  const content = buildApproveExecutionMessage({
-    title: pending.title,
-    markdown: pending.markdown,
-  });
-  const userMessage = createMessageV2({
-    sessionId,
-    role: 'user',
-    content,
-    createdAt: Date.now(),
-  });
-
-  safeSend(event.sender, 'chat:event', {
-    type: AGENT_EVENTS.PLAN_APPROVED,
-    planId,
-    sessionId,
-  });
-
-  // Clear pending so stale approve cannot re-run the same plan card.
-  pendingPlansBySession.delete(sessionId);
-
-  const baseMessages = Array.isArray(payload.messages) ? payload.messages : [];
-  const messages = [...baseMessages, userMessage];
-
+  const { sessionId, planId } = payload;
+  if (worktreeMutation || activeRun) return { ok: false, code: 'BUSY', error: '请先停止当前执行再批准计划' };
+  let claim;
+  let userMessage;
+  let executionStarted = false;
   try {
+    claim = planState.claimApprove(planId, resolvePlanBinding(event, payload));
+    userMessage = createMessageV2({ sessionId, role: 'user', content: buildApproveExecutionMessage(claim.plan), createdAt: Date.now() });
+    safeSend(event.sender, 'chat:event', { type: 'plan-approving', planId, sessionId });
     const result = await startChatRun(event, {
-      ...payload,
-      agentMode: 'agent',
-      messages,
-      sessionId,
-    }, { stopPrevious: false });
-    return {
-      ok: true,
-      agentMode: 'agent',
-      userMessage,
-      result,
-    };
+      ...payload, agentMode: 'agent', sessionId,
+      messages: [...(Array.isArray(payload.messages) ? payload.messages : []), userMessage],
+    }, { stopPrevious: false, onExecutionStarted: () => {
+      planState.markStarted(planId, claim.claimId);
+      executionStarted = true;
+    } });
+    if (result?.ok === false || result?.aborted) throw Object.assign(new Error(result.error || '执行未完成'), { code: result.code });
+    planState.complete(planId, claim.claimId);
+    safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.PLAN_APPROVED, planId, sessionId });
+    return { ok: true, agentMode: 'agent', userMessage, result };
   } catch (err) {
-    if (isAbortError(err)) {
-      return {
-        ok: false,
-        aborted: true,
-        error: '已停止',
-        agentMode: 'agent',
-        userMessage,
-      };
+    let isRetryable = false;
+    if (claim) {
+      try {
+        const settled = executionStarted
+          ? planState.fail(planId, claim.claimId, err.message)
+          : planState.rollback(planId, claim.claimId, err.message);
+        isRetryable = settled.status === 'proposed';
+      } catch { /* binding expired during run: never restore authority */ }
+      safeSend(event.sender, 'chat:event', { type: 'plan-approval-failed', planId, sessionId, reason: redactSecrets(err.message), isRetryable, status: isRetryable ? 'proposed' : 'expired' });
     }
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-      agentMode: 'agent',
-      userMessage,
-    };
+    const error = redactSecrets(err.message) + (executionStarted ? '\n执行已开始，可能已经产生变更；请先检查现场并生成新计划，不能直接重试旧计划。' : '');
+    return { ok: false, code: err.code || (executionStarted ? 'PLAN_EXECUTION_FAILED' : undefined), aborted: isAbortError(err), isRetryable, error, agentMode: 'agent', userMessage };
   }
 });
 
 ipcMain.handle('chat:rejectPlan', async (event, payload = {}) => {
-  const sessionId = payload.sessionId;
-  const planId = payload.planId;
-  if (!sessionId) {
-    return { ok: false, error: '缺少 sessionId' };
-  }
-  const pending = pendingPlansBySession.get(sessionId);
-  if (pending && planId && pending.planId !== planId) {
-    return { ok: false, error: '计划不存在或已更新' };
-  }
-  if (pending) {
-    pendingPlansBySession.delete(sessionId);
-    safeSend(event.sender, 'chat:event', {
-      type: AGENT_EVENTS.PLAN_REJECTED,
-      planId: pending.planId,
-      sessionId,
-      reason: payload.reason ? String(payload.reason) : null,
-    });
-  }
-  return { ok: true };
+  try {
+    const plan = planState.reject(payload.planId, resolvePlanBinding(event, payload));
+    safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.PLAN_REJECTED, planId: plan.planId, sessionId: plan.sessionId, reason: String(payload.reason || '').slice(0, 1000) });
+    return { ok: true };
+  } catch (err) { return { ok: false, code: err.code, error: err.message }; }
 });
 
-ipcMain.handle('chat:getPendingPlan', async (_event, payload = {}) => {
-  const sessionId = payload.sessionId;
-  if (!sessionId) {
-    return { ok: false, error: '缺少 sessionId' };
-  }
-  const pending = pendingPlansBySession.get(sessionId);
-  if (!pending) {
-    return { ok: true, plan: null };
-  }
-  return { ok: true, plan: { ...pending } };
+ipcMain.handle('chat:getPendingPlan', async (event, payload = {}) => {
+  try { return { ok: true, plan: planState.getPending(payload.sessionId, resolvePlanBinding(event, payload)) }; }
+  catch (err) { return { ok: false, code: err.code, error: err.message }; }
 });
 
 ipcMain.handle('web:fetch', async (_event, payload = {}) => {

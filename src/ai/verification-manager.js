@@ -529,6 +529,7 @@ class VerificationManager {
       workspaceFingerprintStart: '',
       stdout: '', stderr: '', diagnostics: [], outputTruncated: false,
       abort: new AbortController(), profile: { ...profile }, cwdResolved,
+      permissionGate: options.permissionGate, sessionKey: options.sessionKey,
     };
     this.jobs.set(job.jobRef, job);
     this.queue.push(job);
@@ -566,7 +567,14 @@ class VerificationManager {
     let result;
     let internalError = false;
     try {
+      let hostExecutionGrant;
+      if (this.runTerminal === defaultRunTerminal) {
+        const authorization = await job.permissionGate?.authorizeHostExecution?.({ projectRoot: job.projectPath, sessionKey: job.sessionKey, command: job.profile.command, cwd: job.cwdResolved, signal: job.abort.signal });
+        if (!authorization?.allowed || !authorization.hostExecutionGrant) throw codeError('OS_ISOLATION_UNAVAILABLE', '需要单次宿主执行确认');
+        hostExecutionGrant = authorization.hostExecutionGrant;
+      }
       result = await this.runTerminal(job.projectPath, job.profile.command, {
+        hostExecutionGrant, sessionKey: job.sessionKey,
         cwd: job.cwdResolved,
         timeoutMs: job.profile.timeoutMs,
         signal: job.abort.signal,
@@ -713,7 +721,14 @@ class VerificationManager {
     let result;
     let internalError = false;
     try {
+      let hostExecutionGrant;
+      if (this.runTerminal === defaultRunTerminal) {
+        const authorization = await options.permissionGate?.authorizeHostExecution?.({ projectRoot: executionRoot, sessionKey: options.sessionKey, command: profile.command, cwd: cwdResolved, signal: options.signal });
+        if (!authorization?.allowed || !authorization.hostExecutionGrant) throw codeError('OS_ISOLATION_UNAVAILABLE', '需要单次宿主执行确认');
+        hostExecutionGrant = authorization.hostExecutionGrant;
+      }
       result = await this.runTerminal(executionRoot, profile.command, {
+        hostExecutionGrant, sessionKey: options.sessionKey,
         cwd: cwdResolved,
         timeoutMs: profile.timeoutMs,
         signal: options.signal,
