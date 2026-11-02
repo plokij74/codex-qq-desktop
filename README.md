@@ -10,7 +10,7 @@ QQ 2007 风格的 **Codex 聊天客户端**（Windows / Electron）。
 - **搜索**过滤会话与项目
 - **表情 / 图片 / 附件**（含粘贴图片）
 - **斜杠命令**：`/help` `/clear` `/mode` `/new 标题`
-- AI：**本地模拟** 或 **OpenAI 兼容 API**
+- AI：**显式本地模拟** 或三协议 **API 模式**（OpenAI Chat Completions / OpenAI Responses / Anthropic Messages），支持模型与 AI 助手配置
 - **Phase A Agent 核心**：权限三档、内联审批、grep/glob/search_replace、流式正文 + 工具轨迹
 - **Phase B 工程闭环**：写盘 unified diff 审批、`git_status` / `git_diff` / `git_commit`、底部终端面板、输入框 `@文件` 引用
 - **Phase D.15 CI 跟踪**：手动跟踪 PR 当前提交的 GitHub Actions，后台运行、应用内未读提醒、可选 Windows 通知
@@ -47,14 +47,20 @@ npm run dist
 
 ## 设置
 
-标题栏 ⚙：
+标题栏 ⚙ 与模型/助手管理：
 
-| 字段 | 说明 |
+| 配置 | 说明 |
 |------|------|
-| 模式 | 本地模拟 / OpenAI 兼容 API |
-| Base URL | 填到 `/v1`，不要带 `/chat/completions` |
-| API Key | 主进程保存 |
-| Model | 如 `gpt-4o-mini` |
+| 模式 | 显式选择本地模拟或 API；API 调用失败不会切到本地模拟 |
+| Provider（提供方） | 选择 `openai-chat-completions`、`openai-responses` 或 `anthropic-messages`，分别对应 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages |
+| Base URL | 提供方的 HTTP(S) 基址，保留网关路径，只规范化当前协议的操作后缀；不要求固定 `/v1`，不要在 URL 中放 key/token |
+| 认证与凭据 | 按提供方选择 Bearer、API Key 或显式 `none`（无认证）；空 key 不代表 `none`。凭据通过配置页提交主进程保存，不在聊天中粘贴或传递 |
+| 模型配置 | 绑定提供方与远端 Model ID，显式配置输出预算、请求参数、工具/流式兼容策略和能力；会话可选择模型，不靠模型名称猜能力 |
+| AI 助手 | 配置助手身份、模型绑定、提示词、知识与工具范围；新自定义助手默认无工具、无项目上下文或项目记忆 |
+| 能力与兼容 | 使用 native tools 或强制 stream 前，必须显式声明或诊断确认能力支持；`auto` 只在已知支持 streaming 时流式，否则事先选非流式。文本工具兼容必须显式配置并获准 |
+| 合成诊断 | 只发送合成数据，不读取聊天或项目素材；真实提供方仍可能计费，必须先预览请求数/预算并明确同意后再发送 |
+
+配置缺失、能力不足或协议/网络失败会明确报错；不会自动重试、切换协议/主机、降级为文本工具协议，或以 demo 答复冒充 API 成功。凭据不要放进聊天、附件、日志或 URL。
 
 ## 界面操作速查
 
@@ -70,7 +76,7 @@ npm run dist
 
 | 设置 | 默认 | 说明 |
 |------|------|------|
-| 启用多轮 Agent | 开 | API 模式 + 已绑定项目时，模型可反复调用工具 |
+| 启用多轮 Agent | 开 | API 模式 + 已绑定项目，且助手/模型授权与能力允许时，可反复调用工具 |
 | 最大轮数 | 8 | `0` = **不限制**（仍受单次停止/中止约束） |
 | 权限模式 | **confirm-writes** | 见下表「权限模式」 |
 | 允许终端 | **关** | 开启后 Agent 可调用 `run_terminal` |
@@ -114,8 +120,8 @@ npm run dist
 
 - 需确认的操作在**聊天区气泡内**显示审批卡片（非系统 MessageBox）
 - 工具开始/结束事件与助手正文同时间线展示
-- 正文优先 **SSE 流式**（网关不支持 stream 时整段回退，仍会推送工具事件）
-- 网关不支持 `tools` 时仍可走文本协议解析，不崩溃
+- 正文按预设流式策略和已声明/诊断的 streaming 能力选择 **SSE**；`auto` 在能力未知时事先使用非流式，不因 stream 失败补发请求
+- native tools 只在能力支持时使用；文本工具兼容须事先显式配置并获准，调用失败不会自动切成文本协议
 
 ### 项目指令：AGENTS.md / CLAUDE.md
 
@@ -130,9 +136,9 @@ npm run dist
 
 ### 模式提示
 
-- **API 模式 + 已绑定项目 + agentEnabled**：完整多轮工具循环
-- **本地模拟 (local)**：不依赖外网；list 等快路径仍可用
-- **无 stream / 无 tools 网关**：自动降级，保持可用
+- **API 模式 + 已绑定项目 + agentEnabled**：在助手/模型允许的工具范围内运行多轮；使用 native tools 前需确认能力支持
+- **本地模拟 (local)**：显式选用，不依赖外网；API 失败不会切换到此模式
+- **无 stream / 无 native tools 网关**：事先选择非流式、显式获准的 `text-compat` 或 `none` 工具策略；失败不会自动降级、重试或生成模拟答复
 
 ## Phase B：工程闭环
 
@@ -953,10 +959,10 @@ D18 或 D20 的 PR 更新核对成功后，在结果卡、修复详情或 PR 的
 
 设计与实施记录见 [D21 spec](docs/superpowers/specs/2026-10-12-phase-d21-pr-audit-tracking-design.md) 和 [D21 plan](docs/superpowers/plans/2026-10-12-phase-d21-pr-audit-tracking.md)。独立面板冒烟：`node scripts/smoke-pr-audit-tracking-ui.cjs`；完整多轮桌面冒烟：`node scripts/smoke-pr-audit-tracking.cjs`，两者均已通过。前者使用真实 Electron 和受控历史替身，后者还使用真实临时 Git；全量回归及失败用例复验结果见实施记录。
 
-## Phase E：全功能补齐规划（尚未实施）
+## Phase E：全功能补齐与实施进展
 
 [Phase E 总规划：E1–E27](<docs/superpowers/plans/2026-10-15-phase-e-product-readiness.md>) 按依赖顺序安排本次审计的 43 项缺失、部分实现和展示不实问题，**不排具体日期**。
 
 覆盖基础断点、Plan/消息、附件/多模态、隔离/PTY/后台任务、会话恢复、语义检索、多 Agent、MCP/Skills、调度、PR/CI、真实插件与市场、自动修复、桌面生命周期、同步和通信。每个阶段都包含前置条件、具体交付与验收标准；隐藏或标记演示只算止血，不算功能完成。
 
-**当前只完成规划，E1–E27 均未实施。** 真实外部资源或平台能力未就绪的条目保留为阻断，不用模拟结果代替验收。
+**E4 相关代码已实施，离线专项 691/691 和实际 Electron fixture 14 项检查通过；E5–E27 仍仅完成规划。** E1–E3 的阶段状态见总规划，E4 的完整回归、跳过与真实端点边界见 [E4 实现与验证记录](<docs/superpowers/plans/2026-10-30-e4-implementation-verification.md>)。真实模型端点尚未获准测试，不能用离线 fixture 代替正式能力验收。

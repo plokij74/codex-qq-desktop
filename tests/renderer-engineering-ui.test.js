@@ -147,15 +147,18 @@ describe('D11 renderer engineering center contract', () => {
     assert.ok(start >= 0);
     let stored;
     const schema = require('../src/ai/message-schema');
+    const chat = require('../src/renderer/e4-chat-state');
+    const state = chat.createState({ sessions: [{ id: 's1', assistantId: 'assistant_codex', identityType: 'ai', messages: [{ role: 'assistant', content: 'hello', diagnostic: 'must-not-persist' }] }], activeSessionId: 's1' });
     require('node:vm').runInNewContext(`${body}\nsaveState();`, {
-      sessions: [{ id: 's1', messages: [{ role: 'assistant', content: 'hello', diagnostic: 'must-not-persist' }] }],
-      projects: [], activeSessionId: 's1', pluginState: {},
+      sessions: state.sessions, chatState: state, storageWriteBlocked: false, draftPersistenceError: '',
+      projects: [], activeSessionId: 's1', pluginState: {}, document: { getElementById: () => null },
       engineering: { command: 'must-not-persist' }, verification: { stdout: 'must-not-persist' },
       ensureSessionCandidateState() {}, ensureSessionWorktreeState() {},
-      window: { codex: { messageSchema: schema } }, STORAGE_KEY: 'test',
+      window: { E4ChatState: chat, codex: { messageSchema: schema } }, STORAGE_KEY: 'test',
       localStorage: { setItem(key, value) { assert.equal(key, 'test'); stored = JSON.parse(value); } },
     });
-    assert.deepEqual(Object.keys(stored).sort(), ['activeSessionId', 'pluginState', 'projects', 'sessions']);
+    assert.deepEqual(Object.keys(stored).sort(), ['activeSessionId', 'draftsBySession', 'pluginState', 'projects', 'schemaVersion', 'sessions']);
+    assert.equal(stored.schemaVersion, 3);
     assert.equal(stored.sessions[0].messages[0].schemaVersion, 2);
     assert.equal(stored.sessions[0].messages[0].content, 'hello');
     assert.ok(!JSON.stringify(stored).includes('must-not-persist'));

@@ -77,9 +77,46 @@ describe('E1 Direct Defects - Empty Projects and Storage Corruption (G02)', () =
     assert.doesNotMatch(loadStateFn, /projects\s*=\s*Array\.isArray\(data\.projects\)\s*&&\s*data\.projects\.length\s*\?\s*data\.projects\s*:\s*defaultProjects\(\)/);
   });
 
-  it('loadState backs up corrupted storage instead of wiping silently', () => {
-    const loadStateFn = extractFunction(appSource, 'loadState');
-    assert.match(loadStateFn, /codex-qq-corrupted/);
+  it('loadState preserves corrupted original and legacy keys, blocks writes and reports recovery without seeding', () => {
+    const chat = require('../src/renderer/e4-chat-state');
+    const raw = '{broken';
+    const legacyKey = chat.LEGACY_STORAGE_KEYS[0];
+    const legacy = JSON.stringify({ sessions: [{ id: 'legacy', messages: [] }], projects: [] });
+    const storage = new Map([[chat.STORAGE_KEY, raw], [legacyKey, legacy]]);
+    const writes = [], removals = [], notices = [];
+    const status = { textContent: '', hidden: true };
+    let seedCalls = 0;
+    const context = vm.createContext({
+      STORAGE_KEY: chat.STORAGE_KEY, storageWriteBlocked: false, draftPersistenceError: '',
+      chatState: chat.createState(), sessions: [], projects: [], activeSessionId: '', pluginState: {},
+      window: { E4ChatState: chat, codex: { messageSchema: { projectToStorageJson: (message) => message } } },
+      localStorage: {
+        getItem: (key) => storage.get(key) ?? null,
+        setItem: (key, value) => { writes.push([key, value]); storage.set(key, value); },
+        removeItem: (key) => { removals.push(key); storage.delete(key); },
+      },
+      freshChatState: () => { seedCalls++; return chat.createState({ sessions: [{ id: 'seed', messages: [] }] }); },
+      restoreChatState: (state) => { context.chatState = state; context.sessions = state.sessions; context.projects = state.projects; },
+      ensureSessionCandidateState() {}, ensureSessionWorktreeState() {},
+      document: { getElementById: () => status }, toast: (notice) => notices.push(notice),
+      setTimeout: (callback) => { callback(); return 1; },
+    });
+    vm.runInContext(extractFunction(appSource, 'loadState') + '\n' + extractFunction(appSource, 'saveState'), context);
+    context.loadState();
+    assert.equal(context.saveState(), false);
+    assert.equal(context.storageWriteBlocked, true);
+    assert.equal(seedCalls, 0);
+    assert.equal(context.sessions.length, 0);
+    assert.equal(context.projects.length, 0);
+    assert.equal(storage.get(chat.STORAGE_KEY), raw);
+    assert.equal(storage.get(legacyKey), legacy);
+    assert.equal(storage.size, 2);
+    assert.deepEqual(writes, []);
+    assert.deepEqual(removals, []);
+    assert.equal(status.hidden, false);
+    assert.match(status.textContent, /原数据.*保留/);
+    assert.match(status.textContent, /未保存/);
+    assert.ok(notices.length > 0);
   });
 });
 

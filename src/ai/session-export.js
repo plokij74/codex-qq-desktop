@@ -34,6 +34,21 @@ function sessionMessages(session) {
   return Array.isArray(session?.messages) ? session.messages : [];
 }
 
+// Optional E4 identity is metadata only. Missing historical identity stays unknown;
+// a demo contact never gains an AI assistant/model by copying export fields.
+function sessionIdentityForExport(session) {
+  const identity = {};
+  if (!['ai', 'demo-contact'].includes(session?.identityType)) return identity;
+  identity.identityType = session.identityType;
+  const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\u0000\r\n]/.test(value);
+  if (session.identityType === 'ai') {
+    if (validId(session.assistantId)) identity.assistantId = session.assistantId;
+    if (session.modelProfileId === null) identity.modelProfileId = null;
+    else if (validId(session.modelProfileId)) identity.modelProfileId = session.modelProfileId;
+  }
+  return identity;
+}
+
 function exportSessionMarkdown(session) {
   const s = session || {};
   const messages = sessionMessages(s);
@@ -43,6 +58,10 @@ function exportSessionMarkdown(session) {
   lines.push('');
   lines.push(`- 会话 ID：${s.id ?? '-'}`);
   lines.push(`- 类型：${s.kind ?? '-'}`);
+  const identity = sessionIdentityForExport(s);
+  if (identity.identityType) lines.push(`- 身份：${identity.identityType}`);
+  if (identity.assistantId) lines.push(`- AI 助手：${identity.assistantId}`);
+  if (Object.hasOwn(identity, 'modelProfileId')) lines.push(`- 会话模型覆盖：${identity.modelProfileId || '跟随助手/全局默认'}`);
   lines.push(`- 对话对象：${s.peer ?? '-'}`);
   lines.push(`- 项目：${s.projectId ?? '-'}`);
   lines.push(`- 会话模式：${s.agentMode ?? '-'}`);
@@ -61,6 +80,11 @@ function exportSessionMarkdown(session) {
     lines.push(`### ${i + 1} · ${who}${marks.length ? ' · ' + marks.join(' · ') : ''}`);
     lines.push('');
     lines.push(String(norm.content ?? ''));
+    if (norm.modelSource) {
+      lines.push('');
+      lines.push('模型来源（历史元数据，不是外部调用证明）：');
+      lines.push('```json', JSON.stringify({ modelSource: norm.modelSource }), '```');
+    }
 
     // Plan parts
     for (const part of norm.parts || []) {
@@ -111,6 +135,7 @@ function exportSessionJson(session) {
     peer: s.peer ?? null,
     projectId: s.projectId ?? null,
     agentMode: s.agentMode ?? null,
+    ...sessionIdentityForExport(s),
     pinned: s.pinned === true,
     createdAt: s.createdAt ?? null,
     updatedAt: s.updatedAt ?? null,

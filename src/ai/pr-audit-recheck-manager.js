@@ -6,6 +6,7 @@ const S = require('./pr-audit-recheck-state');
 const { PrAuditRecheckStore } = require('./pr-audit-recheck-store');
 const { RecheckSnapshot, cleanupRecheckRefs } = require('./pr-audit-recheck-snapshot');
 const { runRecheck } = require('./pr-audit-recheck-runtime');
+const { acceptAuditModel, modelFailure } = require('./pr-audit-runtime');
 class PrAuditRecheckManager {
   constructor(options = {}) {
     this.audits = options.auditManager; this.repairs = options.auditRepairManager;
@@ -13,6 +14,8 @@ class PrAuditRecheckManager {
     this.github = options.githubCli || this.audits.github; this.worktree = options.worktreeManager;
     this.store = options.store || new PrAuditRecheckStore(options);
     this.runtime = options.runtime || runRecheck; this.snapshotFactory = options.snapshotFactory || ((args) => new RecheckSnapshot(args));
+    this.acceptBoundModel = options.acceptBoundModel; this.chatFn = options.chatFn || this.audits.chatFn; this.fetchFn = options.fetchFn || this.audits.fetchFn;
+    this.legacyModelInjected = typeof options.runtime === 'function' || typeof this.chatFn === 'function' || typeof this.fetchFn === 'function';
     this.onEvent = options.onEvent; this.now = options.now || Date.now; this.timeoutMs = options.timeoutMs || A.LIMITS.timeout;
     this.runs = new Map(); this.cleaned = new Map(); this.closing = false;
   }
@@ -24,7 +27,8 @@ class PrAuditRecheckManager {
   save(row) {
     const saved = this.store.put(row);
     try { this.onEvent?.({ type: 'engineering:pr-audit:recheck:event', projectKey: saved.projectKey, prNumber: saved.prNumber,
-      recheckRef: saved.recheckRef, status: saved.status, turn: saved.turns || 0 }); } catch {}
+      recheckRef: saved.recheckRef, status: saved.status, turn: saved.turns || 0,
+      ...(saved.modelSource !== undefined ? { modelSource: saved.modelSource } : {}) }); } catch {}
     return saved;
   }
   protectsSource(ref) { return this.store.referencesUnknown?.() || this.store.list().some((r) => r.source.auditRepairRef === ref) || [...this.runs.values()].some((r) => r.source?.auditRepairRef === ref); }
@@ -92,20 +96,28 @@ class PrAuditRecheckManager {
     catch (cause) { this.current(ctx); return ['PR_AUDIT_CHANGED', 'PR_AUDIT_NOT_OPEN', 'PR_AUDIT_FORK'].includes(cause.code) ? 'stale' : 'unknown'; }
   }
   async start(projectPath, resultId, ctx = {}) {
-    let acquired; let running = false;
+    let acquired; let accepted; let prepared; let setup; let running = false;
     try {
       const root = canonicalProjectPath(projectPath); const key = projectKey(root); this.current(ctx);
-      const settings = { ...this.audits.getSettings() };
-      if (settings.mode !== 'api' || settings.agentEnabled === false || !settings.apiKey || !settings.model) throw A.fail('MODEL_REQUIRED');
+      const settings = this.audits.getSettings() || {}; const accept = this.acceptBoundModel || this.audits.acceptBoundModel;
+      if (settings.mode !== 'api' || settings.agentEnabled === false) throw A.fail('MODEL_REQUIRED');
+      if (typeof accept !== 'function' && ctx.modelBinding == null && (!settings.apiKey || !settings.model)) throw A.fail('MODEL_REQUIRED');
       const ref = S.ref(); this.audits.taskPool.acquire(ref, key); acquired = ref;
+      // Pin the independent recheck before protection/resolve can await or defaults can change.
+      accepted = acceptAuditModel(accept, { kind: 'pr-audit-recheck', taskId: ref, context: ctx, settings });
+      if (!accepted && !this.legacyModelInjected) throw modelFailure('MODEL_BOUND_CHAT_REQUIRED');
+      const runtimeSettings = accepted ? { mode: settings.mode, agentEnabled: settings.agentEnabled, compactMaxApproxTokens: settings.compactMaxApproxTokens } : { ...settings };
+      await ctx.beforeSnapshot?.(); this.current(ctx);
       const { source, findings } = await this.resolve(root, resultId, ctx); this.current(ctx);
       const row = this.save({ recheckRef: ref, projectKey: key, prNumber: source.prNumber, source,
-        createdAt: new Date(this.now()).toISOString(), status: 'preparing', freshness: 'unknown', model: String(settings.model).slice(0, 200) });
+        createdAt: new Date(this.now()).toISOString(), status: 'preparing', freshness: 'unknown',
+        model: String(accepted ? accepted.modelSource.model : settings.model).slice(0, 200), ...(accepted ? { modelSource: accepted.modelSource } : {}) });
+      prepared = row; const persistence = this.store.persistenceStatus();
       const controller = new AbortController(); const abort = () => controller.abort(ctx.signal?.reason);
+      const record = { ref, root, key, source, controller, modelBinding: accepted?.binding }; setup = { record, abort };
       ctx.signal?.addEventListener('abort', abort, { once: true }); if (ctx.signal?.aborted) abort();
-      const record = { ref, root, key, source, controller }; this.runs.set(ref, record); running = true;
-      ctx.retainUntilFinished?.(); const context = { ...ctx, signal: controller.signal };
-      const timer = setTimeout(() => controller.abort(A.fail('TIMEOUT')), this.timeoutMs); timer.unref?.();
+      this.runs.set(ref, record); ctx.retainUntilFinished?.(); const context = { ...ctx, signal: controller.signal };
+      const timer = setTimeout(() => controller.abort(A.fail('TIMEOUT')), this.timeoutMs); setup.timer = timer; timer.unref?.();
       record.done = Promise.resolve().then(async () => {
         let snapshot;
         try {
@@ -116,16 +128,15 @@ class PrAuditRecheckManager {
           const again = await this.resolve(root, resultId, context);
           if (A.hash(again.source) !== A.hash(source) || await this.freshness(root, { source, target }, context) !== 'current') throw A.fail('CHANGED');
           this.save({ ...this.row(root, ref), status: 'running', target });
-          const generated = await this.runtime({ snapshot, findings, settings, signal: context.signal,
+          const generated = await this.runtime({ snapshot, findings, settings: runtimeSettings, signal: context.signal, timeoutMs: this.timeoutMs,
+            modelBinding: accepted?.binding, chatFn: accepted?.chatFn || this.chatFn, fetchFn: accepted ? undefined : this.fetchFn,
             onProgress: ({ turn }) => { this.current(context); this.save({ ...this.row(root, ref), turns: turn }); } });
           this.current(context); this.originals(root, source);
           const report = S.report(generated.report, source.findingIds, snapshot.evidence);
           const selected = new Set(report.findings.flatMap((f) => f.evidence));
-          const bounded = (v) => Number.isFinite(v) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(v))) : 0;
           const freshness = await this.freshness(root, this.row(root, ref), context); this.current(context);
           this.save({ ...this.row(root, ref), status: 'completed', freshness, report,
-            evidence: [...snapshot.evidence.values()].filter((e) => selected.has(e.evidenceId)),
-            usage: { inputTokens: bounded(generated.usage?.inputTokens), outputTokens: bounded(generated.usage?.outputTokens), estimated: !!generated.usage?.estimated },
+            evidence: [...snapshot.evidence.values()].filter((e) => selected.has(e.evidenceId)), usage: A.summarizeUsage(generated.usage),
             turns: generated.turns || this.row(root, ref).turns || 0, finishedAt: new Date(this.now()).toISOString() });
         } catch (cause) {
           const stopped = controller.signal.aborted;
@@ -134,13 +145,27 @@ class PrAuditRecheckManager {
         } finally {
           clearTimeout(timer);
           try { await snapshot?.cleanup(); } finally {
-            this.runs.delete(ref); this.audits.taskPool.release(ref); ctx.signal?.removeEventListener('abort', abort); ctx.release?.();
+            try { await accepted?.release(); } finally {
+              this.runs.delete(ref); this.audits.taskPool.release(ref); ctx.signal?.removeEventListener('abort', abort); ctx.release?.();
+            }
           }
         }
       });
-      record.done.catch(() => {});
-      return { ok: true, recheckRef: row.recheckRef, persistence: this.store.persistenceStatus() };
-    } catch (cause) { if (acquired && !running) this.audits.taskPool.release(acquired); return A.error(cause); }
+      record.done.catch(() => {}); running = true;
+      return { ok: true, recheckRef: row.recheckRef, persistence, ...(accepted ? { modelSource: accepted.modelSource } : {}) };
+    } catch (cause) {
+      if (running) {
+        setup.record.controller.abort(cause); await setup.record.done.catch(() => {});
+      } else {
+        clearTimeout(setup?.timer);
+        if (setup) { this.runs.delete(setup.record.ref); ctx.signal?.removeEventListener('abort', setup.abort); }
+        if (prepared) { try { this.save({ ...prepared, status: 'failed', errorCode: A.error(cause).code, finishedAt: new Date(this.now()).toISOString() }); } catch {} }
+        try { await accepted?.release(); } catch { /* Preserve the original safe rejection. */ }
+        if (acquired) this.audits.taskPool.release(acquired);
+        if (setup) { try { ctx.release?.(); } catch {} }
+      }
+      return A.error(cause);
+    }
   }
   async list(root, prNumber, ctx = {}) {
     try {
@@ -163,7 +188,8 @@ class PrAuditRecheckManager {
       }
       return { ok: true, projectKey: key, deliveries: deliveries.slice(0, 200), rechecks: records.map((r) => ({ recheckRef: r.recheckRef,
         resultId: r.source.resultId, auditRef: r.source.auditRef, prNumber: r.prNumber, status: r.status, freshness: 'unknown', createdAt: r.createdAt,
-        headSha: r.target?.headSha, turns: r.turns || 0, errorCode: r.errorCode })), persistence: this.store.persistenceStatus(), deliveriesUnavailable: !listed?.ok };
+        headSha: r.target?.headSha, turns: r.turns || 0, errorCode: r.errorCode,
+        ...(r.modelSource !== undefined ? { modelSource: r.modelSource } : {}) })), persistence: this.store.persistenceStatus(), deliveriesUnavailable: !listed?.ok };
     } catch (cause) { return A.error(cause); }
   }
   async get(root, ref, ctx = {}) {

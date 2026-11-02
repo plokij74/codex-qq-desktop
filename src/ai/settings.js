@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const { sanitizeMcpServers } = require('./mcp-config');
 const crypto = require('crypto');
-const { SecretManager, defaultSecretManager, migrateSettingsFile } = require('./secret-manager');
+const { SecretManager, defaultSecretManager } = require('./secret-manager');
+const { createModelRegistry, validateModelRegistry } = require('./model-profiles');
 
 const DEFAULT_SETTINGS = {
   mode: 'local',
@@ -10,6 +11,7 @@ const DEFAULT_SETTINGS = {
   apiKey: '',
   apiKeyConfigured: false,
   secretRef: '',
+  modelCredentialCleanup: [], // Main-owned cleanup journal; never accepted from public settings writes.
   executionPolicy: 'strict-isolated', // strict-isolated | workspace-write | host-unconfined
   model: 'gpt-4o-mini',
   // Agent
@@ -134,18 +136,34 @@ function clampFloat(v, min, max, fallback) {
   return Math.max(min, Math.min(max, n));
 }
 
-/** Phase D.3: 价格行归一化；modelPrefix 为空的行整行丢弃。 */
+/** Legacy prefix rows remain exact; E4 scope/cache fields are bounded and explicit. */
 function sanitizePricing(list) {
   if (!Array.isArray(list)) return [];
   const out = [];
+  const scopedId = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
   for (const row of list) {
-    const modelPrefix = String(row?.modelPrefix ?? '').trim();
-    if (!modelPrefix) continue;
-    out.push({
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    // A malformed scope is dropped, never broadened into a legacy/global rate.
+    if (row.providerId != null && row.providerId !== '' && !scopedId(row.providerId)
+      || row.modelProfileId != null && row.modelProfileId !== '' && !scopedId(row.modelProfileId)) continue;
+    const providerId = scopedId(row.providerId) ? row.providerId : null;
+    const modelProfileId = scopedId(row.modelProfileId) ? row.modelProfileId : null;
+    const modelPrefix = String(row.modelPrefix ?? '').trim();
+    if (!modelPrefix && !modelProfileId || (providerId || modelProfileId) && modelPrefix.length > 256) continue;
+    const normalized = {
       modelPrefix,
-      inputPerM: clampFloat(row?.inputPerM, 0, 10000, 0),
-      outputPerM: clampFloat(row?.outputPerM, 0, 10000, 0),
-    });
+      inputPerM: clampFloat(row.inputPerM, 0, 10000, 0),
+      outputPerM: clampFloat(row.outputPerM, 0, 10000, 0),
+    };
+    if (providerId) normalized.providerId = providerId;
+    if (modelProfileId) normalized.modelProfileId = modelProfileId;
+    for (const key of ['cachedInputPerM', 'cacheCreationInputPerM']) {
+      const raw = row[key];
+      const value = typeof raw === 'number' || typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
+      // Unknown/invalid optional prices must not silently become a free price (0).
+      if (Number.isFinite(value) && value >= 0 && value <= 10000) normalized[key] = value;
+    }
+    out.push(normalized);
     if (out.length >= PRICING_ROWS_MAX) break;
   }
   return out;
@@ -310,7 +328,15 @@ function writeSettingsFile(file, settings) {
   const temporary = `${file}.${crypto.randomBytes(12).toString('hex')}.tmp`;
   try {
     fs.writeFileSync(temporary, JSON.stringify(settings, null, 2), 'utf8');
-    fs.renameSync(temporary, file);
+    for (let attempt = 0; ; attempt += 1) {
+      try { fs.renameSync(temporary, file); break; }
+      catch (error) {
+        // Windows scanners may briefly hold the destination. Keep the atomic
+        // rename (never unlink/copy over it), and surface permanent failures.
+        if (attempt >= 4 || !['EPERM', 'EBUSY'].includes(error?.code)) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 * (attempt + 1));
+      }
+    }
   } finally {
     if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
   }
@@ -328,112 +354,219 @@ function getOrCreateSecretManager(userDataPath) {
   return secretManagersByPath.get(normalized);
 }
 
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const isSettingsObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+function modelSettingsError(message, code = 'MODEL_CONFIG_INVALID') {
+  const error = new Error(message);
+  error.code = code;
+  error.needsRepair = true;
+  return error;
+}
+
+function getModelRegistryBackupPath(userDataPath) {
+  return path.join(userDataPath, 'settings.pre-model-registry-v1.backup.json');
+}
+
+function readSettingsDisk(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { exists: false, parsed: {} };
+    throw modelSettingsError('The existing settings file cannot be read; preserve it for recovery');
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { throw modelSettingsError('The existing settings file contains invalid JSON; preserve it for repair'); }
+  if (!isSettingsObject(parsed)) throw modelSettingsError('The existing settings file is not an object; preserve it for repair');
+  return { exists: true, parsed };
+}
+
+function normalizeCleanupJournal(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 2048 || value.some((entry) => typeof entry !== 'string' || entry.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(entry))) {
+    throw modelSettingsError('The model credential cleanup journal requires repair');
+  }
+  return [...new Set(value)];
+}
+
+function normalizeSettings(settings) {
+  settings.exploreMaxParallel = clampExploreMaxParallel(settings.exploreMaxParallel);
+  // Only main-owned disk snapshots and picker-validated IPC data can grant roots.
+  settings.mcpServers = sanitizeMcpServers(settings.mcpServers, { allowRootPaths: true });
+  settings.modelCredentialCleanup = normalizeCleanupJournal(settings.modelCredentialCleanup);
+  clampCompactSettings(settings);
+  clampMemorySettings(settings);
+  clampWebSettings(settings);
+  clampUsageSettings(settings);
+  clampVerificationSettings(settings);
+  return clampMcpD10Settings(settings);
+}
+
+function resolveLegacyApiKeyEnabled(options) {
+  return options.resolveLegacyApiKey !== false && options.resolveSecrets !== false;
+}
+
+// Compatibility aliases are derived from the registry, never the other way
+// around once migration completed. New opaque model credentials are not
+// decrypted by this legacy compatibility path.
+function projectLegacyAliases(settings, manager, options) {
+  const registry = settings.modelRegistry;
+  const model = registry.models.find((entry) => entry.id === registry.defaultModelProfileId);
+  const provider = registry.providers.find((entry) => entry.id === model.providerId);
+  settings.baseUrl = provider.baseUrl;
+  settings.model = model.model;
+  settings.secretRef = provider.auth.secretRef;
+  settings.apiKeyConfigured = Boolean(provider.auth.kind !== 'none' && provider.auth.secretRef);
+  settings.apiKey = '';
+  delete settings.apiKeyUnavailable;
+  if (resolveLegacyApiKeyEnabled(options) && provider.auth.secretRef === 'sec_main_api_key') {
+    try {
+      settings.apiKey = manager.getSecret('main_api_key') || '';
+      if (!settings.apiKey) settings.apiKeyUnavailable = true;
+    } catch { settings.apiKeyUnavailable = true; }
+  }
+  return settings;
+}
+
+function legacyCredentialReference(settings, manager) {
+  if (typeof settings.secretRef === 'string' && settings.secretRef) return settings.secretRef;
+  if (settings.apiKeyConfigured === true || (typeof settings.apiKey === 'string' && settings.apiKey.trim())) return 'sec_main_api_key';
+  // This metadata-only lookup is performed only during the one-time legacy
+  // migration. A cleared reference in an existing registry is never restored.
+  try { return manager.hasSecret('main_api_key') ? 'sec_main_api_key' : ''; }
+  catch { return ''; }
+}
+
+function storeLegacyPlaintext(key, manager) {
+  try {
+    manager.registerSecret?.(key, 'MODEL_CREDENTIAL');
+    manager.setSecret('main_api_key', key, { label: 'Legacy model API key' });
+  } catch { throw modelSettingsError('The legacy credential could not be stored; the original settings were preserved', 'MODEL_CREDENTIAL_UNAVAILABLE'); }
+}
+
+function sanitizedBackup(settings, diskServers) {
+  const omit = Symbol('omit');
+  function sanitize(value, key = '') {
+    if (typeof value === 'string' && /key|token|secret|password|authorization|credential/i.test(key)
+      && !['secretRef', 'credentialsRef', 'credentialOrigin', 'modelCredentialCleanup'].includes(key)) return omit;
+    if (Array.isArray(value)) return value.map((entry) => sanitize(entry, key)).filter((entry) => entry !== omit);
+    if (isSettingsObject(value)) {
+      const result = {};
+      for (const [childKey, child] of Object.entries(value)) {
+        const safe = sanitize(child, childKey);
+        if (safe !== omit) result[childKey] = safe;
+      }
+      return result;
+    }
+    return value;
+  }
+  const result = sanitize({ ...settings, ...(Array.isArray(settings.mcpServers) ? { mcpServers: diskServers } : {}) });
+  delete result.apiKey;
+  return result;
+}
+
+// The temporary hard link publishes a complete backup without replacing a
+// previously captured recovery snapshot. Both files are on the same volume.
+function writeModelRegistryBackup(userDataPath, settings) {
+  const backup = getModelRegistryBackupPath(userDataPath);
+  if (fs.existsSync(backup)) return;
+  fs.mkdirSync(path.dirname(backup), { recursive: true });
+  const temporary = `${backup}.${crypto.randomBytes(12).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(settings, null, 2), 'utf8');
+    try { fs.linkSync(temporary, backup); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+  } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+}
+
 function loadSettings(userDataPath, options = {}) {
   const file = getSettingsPath(userDataPath);
-  const secMgr = options.secretManager || getOrCreateSecretManager(userDataPath);
-  try {
-    if (userDataPath) {
-      migrateSettingsFile(userDataPath, secMgr);
-    }
-    const raw = fs.readFileSync(file, 'utf8');
-    const parsed = JSON.parse(raw);
-    const runtimeServers = sanitizeMcpServers(hydrateMcpServers(parsed.mcpServers, secMgr), { allowRootPaths: true });
-    for (const server of runtimeServers) {
-      registerMcpCredentialValues(server.env, secMgr);
-      registerMcpCredentialValues(server.headers, secMgr);
-    }
-    if (Array.isArray(parsed.mcpServers)) {
-      const diskServers = protectMcpServers(runtimeServers, parsed.mcpServers, secMgr);
-      if (JSON.stringify(diskServers) !== JSON.stringify(parsed.mcpServers)) {
-        try {
-          writeSettingsFile(file, { ...parsed, mcpServers: diskServers });
-          retireMcpCredentials(parsed.mcpServers, diskServers, secMgr);
-        } catch (error) { throw mcpCredentialError(error); }
-      }
-    }
-    const merged = { ...DEFAULT_SETTINGS, ...parsed, mcpServers: runtimeServers };
-    registerSettingsSecrets(merged, secMgr);
-
-    if (secMgr && secMgr.hasSecret('main_api_key')) {
-      merged.apiKey = secMgr.getSecret('main_api_key') || '';
-      merged.apiKeyConfigured = true;
-      merged.secretRef = 'sec_main_api_key';
-    } else if (merged.apiKey) {
-      if (secMgr) {
-        secMgr.setSecret('main_api_key', merged.apiKey, { label: 'OpenAI API Key' });
-      }
-      merged.apiKeyConfigured = true;
-      merged.secretRef = 'sec_main_api_key';
-    }
-
-    merged.exploreMaxParallel = clampExploreMaxParallel(merged.exploreMaxParallel);
-    // Paths are retained only from the settings file written by main. JSON
-    // imports are sanitized before they reach this loader and cannot grant a
-    // new root without a picker-issued token.
-    merged.mcpServers = sanitizeMcpServers(merged.mcpServers, { allowRootPaths: true });
-    clampCompactSettings(merged);
-    clampMemorySettings(merged);
-    clampWebSettings(merged);
-    clampVerificationSettings(merged);
-    return clampMcpD10Settings(clampUsageSettings(merged));
-  } catch (error) {
-    if (error.code === 'MCP_CREDENTIAL_STORE_UNAVAILABLE') throw error;
-    const fallback = { ...DEFAULT_SETTINGS };
-    if (secMgr && secMgr.hasSecret('main_api_key')) {
-      fallback.apiKey = secMgr.getSecret('main_api_key') || '';
-      fallback.apiKeyConfigured = true;
-      fallback.secretRef = 'sec_main_api_key';
-    }
-    return fallback;
+  const { exists, parsed } = readSettingsDisk(file);
+  const seed = { ...DEFAULT_SETTINGS, ...parsed };
+  // Validate before touching any vault, migration backup or on-disk settings.
+  let registry = createModelRegistry(seed);
+  normalizeCleanupJournal(parsed.modelCredentialCleanup);
+  const manager = options.secretManager || getOrCreateSecretManager(userDataPath);
+  const registryMigration = exists && (!hasOwn(parsed, 'modelRegistry') || parsed.modelRegistry?.migration?.completed === false);
+  if (exists && !hasOwn(parsed, 'modelRegistry')) {
+    registry = createModelRegistry({ ...seed, secretRef: legacyCredentialReference(parsed, manager) });
   }
+  if (registryMigration && typeof parsed.apiKey === 'string' && parsed.apiKey.trim()) {
+    let needsLegacyStore = !hasOwn(parsed, 'modelRegistry');
+    if (!needsLegacyStore && registry.providers.some((provider) => provider.auth.secretRef === 'sec_main_api_key')) {
+      try { needsLegacyStore = !manager.hasSecret('main_api_key'); }
+      catch { throw modelSettingsError('The existing model credential could not be verified; preserve settings for repair', 'MODEL_CREDENTIAL_UNAVAILABLE'); }
+    }
+    if (needsLegacyStore) storeLegacyPlaintext(parsed.apiKey.trim(), manager);
+  }
+  const runtimeServers = sanitizeMcpServers(hydrateMcpServers(parsed.mcpServers, manager), { allowRootPaths: true });
+  for (const server of runtimeServers) {
+    registerMcpCredentialValues(server.env, manager);
+    registerMcpCredentialValues(server.headers, manager);
+  }
+  const diskServers = protectMcpServers(runtimeServers, parsed.mcpServers, manager);
+  const mcpChanged = Array.isArray(parsed.mcpServers) && JSON.stringify(diskServers) !== JSON.stringify(parsed.mcpServers);
+  const merged = normalizeSettings({ ...DEFAULT_SETTINGS, ...parsed, modelRegistry: registry, mcpServers: runtimeServers });
+  if (registryMigration || mcpChanged || (exists && hasOwn(parsed, 'apiKey'))) {
+    if (registryMigration) writeModelRegistryBackup(userDataPath, sanitizedBackup(parsed, diskServers));
+    const diskCopy = projectLegacyAliases({ ...parsed, modelRegistry: registry, modelCredentialCleanup: merged.modelCredentialCleanup, mcpServers: diskServers }, manager, { resolveLegacyApiKey: false });
+    delete diskCopy.apiKey;
+    try { writeSettingsFile(file, diskCopy); }
+    catch (error) { if (mcpChanged) throw mcpCredentialError(error); throw error; }
+    retireMcpCredentials(parsed.mcpServers, diskServers, manager);
+  }
+  projectLegacyAliases(merged, manager, options);
+  registerSettingsSecrets(merged, manager);
+  return merged;
 }
 
 function saveSettings(userDataPath, partial, options = {}) {
-  const secMgr = options.secretManager || getOrCreateSecretManager(userDataPath);
-  const incoming = { ...partial };
-  registerSettingsSecrets(incoming, secMgr);
-
-  if (typeof incoming.apiKey === 'string' && incoming.apiKey.trim().length > 0) {
-    if (secMgr) {
-      secMgr.setSecret('main_api_key', incoming.apiKey.trim(), { label: 'OpenAI API Key' });
-    }
-    incoming.apiKeyConfigured = true;
-    incoming.secretRef = 'sec_main_api_key';
-  } else if ('apiKey' in incoming && (!incoming.apiKey || incoming.apiKey.trim().length === 0)) {
-    incoming.apiKeyConfigured = Boolean(secMgr && secMgr.hasSecret('main_api_key'));
-    if (incoming.apiKeyConfigured) {
-      incoming.secretRef = 'sec_main_api_key';
-    }
-  }
-
-  const current = loadSettings(userDataPath, { secretManager: secMgr });
-  const next = { ...current, ...incoming };
-
-  next.exploreMaxParallel = clampExploreMaxParallel(next.exploreMaxParallel);
-  next.mcpServers = sanitizeMcpServers(next.mcpServers, { allowRootPaths: true });
-  clampCompactSettings(next);
-  clampMemorySettings(next);
-  clampWebSettings(next);
-  clampUsageSettings(next);
-  clampVerificationSettings(next);
+  if (partial !== undefined && !isSettingsObject(partial)) throw modelSettingsError('Settings updates must be an object');
   const file = getSettingsPath(userDataPath);
-  const previousServers = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers : [];
-  const diskCopy = { ...next, mcpServers: protectMcpServers(next.mcpServers, previousServers, secMgr) };
+  const original = readSettingsDisk(file);
+  // Unknown/newer or broken existing registries must fail before accepting even
+  // unrelated updates, rather than silently downgrading a user's configuration.
+  createModelRegistry({ ...DEFAULT_SETTINGS, ...original.parsed });
+  const incoming = { ...partial };
+  const trusted = options.trustedModelRegistry === true;
+  const incomingRegistry = trusted && hasOwn(incoming, 'modelRegistry') ? validateModelRegistry(incoming.modelRegistry) : undefined;
+  if (trusted && hasOwn(incoming, 'modelCredentialCleanup')) incoming.modelCredentialCleanup = normalizeCleanupJournal(incoming.modelCredentialCleanup);
+  else delete incoming.modelCredentialCleanup;
+  delete incoming.modelRegistry;
+  const manager = options.secretManager || getOrCreateSecretManager(userDataPath);
+  // Propagate the opt-out into the internal load as well as the returned value.
+  const current = loadSettings(userDataPath, { ...options, secretManager: manager });
+  if (options.expectedRegistryRevision !== undefined && options.expectedRegistryRevision !== current.modelRegistry.revision) throw modelSettingsError('Model configuration changed; reload before saving', 'CONFIG_CONFLICT');
+  let registry = incomingRegistry || current.modelRegistry;
+  if (original.exists && incomingRegistry) {
+    const same = JSON.stringify(incomingRegistry) === JSON.stringify(current.modelRegistry);
+    if (!same && incomingRegistry.revision !== current.modelRegistry.revision + 1) throw modelSettingsError('Model configuration changed; reload before saving', 'CONFIG_CONFLICT');
+  }
+  // Only an initial legacy caller may seed a newly-created settings file. Once
+  // a registry exists, all old aliases (including apiKey) are read-only.
+  let initialKey = '';
+  if (!original.exists && !incomingRegistry) {
+    initialKey = resolveLegacyApiKeyEnabled(options) && typeof incoming.apiKey === 'string' ? incoming.apiKey.trim() : '';
+    registry = createModelRegistry({ ...DEFAULT_SETTINGS, ...incoming, secretRef: initialKey ? 'sec_main_api_key' : '', apiKeyConfigured: Boolean(initialKey), apiKey: initialKey });
+  }
+  for (const alias of ['baseUrl', 'model', 'apiKey', 'apiKeyConfigured', 'apiKeyUnavailable', 'secretRef']) delete incoming[alias];
+  const next = normalizeSettings({ ...current, ...incoming, modelRegistry: registry });
+  registerSettingsSecrets(next, manager);
+  if (initialKey) storeLegacyPlaintext(initialKey, manager);
+  const previousServers = readSettingsDisk(file).parsed.mcpServers;
+  const diskCopy = projectLegacyAliases({ ...next, mcpServers: protectMcpServers(next.mcpServers, previousServers, manager) }, manager, { resolveLegacyApiKey: false });
   delete diskCopy.apiKey;
   writeSettingsFile(file, diskCopy);
-  retireMcpCredentials(previousServers, diskCopy.mcpServers, secMgr);
-
-  // In-memory returned object retains decrypted apiKey
-  if (secMgr && secMgr.hasSecret('main_api_key')) {
-    next.apiKey = secMgr.getSecret('main_api_key') || '';
-  }
-
-  return clampMcpD10Settings(next);
+  retireMcpCredentials(previousServers, diskCopy.mcpServers, manager);
+  return projectLegacyAliases(next, manager, options);
 }
 
 module.exports = {
   DEFAULT_SETTINGS,
   getSettingsPath,
+  getModelRegistryBackupPath,
+  getSettingsSecretManager: getOrCreateSecretManager,
   loadSettings,
   saveSettings,
   clampInt,

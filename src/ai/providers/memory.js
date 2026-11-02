@@ -13,6 +13,11 @@ const {
 } = require('../memory-recall');
 // clampInt 已由 settings.js 导出并被 main.js 复用，不要再抄一份。
 const { clampInt } = require('../settings');
+const { filterAssistantTools, assertAssistantToolAllowed, assistantContextPolicy } = require('../assistant-policy');
+
+function bindingFor(ctx) {
+  return ctx?.modelBinding ?? ctx?.extensions?.modelBinding ?? null;
+}
 
 const RECALL_LIMIT_DEFAULT = 10;
 const RECALL_LIMIT_MAX = 20;
@@ -84,6 +89,21 @@ const TOOL_FORGET = {
   },
 };
 
+function memoryToolsFor(ctx) {
+  const tools = normalizeMode(ctx?.agentMode) === 'plan' ? [TOOL_RECALL] : [TOOL_RECALL, TOOL_REMEMBER, TOOL_FORGET];
+  const modelBinding = bindingFor(ctx);
+  if (modelBinding == null) return tools;
+  if (ctx?.settings?.memoryEnabled === false || Number(ctx?.subagentDepth) >= 1) return [];
+  return filterAssistantTools(tools, modelBinding);
+}
+
+function isAdvertised(ctx, name) {
+  const tools = ctx?.advertisedTools;
+  if (tools == null) return true; // standalone provider callers still have the host/role checks above
+  if (tools instanceof Set) return tools.has(name);
+  return Array.isArray(tools) && tools.some((tool) => (typeof tool === 'string' ? tool : tool?.name || tool?.function?.name) === name);
+}
+
 function createMemoryProvider() {
   return {
     id: 'memory',
@@ -98,11 +118,20 @@ function createMemoryProvider() {
     getTools(ctx) {
       // plan mode is read-only research; the gate would refuse writes anyway,
       // but not offering them keeps the tool list honest.
-      if (normalizeMode(ctx?.agentMode) === 'plan') return [TOOL_RECALL];
-      return [TOOL_RECALL, TOOL_REMEMBER, TOOL_FORGET];
+      return memoryToolsFor(ctx);
     },
 
     async execute(name, args, ctx) {
+      const modelBinding = bindingFor(ctx);
+      if (modelBinding != null) {
+        assistantContextPolicy(modelBinding, ctx?.project);
+        assertAssistantToolAllowed(name, modelBinding);
+        if (!memoryToolsFor(ctx).some((tool) => tool.function.name === name) || !isAdvertised(ctx, name)) {
+          const error = new Error('助手未获准使用工具: ' + name);
+          error.code = 'ASSISTANT_TOOL_DENIED';
+          throw error;
+        }
+      }
       const { projectPath, userDataPath } = pathsFor(ctx);
       try {
         if (name === 'remember') {
@@ -152,6 +181,12 @@ function createMemoryProvider() {
     },
 
     getSystemFragment(ctx) {
+      const modelBinding = bindingFor(ctx);
+      if (modelBinding != null && !assistantContextPolicy(modelBinding, ctx?.project).projectMemory) return '';
+      if (ctx?.settings?.memoryEnabled === false || Number(ctx?.subagentDepth) >= 1) return '';
+      const tools = memoryToolsFor(ctx);
+      const canRecall = tools.some((tool) => tool.function.name === 'recall') && isAdvertised(ctx, 'recall');
+      const canRemember = tools.some((tool) => tool.function.name === 'remember') && isAdvertised(ctx, 'remember');
       try {
         const { projectPath, userDataPath } = pathsFor(ctx);
         const { entries } = store.readAll({ projectPath, userDataPath });
@@ -163,11 +198,12 @@ function createMemoryProvider() {
           maxApproxTokens: memoryInjectMaxTokens,
           now: Date.now(),
         });
-        // plan mode withholds remember (see getTools) — don't advertise it.
-        return formatInjection(picked, {
-          writeHint: normalizeMode(ctx?.agentMode) !== 'plan',
+        const fragment = formatInjection(picked, {
+          writeHint: canRecall && canRemember,
           maxApproxTokens: memoryInjectMaxTokens,
         });
+        // The shared formatter has a fixed recall footer; omit it when that tool is not offered.
+        return canRecall ? fragment : fragment.replace(/\n更多条目用 recall 检索。$/, '');
       } catch {
         // A broken store must never break the run.
         return '';

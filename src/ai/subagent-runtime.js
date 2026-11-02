@@ -2,6 +2,8 @@
 
 const { AGENT_EVENTS } = require('./agent-events');
 const { assertSafeChildPath } = require('./worktree');
+const { isResolvedModelBinding } = require('./model-profiles');
+const { assistantContextPolicy } = require('./assistant-policy');
 
 const SUMMARY_MAX = 8 * 1024;
 const GOALS_MAX = 6;
@@ -61,6 +63,29 @@ function mergeSubagentFileChanges(parentArr, toolName, resultStr) {
 function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
   if (typeof runLoop !== 'function') {
     throw new Error('createSubagentRuntime requires runLoop');
+  }
+
+  const boundChatFunctions = new WeakSet();
+
+  function modelBindingFor(ctx) {
+    return ctx.modelBinding ?? ctx.extensions?.modelBinding;
+  }
+
+  function bindingPrecheck(ctx, kind) {
+    const modelBinding = modelBindingFor(ctx);
+    if (modelBinding == null) return null;
+    if (!isResolvedModelBinding(modelBinding)) {
+      return { ok: false, kind, code: 'MODEL_BINDING_INVALID', error: '子 Agent 需要真实模型绑定' };
+    }
+    try {
+      assistantContextPolicy(modelBinding, ctx.project);
+    } catch (error) {
+      return { ok: false, kind, code: error.code, error: error.message };
+    }
+    if (typeof ctx.extensions?.createBoundChat !== 'function') {
+      return { ok: false, kind, code: 'MODEL_BOUND_CHAT_REQUIRED', error: '子 Agent 需要 host createBoundChat 工厂，不能共享父模型状态或重新解析旧设置' };
+    }
+    return null;
   }
 
   let idSeq = 0;
@@ -216,6 +241,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
       ...parentSettings,
       maxAgentTurns: maxTurns,
       skillsEnabled: false,
+      terminalEnabled: false,
       mcpEnabled: false,
       subagentEnabled: false,
       verifyBeforeDone: false,
@@ -230,6 +256,11 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
     delete childExt.mcpOAuthManager;
     delete childExt.subagentRuntime;
     delete childExt.worktreeManager;
+    delete childExt.toolRoute;
+    delete childExt.skillCatalog;
+    delete childExt.providerState;
+    delete childExt.advertisedTools;
+    delete childExt.contextPolicy;
     return childExt;
   }
 
@@ -302,8 +333,24 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
     });
 
     try {
+      const modelBinding = modelBindingFor(ctx);
+      let chatFn;
+      const extensions = childExtensions(ctx.extensions);
+      if (modelBinding != null) {
+        chatFn = await ctx.extensions.createBoundChat(kind, { signal: ctx.signal });
+        if (typeof chatFn !== 'function' || chatFn === ctx.chatFn || boundChatFunctions.has(chatFn)) {
+          const error = new Error('每个子 Agent 必须得到独立的 model-bound chat closure');
+          error.code = 'MODEL_BOUND_CHAT_REQUIRED';
+          throw error;
+        }
+        boundChatFunctions.add(chatFn);
+        extensions.modelBinding = modelBinding;
+        extensions.projectBindingId = modelBinding.projectBindingId;
+      }
       const result = await runLoop({
         project: childProject || ctx.project,
+        modelBinding,
+        chatFn,
         settings: childSettings(ctx.settings, turns),
         messages: [{ role: 'user', content: g }],
         gate: childGate || ctx.gate,
@@ -318,7 +365,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
         subagentDepth: 1,
         subagentKind: kind,
         registry: ctx.registry,
-        extensions: childExtensions(ctx.extensions),
+        extensions,
       });
 
       const summary = String(result.content || '').slice(0, SUMMARY_MAX);
@@ -354,8 +401,13 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
       return out;
     } catch (err) {
       const msg = err?.message || String(err);
+      const details = {
+        ...(typeof err?.code === 'string' ? { code: err.code } : {}),
+        ...(err?.partialOutput !== undefined ? { partialOutput: err.partialOutput } : {}),
+      };
       ctx.onEvent?.({
         type: AGENT_EVENTS.SUBAGENT_END,
+        ...details,
         subagentId,
         kind,
         ok: false,
@@ -364,7 +416,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
         ...(batchId ? { batchId } : {}),
       });
       if (err?.code === 'ABORTED') throw err;
-      return { ok: false, kind, subagentId, error: msg };
+      return { ok: false, kind, subagentId, error: msg, ...details };
     }
   }
 
@@ -376,7 +428,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
     if (g.length < 4) {
       return { ok: false, kind, error: 'goal 过短（至少 4 个字符）' };
     }
-    return null;
+    return bindingPrecheck(ctx, kind);
   }
 
   async function runExplore(ctx, { goal, maxTurns, batchId } = {}) {
@@ -424,7 +476,7 @@ function createSubagentRuntime({ runLoop, worktreeManager } = {}) {
       const create = typeof createWorktree === 'function' ? createWorktree : (input) => manager.create(input);
       const created = await create({
         project: ctx.project,
-        projectBindingId: ctx.projectBindingId,
+        projectBindingId: modelBindingFor(ctx)?.projectBindingId ?? ctx.projectBindingId,
         sessionId: ctx.sessionKey,
         subagentId,
         goal: String(markerGoal || goal || '').slice(0, 500),

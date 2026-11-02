@@ -149,7 +149,9 @@ function buildCompactSystemPrompt() {
  *   onUsage?:Function}} args
  * @returns {Promise<string>}
  */
-async function generateCompactSummary({ transcript, settings, chatFn, signal, onUsage } = {}) {
+async function generateCompactSummary({ transcript, settings, modelBinding, chatFn, signal, onUsage } = {}) {
+  if (modelBinding != null && !require('./model-profiles').isResolvedModelBinding(modelBinding)) throw Object.assign(new Error('压缩需要主进程模型绑定。'), { code: 'MODEL_BINDING_INVALID' });
+  if (signal?.aborted) throw Object.assign(new Error('已停止'), { code: 'ABORTED' });
   const text = String(transcript || '');
   if (!text.trim()) throw new Error('待压缩内容为空');
   const s = settings || {};
@@ -157,6 +159,7 @@ async function generateCompactSummary({ transcript, settings, chatFn, signal, on
   if (mode === 'local') {
     return `（本地模式占位摘要）摘录约 ${text.length} 字符、约 ${approxTokensFromText(text)} token。切换到 API 模式可生成真实摘要。`;
   }
+  if (modelBinding && typeof chatFn !== 'function') throw Object.assign(new Error('压缩缺少绑定的模型客户端。'), { code: 'MODEL_BOUND_CHAT_REQUIRED' });
   const sentMessages = [
     { role: 'system', content: buildCompactSystemPrompt() },
     { role: 'user', content: text.slice(0, TRANSCRIPT_MAX_DEFAULT) },
@@ -165,9 +168,7 @@ async function generateCompactSummary({ transcript, settings, chatFn, signal, on
   let rawUsage = null;
   if (typeof chatFn === 'function') {
     const response = await chatFn({
-      baseUrl: s.baseUrl,
-      apiKey: s.apiKey,
-      model: s.model,
+      ...(modelBinding ? { modelBinding } : { baseUrl: s.baseUrl, apiKey: s.apiKey, model: s.model }),
       temperature: 0.2,
       signal,
       messages: sentMessages,
@@ -190,8 +191,9 @@ async function generateCompactSummary({ transcript, settings, chatFn, signal, on
     content = msg?.content || '';
     rawUsage = msg?.usage ?? null;
   }
+  if (signal?.aborted) throw Object.assign(new Error('已停止'), { code: 'ABORTED' });
   const out = String(content || '').trim();
-  if (typeof onUsage === 'function') {
+  if (!modelBinding && typeof onUsage === 'function') {
     try {
       await Promise.resolve(onUsage({ rawUsage, messages: sentMessages, content: out }));
     } catch {
@@ -215,19 +217,21 @@ function bestEffortUsageReporter(onUsage) {
 }
 
 async function generateCompactArtifacts({
-  transcript, settings, candidateLimit, chatFn, signal, onUsage,
+  transcript, settings, modelBinding, candidateLimit, chatFn, candidateChatFn, signal, onUsage,
 } = {}) {
   const reportUsage = bestEffortUsageReporter(onUsage);
   const summary = await generateCompactSummary({
-    transcript, settings, chatFn, signal, onUsage: reportUsage,
+    transcript, settings, modelBinding, chatFn, signal, onUsage: reportUsage,
   });
   try {
     const candidates = await generateMemoryCandidates({
-      transcript, settings, limit: candidateLimit,
-      chatFn, signal, onUsage: reportUsage,
+      transcript, settings, modelBinding, limit: candidateLimit,
+      chatFn: modelBinding ? candidateChatFn : (candidateChatFn || chatFn), signal, onUsage: reportUsage,
     });
+    if (signal?.aborted) throw Object.assign(new Error('已停止'), { code: 'ABORTED' });
     return { summary, candidates, candidateWarning: null };
-  } catch {
+  } catch (error) {
+    if (signal?.aborted || ['ABORTED', 'MODEL_TIMEOUT', 'MODEL_BINDING_INVALID', 'MODEL_BOUND_CHAT_REQUIRED'].includes(error?.code) || error?.name === 'AbortError') throw error;
     return {
       summary,
       candidates: [],

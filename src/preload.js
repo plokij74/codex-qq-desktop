@@ -12,7 +12,38 @@ contextBridge.exposeInMainWorld('codex', {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (partial) => ipcRenderer.invoke('settings:save', partial),
   sendChat: (payload) => ipcRenderer.invoke('chat:send', payload),
-  stopChat: () => ipcRenderer.invoke('chat:stop'),
+  stopChat: (payload = {}) => payload?.sessionId && payload?.runId
+    ? ipcRenderer.invoke('chat:stop', { sessionId: String(payload.sessionId), runId: String(payload.runId) })
+    : Promise.resolve({ ok: false, code: 'RUN_SCOPE_REQUIRED', error: '停止请求必须包含会话和运行标识' }),
+  listModels: () => ipcRenderer.invoke('models:list'),
+  saveModelProvider: (payload = {}) => ipcRenderer.invoke('models:saveProvider', { provider: payload?.provider, expectedRevision: payload?.expectedRevision }),
+  saveModelProfile: (payload = {}) => ipcRenderer.invoke('models:saveModel', { model: payload?.model, expectedRevision: payload?.expectedRevision }),
+  setDefaultModel: (payload = {}) => ipcRenderer.invoke('models:setDefault', { modelProfileId: payload?.modelProfileId, expectedRevision: payload?.expectedRevision }),
+  removeModelProfile: (payload = {}) => ipcRenderer.invoke('models:remove', { kind: payload?.kind, id: payload?.id, expectedRevision: payload?.expectedRevision }),
+  setModelCredential: (payload = {}) => ipcRenderer.invoke('models:setCredential', { providerId: payload?.providerId, credential: payload?.credential, expectedRevision: payload?.expectedRevision }),
+  clearModelCredential: (payload = {}) => ipcRenderer.invoke('models:clearCredential', { providerId: payload?.providerId, expectedRevision: payload?.expectedRevision }),
+  retryModelCredentialCleanup: (payload = {}) => ipcRenderer.invoke('models:retryCredentialCleanup', { expectedRevision: payload?.expectedRevision }),
+  syncModelSessionReferences: (payload = {}) => ipcRenderer.invoke('models:syncSessionReferences', {
+    sessions: Array.isArray(payload?.sessions) ? payload.sessions.map((session) => ({
+      sessionId: session?.sessionId, assistantId: session?.assistantId, modelProfileId: session?.modelProfileId,
+      identityType: session?.identityType,
+    })) : [],
+  }),
+  diagnoseModel: (payload = {}) => ipcRenderer.invoke('models:diagnose', { modelProfileId: payload?.modelProfileId, checks: payload?.checks, expectedRevision: payload?.expectedRevision }),
+  cancelModelDiagnosis: (payload = {}) => ipcRenderer.invoke('models:cancelDiagnosis', { diagnosticId: payload?.diagnosticId, sessionId: payload?.sessionId, runId: payload?.runId, clientRequestId: payload?.clientRequestId }),
+  onModelRegistryChanged: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('models:registry-changed', listener);
+    return () => ipcRenderer.removeListener('models:registry-changed', listener);
+  },
+  onModelDiagnosticEvent: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('models:diagnostic-event', listener);
+    return () => ipcRenderer.removeListener('models:diagnostic-event', listener);
+  },
+  listAssistants: () => ipcRenderer.invoke('assistants:list'),
+  saveAssistant: (payload = {}) => ipcRenderer.invoke('assistants:save', { assistant: payload?.assistant, expectedRevision: payload?.expectedRevision }),
+  deleteAssistant: (payload = {}) => ipcRenderer.invoke('assistants:delete', { assistantId: payload?.assistantId, expectedRevision: payload?.expectedRevision }),
   onChatEvent: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('chat:event', listener);

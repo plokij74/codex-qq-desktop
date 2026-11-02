@@ -5,7 +5,7 @@ function failure(code, message) { return Object.assign(new Error(message), { cod
 function canonical(p) { if (!p) return ''; return fs.realpathSync.native(p); }
 function bindingOf(value) {
   const b = {};
-  for (const key of ['sessionId', 'projectId', 'projectBindingId', 'senderId']) b[key] = String(value[key] ?? '');
+  for (const key of ['sessionId', 'projectId', 'projectBindingId', 'senderId', 'assistantId', 'assistantRevision', 'providerId', 'providerRevision', 'modelProfileId', 'modelRevision', 'bindingRevision', 'policyRevision']) b[key] = String(value[key] ?? '');
   b.projectPath = canonical(value.projectPath);
   if (!b.sessionId || !b.senderId || (b.projectPath && (!b.projectId || !b.projectBindingId))) throw failure('INVALID_BINDING', '计划缺少可信项目或发送者绑定');
   return b;

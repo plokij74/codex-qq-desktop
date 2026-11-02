@@ -60,8 +60,95 @@ test('TaskHandle enforces actual lifecycle cancellation and terminal event bound
   const events=[];const h=new TaskHandle({taskId:'t',onStatusChange:e=>events.push(e)});h.start();assert.equal(h.state,'running');assert.equal(h.cancel('timeout'),true);assert.equal(h.signal.aborted,true);assert.equal(h.cancelReason,'timeout');assert.equal(h.cancel('user_request'),false);assert.throws(()=>h.complete());
   const done=new TaskHandle();done.start();done.complete();assert.equal(done.state,'completed');assert.throws(()=>done.start());assert.throws(()=>createTaskEventEnvelope({}));assert.ok(events.length>=3);
 });
-test('renderer approval creates run before IPC events and retains retryable plan',async()=>{
-  const src=fs.readFileSync(path.join(__dirname,'../src/renderer/app.js'),'utf8');const helper=src.slice(src.indexOf('function waitForChatRunEvents('),src.indexOf('function createAssistantRunPlaceholder('));const code=helper+src.slice(src.indexOf('async function approvePlanFromCard('),src.indexOf('\nfunction renderVerifyStrip'));
-  const session={id:'s',messages:[{role:'assistant',parts:[{type:'plan',planId:'p',status:'proposed'}]}]};const trace=[];
-  const ctx={setTimeout,clearTimeout,console,sessions:[session],activeSessionId:'s',sending:false,chatRun:null,window:{codex:{messageSchema:schema,approvePlan:async()=>{assert.ok(ctx.chatRun);trace.push('ipc');ctx.chatRun.trajectory.push({kind:'tool'});return {ok:false,isRetryable:true,error:'busy'};}}},sessionProject:()=>null,setSending:x=>ctx.sending=x,createAssistantRunPlaceholder:()=>{trace.push('run');ctx.chatRun={sessionId:'s',trajectory:[],el:{remove(){}},finalized:false};},finalizeChatRun:()=>{ctx.chatRun.finalized=true;},setPersistedPlanStatus:()=>{},toast:()=>{},saveState:()=>{},renderMessages:()=>{},renderLeftDynamic:()=>{},updateAgentModeToggle:()=>{},worktreeBindings:new Map(),Date};vm.createContext(ctx);vm.runInContext(code,ctx);await ctx.approvePlanFromCard(null,{planId:'p',sessionId:'s'});assert.deepEqual(trace,['run','ipc']);assert.equal(session.messages[0].parts[0].status,'proposed');assert.equal(ctx.sending,false);
+test('renderer approval freezes correlated request before IPC, creates no preaccept run and retains retryable plan', async () => {
+  const chat = require('../src/renderer/e4-chat-state');
+  const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const part = (start, end) => {
+    const a = source.indexOf(start), b = source.indexOf(end, a);
+    assert.ok(a >= 0 && b > a);
+    return source.slice(a, b);
+  };
+  const state = chat.createState({ sessions: [{
+    id: 's', peer: 'codex', identityType: 'ai', assistantId: 'assistant_codex',
+    modelProfileId: 'model-fixed', agentMode: 'plan', projectId: 'project-fixture',
+    messages: [{ role: 'assistant', content: 'Review plan', parts: [{ type: 'plan', planId: 'p', status: 'proposed', resolvedAt: null }] }],
+  }] });
+  const session = state.sessions[0];
+  const originalMessages = JSON.parse(JSON.stringify(session.messages));
+  chat.updateDraft(state, 's', { text: 'unsent next question', attachmentRefs: [] });
+  const project = { id: 'project-fixture', name: 'Fixture', path: path.join(__dirname, '../offline-project-fixture') };
+  const trace = [], captured = [], toasts = [];
+  let syncCalls = 0;
+  const context = vm.createContext({
+    setTimeout, clearTimeout, console, Date, sessions: state.sessions, chatState: state,
+    activeSessionId: 's', sending: false, chatRun: null,
+    modelManager: { getState: () => ({ revision: 7 }) },
+    pendingChatRequests: new Map(), activeForegroundTask: null,
+    chatOutboxStore: { fail: () => assert.fail('Plan preflight must not consume or fail a composer outbox') },
+    window: { E4ChatState: chat, codex: { messageSchema: schema, approvePlan: async (payload) => {
+      trace.push('ipc');
+      assert.equal(context.chatRun, null);
+      assert.equal(context.sending, true);
+      const entry = context.pendingChatRequests.get(payload.clientRequestId);
+      assert.ok(entry);
+      assert.equal(context.pendingChatRequests.size, 1);
+      assert.equal(entry.accepted, false);
+      assert.equal(entry.consumeDraft, false);
+      assert.equal(entry.ledger.accepted, false);
+      assert.equal(entry.ledger.runId, null);
+      assert.equal(entry.ledger.sessionId, 's');
+      assert.equal(entry.ledger.clientRequestId, payload.clientRequestId);
+      assert.ok(Object.isFrozen(entry.outbox));
+      assert.ok(Object.isFrozen(entry.outbox.messages));
+      assert.ok(Object.isFrozen(entry.outbox.messages[0]));
+      assert.equal(payload.assistantId, 'assistant_codex');
+      assert.equal(payload.modelProfileId, 'model-fixed');
+      assert.equal(payload.expectedRegistryRevision, 7);
+      assert.equal(payload.projectBindingId, 'binding-current');
+      assert.deepEqual(JSON.parse(JSON.stringify(payload.project)), project);
+      assert.notEqual(payload.messages, entry.outbox.messages);
+      assert.deepEqual(JSON.parse(JSON.stringify(payload.messages)), originalMessages);
+      captured.push(entry);
+      return { ok: false, code: 'BUSY', isRetryable: true, error: 'busy' };
+    } } },
+    sessionProject: () => project,
+    bindWorktreeProject: async () => {
+      trace.push('bind');
+      assert.equal(context.chatRun, null);
+      assert.equal(context.pendingChatRequests.size, 1);
+      return 'binding-current';
+    },
+    syncModelSessionReferences: async () => {
+      trace.push('refs');
+      if (++syncCalls === 1) chat.updateDraft(state, 's', { text: 'edited while approval is pending', attachmentRefs: [] });
+      return { ok: true };
+    },
+    cloneForIpc: (value) => JSON.parse(JSON.stringify(value)),
+    setSending: (value) => { context.sending = value; },
+    createAssistantRunPlaceholder: () => assert.fail('BUSY preflight must not create an assistant bubble'),
+    finalizeChatRun: () => assert.fail('BUSY preflight must not finalize a nonexistent run'),
+    toast: (message) => toasts.push(message), saveState() {}, renderMessages() {},
+    renderLeftDynamic() {}, renderOutboxRecovery() {}, updateAgentModeToggle() {}, worktreeBindings: new Map(),
+  });
+  const code = part('function waitForChatRunEvents(', 'function createAssistantRunPlaceholder(')
+    + part('async function approvePlanFromCard(', '\nfunction renderVerifyStrip')
+    + part('function rejectChatEntry(', '\nfunction bindEvents()');
+  vm.runInContext(code, context);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await context.approvePlanFromCard(null, { planId: 'p', sessionId: 's' });
+    assert.equal(context.sending, false);
+    assert.equal(context.pendingChatRequests.size, 0);
+    assert.equal(session.messages[0].parts[0].status, 'proposed');
+    assert.equal(session.messages[0].parts[0].resolvedAt, null);
+  }
+  assert.deepEqual(trace, ['bind', 'refs', 'ipc', 'bind', 'refs', 'ipc']);
+  assert.equal(captured.length, 2);
+  assert.notEqual(captured[0].outbox.clientRequestId, captured[1].outbox.clientRequestId);
+  assert.ok(captured[1].outbox.draftRevision > captured[0].outbox.draftRevision);
+  assert.equal(captured[0].outbox.draftText, 'unsent next question');
+  assert.equal(state.draftsBySession.s.text, 'edited while approval is pending');
+  assert.equal(context.chatRun, null);
+  assert.equal(session.agentMode, 'plan');
+  assert.deepEqual(JSON.parse(JSON.stringify(session.messages)), originalMessages);
+  assert.deepEqual(toasts, ['busy', 'busy']);
 });

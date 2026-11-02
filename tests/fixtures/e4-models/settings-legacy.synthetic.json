@@ -1,0 +1,11 @@
+{
+  "fixtureKind": "isolated synthetic legacy settings; no real credentials or user data",
+  "mode": "local",
+  "baseUrl": "https://synthetic.example/gateway/v1/chat/completions",
+  "model": "synthetic-legacy-model",
+  "secretRef": "sec_main_api_key",
+  "apiKeyConfigured": true,
+  "maxAgentTurns": 0,
+  "permissionMode": "read-only",
+  "syntheticUnknownSetting": { "preserved": true }
+}

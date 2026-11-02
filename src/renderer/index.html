@@ -54,8 +54,8 @@
           <div class="contact-row" id="contact-randy" role="button" tabindex="0">
             <span class="avatar-sm">👤</span>
             <div>
-              <div class="contact-name">Randy Lu</div>
-              <div class="contact-status online">在线</div>
+              <div class="contact-name">Randy Lu（示例）</div>
+              <div class="contact-status">模拟</div>
             </div>
           </div>
         </div>
@@ -72,6 +72,11 @@
             <div>
               <h1 id="session-heading">优化 KV 读写成本</h1>
               <div class="session-sub" id="session-sub">与 Codex 小蓝 对话</div>
+              <div class="chat-model-controls">
+                <label><span>助手</span><select id="chat-assistant-select" aria-label="本会话助手"></select></label>
+                <label><span>下一轮模型</span><select id="chat-model-select" aria-label="下一轮模型"></select></label>
+                <span id="chat-model-source" class="model-source-label">尚无固定模型来源</span>
+              </div>
               <div class="usage-bar hidden" id="usage-bar" title="点击展开按来源明细"></div>
             </div>
             <div class="session-actions">
@@ -104,7 +109,8 @@
             <textarea id="chat-input" rows="3" placeholder="输入消息，Enter 发送..."></textarea>
             <div class="composer-footer">
               <span class="hint">Enter 发送 · Shift+Enter 换行 · /help 查看命令</span>
-              <button type="button" id="btn-stop" class="stop-btn hidden" title="停止生成">停止</button><button type="button" id="btn-send" class="send-btn">发送(S)</button>
+              <span id="draft-persistence-status" class="draft-persistence-status" hidden></span>
+              <button type="button" id="btn-stop" class="stop-btn hidden" title="停止当前会话运行">停止</button><button type="button" id="btn-send" class="send-btn">发送(S)</button>
             </div>
           </div>
           <div id="terminal-panel" class="terminal-panel collapsed">
@@ -137,7 +143,7 @@
 
       <aside class="qq-right" id="friend-panel">
         <div class="right-head">
-          <span id="right-title">Codex 好友</span>
+          <span id="right-title">AI 助手</span>
           <span class="lv-badge">LV07</span>
         </div>
         <div class="robot-card" id="robot-card" role="button" tabindex="0" title="和 Codex 聊天">
@@ -150,7 +156,7 @@
             查文档，超可靠哇！
           </div>
         </div>
-        <div class="friend-list-head" id="friend-list-head">我的好友</div>
+        <div class="friend-list-head" id="friend-list-head"><span id="friend-list-label">AI 与示例联系人</span> <button type="button" class="btn-small" id="btn-general-ai" title="新建通用 AI 会话">新建 AI 会话</button></div>
         <ul class="friend-list" id="friend-list"></ul>
       </aside>
     </div>
@@ -186,25 +192,13 @@
     <div class="modal-card">
       <div class="modal-title" id="settings-title">设置</div>
       <label class="field">
-        <span>模式</span>
+        <span>运行模式</span>
         <select id="set-mode">
           <option value="local">本地模拟</option>
-          <option value="api">OpenAI 兼容 API</option>
+          <option value="api">API 模式</option>
         </select>
       </label>
-      <label class="field">
-        <span>Base URL</span>
-        <input id="set-base-url" type="text" placeholder="https://api.openai.com/v1" />
-      </label>
-      <label class="field">
-        <span>API Key</span>
-        <input id="set-api-key" type="password" placeholder="留空则保留原 Key" autocomplete="off" />
-        <small id="set-api-hint" class="field-hint"></small>
-      </label>
-      <label class="field">
-        <span>Model</span>
-        <input id="set-model" type="text" placeholder="gpt-4o-mini" />
-      </label>
+      <button type="button" id="btn-open-model-manager" class="btn-secondary">管理模型、服务商与助手</button>
       <div class="field-block">
         <div class="field-title">Agent / 终端</div>
         <label class="field">
@@ -334,6 +328,13 @@
     </div>
   </div>
 
+  <div id="model-manager-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="model-manager-title">
+    <div class="modal-card e4-model-manager-card">
+      <div class="e4-manager-title"><h1 id="model-manager-title">模型与助手</h1><button type="button" id="btn-close-model-manager" class="icon-btn" title="关闭" aria-label="关闭">×</button></div>
+      <div id="e4-model-manager-root"></div>
+    </div>
+  </div>
+
   <!-- Elevation Request Modal (E.3) -->
   <div id="elevation-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="elevation-title">
     <div class="modal-card">
@@ -414,6 +415,8 @@
   <script src="pr-audit-recheck-ui.js"></script>
   <script src="pr-audit-tracking-ui.js"></script>
   <script src="e2-messages.js"></script>
+  <script src="e4-chat-state.js"></script>
+  <script src="e4-models.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

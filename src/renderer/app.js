@@ -1,5 +1,5 @@
 /* Codex QQ Desktop */
-const STORAGE_KEY = 'codex-qq-state-v2';
+const STORAGE_KEY = window.E4ChatState?.STORAGE_KEY || 'codex-qq-state-v3';
 const TERM_COLLAPSED_KEY = 'codex-qq-term-collapsed';
 const SEED_KV = [
   '【示例】结构确认没问题：','',
@@ -34,12 +34,18 @@ const SCHEDULED = [
   { id: 't3', title: '清理过期 free_trial 标记', when: '已暂停', status: 'paused' },
 ];
 const FRIENDS = [
-  { id: 'codex', name: 'Codex 小蓝', avatar: '🤖', status: '在线', kind: 'bot' },
+  { id: 'codex', name: 'Codex 小蓝', avatar: '🤖', status: 'AI 助手', kind: 'bot' },
   { id: 'randy', name: 'Randy Lu（示例）', avatar: '🧑', status: '模拟', kind: 'user' },
   { id: 'maya', name: 'Maya（示例）', avatar: '👧', status: '模拟', kind: 'user' },
 ];
 let sessions = [];
 let projects = [];
+let chatState = window.E4ChatState?.createState() || { schemaVersion: 3, sessions: [], projects: [], activeSessionId: '', pluginState: {}, draftsBySession: {} };
+let storageWriteBlocked = false;
+let draftPersistenceError = '';
+const pendingAttachmentsBySession = new Map();
+let modelManager = null;
+let modelSettingsUi = null;
 const worktreeBindings = new Map();
 const worktreeBindingRequests = new Map();
 let ciWatchUi = null;
@@ -72,6 +78,11 @@ let defaultAgentModeSeed = 'agent';
 
 /** Active agent/stream run for the current send (event-driven UI). */
 let chatRun = null;
+const pendingChatRequests = new Map();
+const pendingCompactRequests = new Map();
+const chatOutboxStore = window.E4ChatState.createOutboxStore();
+const completedChatRuns = new Map();
+let activeForegroundTask = null;
 
 // MCP task and elicitation state is deliberately ephemeral.  It is hydrated
 // from main on demand and is never included in saveState/session export.
@@ -112,8 +123,14 @@ function setSending(on) {
   sending = !!on;
   const btn = document.getElementById('btn-send');
   const stop = document.getElementById('btn-stop');
+  const owner = chatRun?.accepted ? chatRun : activeForegroundTask;
+  const stoppable = sending && owner?.sessionId === activeSessionId && owner.runId && !owner.doneEvent && !owner.ledger?.terminal;
   if (btn) btn.disabled = sending;
-  if (stop) stop.classList.toggle('hidden', !sending);
+  if (stop) { stop.classList.toggle('hidden', !stoppable); stop.disabled = !!owner?.stopping; stop.textContent = owner?.stopping ? '停止中…' : '停止'; }
+  const busy = document.getElementById('chat-foreground-status');
+  if (busy) { busy.hidden = !sending; busy.textContent = !sending ? '' : owner?.sessionId && owner.sessionId !== activeSessionId
+    ? '其他会话正在运行；当前草稿未发送，切会话不会取消原运行。'
+    : owner?.stopping ? '正在停止并清理，暂不接受新前台任务。' : owner?.kind === 'session_compact' ? '正在手动压缩；不会插入聊天消息或消费草稿。' : owner?.runId ? '当前会话正在生成，模型选择仅影响下一轮。' : '正在预检，草稿与历史尚未消费。'; }
   updateAgentModeToggle();
 }
 
@@ -578,14 +595,22 @@ function disableApprovalCards(root) {
 }
 
 async function stopGenerating() {
-  if (localSendToken) localSendToken.aborted = true;
-  if (chatRun?.el) disableApprovalCards(chatRun.el);
-  try {
-    if (window.codex?.stopChat) await window.codex.stopChat();
-    if (sending) toast('正在停止…');
-  } catch (e) {
-    toast(e?.message || String(e));
+  const target = chatRun?.accepted ? chatRun : activeForegroundTask;
+  if (!target?.sessionId || !target?.runId || target.sessionId !== activeSessionId) {
+    if (sending) toast('当前会话不拥有可停止的运行；其他会话不会被取消');
+    return;
   }
+  if (target.stopping || target.doneEvent || target.ledger?.terminal) return;
+  target.stopping = true;
+  if (activeForegroundTask?.clientRequestId === target.clientRequestId) activeForegroundTask.stopping = true;
+  if (target.el) disableApprovalCards(target.el);
+  setSending(true);
+  try {
+    const result = await window.codex?.stopChat?.({ sessionId: target.sessionId, runId: target.runId });
+    if (result?.ok === false) { target.stopping = false; toast(result.error || '停止失败'); }
+    else toast('正在停止；等待任务清理完成…');
+  } catch (error) { target.stopping = false; toast(error?.message || String(error)); }
+  setSending(sending);
 }
 
 function bindInlineStop() {
@@ -830,71 +855,210 @@ function defaultProjects() {
 }
 function defaultSessions() {
   return [
-    { id: 'task_kv', title: '【示例】优化 KV 读写成本', kind: 'task', peer: 'codex', projectId: null, pinned: true, agentMode: 'agent', messages: [{ role: 'assistant', content: SEED_KV }], updatedAt: Date.now() },
-    { id: 'task_wechat', title: '【示例】微信发送 hello world', kind: 'task', peer: 'codex', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '这个任务可以拆成：\n\n1. 确认接口\n2. 写最小发送脚本\n3. 配 token\n\n把代码或报错贴过来。' }], updatedAt: Date.now() - 1000 },
-    { id: 'chat_randy', title: 'Randy Lu（示例）', kind: 'friend', peer: 'randy', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '（模拟好友：真实通信待 E26 接入）在的，有事直接说。' }], updatedAt: Date.now() - 2000 },
+    { id: 'task_kv', title: '【示例】优化 KV 读写成本', kind: 'task', peer: 'codex', identityType: 'ai', assistantId: 'assistant_codex', modelProfileId: null, projectId: null, pinned: true, agentMode: 'agent', messages: [{ role: 'assistant', content: SEED_KV, modelSource: { kind: 'legacy-demo' } }], updatedAt: Date.now() },
+    { id: 'task_wechat', title: '【示例】微信发送 hello world', kind: 'task', peer: 'codex', identityType: 'ai', assistantId: 'assistant_codex', modelProfileId: null, projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '这个任务可以拆成：\n\n1. 确认接口\n2. 写最小发送脚本\n3. 配 token\n\n把代码或报错贴过来。', modelSource: { kind: 'legacy-demo' } }], updatedAt: Date.now() - 1000 },
+    { id: 'chat_randy', title: 'Randy Lu（示例）', kind: 'friend', peer: 'demo-contact', identityType: 'demo-contact', legacyPeer: 'randy', projectId: null, pinned: false, agentMode: 'agent', messages: [{ role: 'assistant', content: '（模拟好友：真实通信待 E26 接入）在的，有事直接说。', modelSource: { kind: 'legacy-demo' } }], updatedAt: Date.now() - 2000 },
   ];
 }
 function normalizeSessionMessageClient(m) {
   return window.E2Messages.restore(m, window.codex.messageSchema);
 }
-
+function restoreChatState(state) {
+  sessions = state.sessions.map((raw) => {
+    const session = { pinned: false, projectId: null, ...raw, agentMode: normalizeSessionAgentMode(raw.agentMode), messages: (raw.messages || []).map(normalizeSessionMessageClient) };
+    ensureSessionCandidateState(session);
+    ensureSessionWorktreeState(session);
+    return session;
+  });
+  projects = Array.isArray(state.projects) ? state.projects : [];
+  activeSessionId = state.activeSessionId && sessions.some((session) => session.id === state.activeSessionId) ? state.activeSessionId : (sessions[0]?.id || '');
+  if (state.pluginState) pluginState = { ...pluginState, ...state.pluginState };
+  chatState = { ...state, sessions, projects, activeSessionId, pluginState };
+}
+function freshChatState() {
+  const seedSessions = defaultSessions();
+  return window.E4ChatState.createState({ sessions: seedSessions, projects: defaultProjects(), activeSessionId: seedSessions[0].id, pluginState });
+}
 function loadState() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('codex-qq-sessions-v1');
+    let raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) for (const key of window.E4ChatState.LEGACY_STORAGE_KEYS) { raw = localStorage.getItem(key); if (raw) break; }
     if (!raw) {
-      sessions = defaultSessions().map((s) => ({
-        ...s,
-        messages: (s.messages || []).map(normalizeSessionMessageClient),
-      }));
-      sessions.forEach(ensureSessionCandidateState);
-      sessions.forEach(ensureSessionWorktreeState);
-      projects = defaultProjects();
-      activeSessionId = sessions[0].id;
+      storageWriteBlocked = false;
+      chatState = freshChatState();
+      restoreChatState(chatState);
       return;
     }
-    const data = JSON.parse(raw);
-    sessions = Array.isArray(data.sessions) && data.sessions.length
-      ? data.sessions.map((s) => {
-        const mode = normalizeSessionAgentMode(s.agentMode);
-        const msgs = (s.messages || []).map(normalizeSessionMessageClient);
-        const session = { pinned: false, projectId: null, ...s, agentMode: mode, messages: msgs };
-        ensureSessionCandidateState(session);
-        ensureSessionWorktreeState(session);
-        return session;
-      })
-      : defaultSessions().map((s) => ({
-        ...s,
-        messages: (s.messages || []).map(normalizeSessionMessageClient),
-      }));
-    sessions.forEach(ensureSessionCandidateState);
-    sessions.forEach(ensureSessionWorktreeState);
-    projects = Array.isArray(data.projects) ? data.projects : defaultProjects();
-    activeSessionId = data.activeSessionId && sessions.some((s) => s.id === data.activeSessionId) ? data.activeSessionId : sessions[0].id;
-    if (data.pluginState) pluginState = { ...pluginState, ...data.pluginState };
+    const migrated = window.E4ChatState.migrateState(JSON.parse(raw));
+    if (!migrated.ok) {
+      storageWriteBlocked = true;
+      chatState = migrated.state || window.E4ChatState.createState();
+      restoreChatState(chatState);
+      draftPersistenceError = `${migrated.error || '会话数据无法迁移'}；原数据保留，当前更改未保存，请先导出恢复。`;
+      const status = document.getElementById('draft-persistence-status');
+      if (status) { status.textContent = draftPersistenceError; status.hidden = false; }
+      setTimeout(() => toast(draftPersistenceError, 5000), 100);
+      return;
+    }
+    storageWriteBlocked = false;
+    chatState = migrated.state;
+    restoreChatState(chatState);
+    if (migrated.migrated) saveState();
   } catch (err) {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('codex-qq-sessions-v1');
-      if (raw) {
-        localStorage.setItem(`codex-qq-corrupted-${Date.now()}`, raw);
-      }
-    } catch { /* ignore backup failure */ }
-    sessions = defaultSessions();
-    sessions.forEach(ensureSessionCandidateState);
-    sessions.forEach(ensureSessionWorktreeState);
-    projects = defaultProjects();
-    activeSessionId = sessions[0].id;
-    setTimeout(() => {
-      toast('本地存储数据异常，已自动备份原数据并加载默认配置', 5000);
-    }, 100);
+    // Never overwrite or seed a malformed container. The original key remains available for recovery.
+    storageWriteBlocked = true;
+    chatState = window.E4ChatState.createState();
+    restoreChatState(chatState);
+    draftPersistenceError = '本地会话数据异常；原数据保留，当前更改未保存，请先恢复原数据。';
+    const status = document.getElementById('draft-persistence-status');
+    if (status) { status.textContent = draftPersistenceError; status.hidden = false; }
+    setTimeout(() => toast(draftPersistenceError, 5000), 100);
   }
 }
 function saveState() {
   sessions.forEach(ensureSessionCandidateState);
   sessions.forEach(ensureSessionWorktreeState);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions: sessions.map((s) => ({ ...s, messages: s.messages.map((m) => window.codex.messageSchema.projectToStorageJson(m)) })), projects, activeSessionId, pluginState }));
+  if (typeof window.codex?.syncModelSessionReferences === 'function') syncModelSessionReferences().catch((error) => console.warn('Session references sync failed', error.message));
+  if (storageWriteBlocked) {
+    const status = document.getElementById('draft-persistence-status');
+    if (status) { status.textContent = draftPersistenceError || '原数据保留，当前更改未保存'; status.hidden = false; }
+    return false;
+  }
+  chatState.sessions = sessions;
+  chatState.projects = projects;
+  chatState.activeSessionId = activeSessionId;
+  chatState.pluginState = pluginState;
+  const result = window.E4ChatState.writeState(localStorage, STORAGE_KEY, chatState, (message) => window.codex.messageSchema.projectToStorageJson(message));
+  if (!result.ok) {
+    draftPersistenceError = result.error || '草稿未能保存';
+    const status = document.getElementById('draft-persistence-status');
+    if (status) { status.textContent = draftPersistenceError; status.hidden = false; }
+    return false;
+  }
+  draftPersistenceError = '';
+  const status = document.getElementById('draft-persistence-status');
+  if (status) status.hidden = true;
+  return true;
 }
+let referenceSyncFingerprint = '';
+let referenceSyncPromise = null;
+async function syncModelSessionReferences() {
+  if (typeof window.codex?.syncModelSessionReferences !== 'function') throw new Error('会话引用同步 API 未就绪；模型配置不可修改');
+  const payload = { sessions: window.E4ChatState.sessionReferences(sessions) };
+  const fingerprint = JSON.stringify(payload);
+  if (fingerprint === referenceSyncFingerprint && referenceSyncPromise) return referenceSyncPromise;
+  referenceSyncFingerprint = fingerprint;
+  referenceSyncPromise = Promise.resolve(window.codex.syncModelSessionReferences(payload)).then((result) => {
+    if (result?.ok !== true) { referenceSyncFingerprint = ''; throw new Error(result?.error || '会话引用同步失败'); }
+    return result;
+  }, (error) => { referenceSyncFingerprint = ''; throw error; });
+  return referenceSyncPromise;
+}
+
+function renderOutboxRecovery() {
+  const root = document.getElementById('chat-outbox-recovery');
+  if (!root) return;
+  const records = chatOutboxStore.list(activeSessionId).filter((item) => item.status === 'refused');
+  root.replaceChildren(); root.hidden = records.length === 0;
+  for (const record of records) {
+    const row = document.createElement('div'); row.className = 'e4-outbox-recovery';
+    const text = document.createElement('span');
+    text.textContent = `未发送快照：${record.outbox.draftText.slice(0, 80)} · ${record.error}`;
+    const recover = document.createElement('button'); recover.type = 'button'; recover.className = 'btn-small'; recover.textContent = '恢复为独立草稿';
+    recover.addEventListener('click', () => {
+      // Preserve the current editor in its own session instead of replacing it with an older snapshot.
+      persistActiveDraft();
+      const original = sessions.find((item) => item.id === record.outbox.sessionId);
+      if (!original) return toast('原会话不可用；快照仍保留');
+      const recovered = { ...original, id: uid(), title: `${original.title || 'AI'} · 未发送草稿`, messages: [],
+        pendingMemoryCandidates: [], pendingWorktreeResults: [], updatedAt: Date.now() };
+      sessions.unshift(recovered); chatState.sessions = sessions; ensureDraftSlot(recovered);
+      window.E4ChatState.updateDraft(chatState, recovered.id, { text: record.outbox.draftText, attachmentRefs: record.outbox.attachmentRefs });
+      const attachments = pendingAttachmentsBySession.get(original.id) || [];
+      const refs = new Set(record.outbox.attachmentRefs.map((ref) => ref.attachmentId));
+      pendingAttachmentsBySession.set(recovered.id, attachments.filter((item, index) => refs.has(String(item.id || item.attachmentId || `${original.id}_${index}_${item.name || 'file'}`))));
+      chatOutboxStore.remove(record.outbox.clientRequestId); switchSession(recovered.id); saveState(); renderLeftDynamic();
+    });
+    const discard = document.createElement('button'); discard.type = 'button'; discard.className = 'btn-small'; discard.textContent = '丢弃快照';
+    discard.addEventListener('click', async () => {
+      if (await appConfirm('仅丢弃这份未发送快照；当前草稿与历史不会改变。继续？')) { chatOutboxStore.remove(record.outbox.clientRequestId); renderOutboxRecovery(); }
+    });
+    row.append(text, recover, discard); root.appendChild(row);
+  }
+}
+
 function activeSession() { return sessions.find((s) => s.id === activeSessionId) || sessions[0]; }
+function ensureDraftSlot(session) {
+  if (!session || !chatState.draftsBySession) return;
+  if (!chatState.draftsBySession[session.id]) chatState.draftsBySession[session.id] = { text: '', attachmentRefs: [], revision: 0, updatedAt: 0 };
+}
+function currentAttachmentRefs(session = activeSession()) {
+  return pendingAttaches.map((item, index) => ({
+    attachmentId: String(item.id || item.attachmentId || `${session?.id || 'draft'}_${index}_${item.name || 'file'}`),
+    name: String(item.name || 'attachment'),
+    mimeType: String(item.type || item.mimeType || 'application/octet-stream'),
+    size: Number.isFinite(item.size) ? item.size : (item.dataUrl ? Math.floor(item.dataUrl.length * 0.75) : 0),
+  }));
+}
+function persistActiveDraft() {
+  const session = activeSession(); const input = document.getElementById('chat-input');
+  if (!session || session.identityType === 'demo-contact') return { ok: true };
+  ensureDraftSlot(session);
+  pendingAttachmentsBySession.set(session.id, pendingAttaches);
+  const result = window.E4ChatState.updateDraft(chatState, session.id, { text: input?.value || '', attachmentRefs: currentAttachmentRefs(session) });
+  if (!result.ok) {
+    draftPersistenceError = result.error;
+    const status = document.getElementById('draft-persistence-status');
+    if (status) { status.textContent = result.error; status.hidden = false; }
+    saveState();
+    return result;
+  }
+  if (!saveState()) {
+    draftPersistenceError ||= '草稿未成功保存，请保留输入并重试。';
+    const status = document.getElementById('draft-persistence-status');
+    if (status) { status.textContent = draftPersistenceError; status.hidden = false; }
+    return { ok: false, error: draftPersistenceError, inMemorySaved: true };
+  }
+  return result;
+}
+function persistBeforeSessionChange() {
+  const result = persistActiveDraft();
+  if (!result.ok && !result.inMemorySaved) { toast(result.error || '当前草稿无法保存，请先修正后再切换会话'); return false; }
+  return true;
+}
+function restoreSessionDraft(session) {
+  const input = document.getElementById('chat-input');
+  if (!session || !input) return;
+  ensureDraftSlot(session);
+  const draft = chatState.draftsBySession[session.id];
+  input.value = draft?.text || '';
+  pendingAttaches = pendingAttachmentsBySession.get(session.id)
+    || (draft?.attachmentRefs || []).map((ref) => ({ id: ref.attachmentId, name: ref.name, type: ref.mimeType, size: ref.size, unavailableAfterRestart: true }));
+  renderAttachPreview();
+}
+function getAssistantForSession(session) {
+  const state = modelManager?.getState?.() || {};
+  return (state.registry?.assistants || []).find((assistant) => assistant.id === session?.assistantId) || null;
+}
+function getEffectiveModelForSession(session) {
+  const state = modelManager?.getState?.() || {};
+  const registry = state.registry || {};
+  const assistant = (registry.assistants || []).find((item) => item.id === session?.assistantId);
+  const id = session?.modelProfileId || assistant?.modelProfileId || registry.defaultModelProfileId;
+  return (registry.models || []).find((item) => item.id === id) || null;
+}
+function modelOrigin(model) {
+  const provider = modelManager?.getState?.().registry?.providers?.find((item) => item.id === model?.providerId);
+  try { return new URL(provider?.baseUrl || '').origin; } catch { return ''; }
+}
+function modelSourceLabel(source) {
+  const safe = window.E4ChatState.normalizeModelSource(source);
+  if (!safe) return '历史来源未知';
+  if (safe.kind === 'legacy-demo') return '示例历史 · 非真实模型输出';
+  if (safe.kind === 'local-demo') return '本地示例模型';
+  if (safe.kind === 'unknown') return '模型来源未知';
+  return `${safe.providerId || 'API'} · ${safe.model || safe.modelProfileId || '固定模型'}${safe.protocol ? ` · ${safe.protocol}` : ''}`;
+}
 function getProject(id) { return projects.find((p) => p.id === id) || null; }
 function sessionProject(session = activeSession()) {
   if (!session) return null;
@@ -1725,9 +1889,10 @@ function bindPlanCardActions(root) {
 function renderMessages() {
   const list = document.getElementById('message-list'); if (!list) return;
   const session = activeSession(); const msgs = session?.messages || [];
-  const botName = peerName(session?.peer || 'codex');
+  const botName = getAssistantForSession(session)?.name || peerName(session?.peer || 'codex');
   const liveRun = chatRun && chatRun.sessionId === activeSessionId && !chatRun.finalized;
-  const showTyping = sending && !liveRun;
+  const showTyping = sending && !liveRun && activeForegroundTask?.kind === 'chat_run'
+    && !!activeForegroundTask.runId && activeForegroundTask.sessionId === session?.id;
   list.innerHTML = msgs.map((raw) => {
     const msg = window.codex.messageSchema.projectToStorageJson(raw);
     const ui = window.codex.messageSchema.projectToUiModel(msg);
@@ -1735,7 +1900,8 @@ function renderMessages() {
     const roleClass = msg.role === 'user' ? 'msg-user' : 'msg-assistant';
     const errClass = msg.error ? ' msg-error' : '';
     const compactClass = msg.compact ? ' msg-compact' : '';
-    const who = msg.role === 'user' ? '我' : (msg.compact ? '会话摘要' : botName);
+    const assistantName = window.E4ChatState?.normalizeModelSource(msg.modelSource)?.assistantName || botName;
+    const who = msg.role === 'user' ? '我' : (msg.compact ? '会话摘要' : assistantName);
     const strip = msg.role === 'assistant' ? fileChangesStripHtml(msg.fileChanges) : '';
     const attHtml = renderAttachmentsHtml(msg.parts);
     const planPart = (Array.isArray(msg.parts) && msg.parts.find((p) => p && p.type === 'plan')) || (msg.planId ? {
@@ -1747,8 +1913,8 @@ function renderMessages() {
     } : null);
     const planHtml = planPart ? renderPlanCardHtml(planPart, session?.id) : '';
     const trajHtml = renderTrajectoryHtml(msg.trajectory);
-    return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+who+'</div>'+attHtml+strip+renderMarkdownLite(msg.content)+planHtml+trajHtml+'</div></div>';
-  }).join('') + (showTyping ? '<div class="typing">'+botName+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '') + renderInlineMcpTasks();
+    return '<div class="msg '+roleClass+errClass+compactClass+'"><div class="bubble"><div class="msg-meta">'+escapeHtml(who)+'</div>'+attHtml+strip+renderMarkdownLite(msg.content)+planHtml+trajHtml+'</div></div>';
+  }).join('') + (showTyping ? '<div class="typing">'+escapeHtml(botName)+' 正在输入… <button type="button" class="linkish" id="inline-stop">停止</button></div>' : '') + renderInlineMcpTasks();
   renderWorktreeCards(list, session);
   bindFileChangesToggles(list);
   bindPlanCardActions(list);
@@ -1798,9 +1964,10 @@ function waitForChatRunEvents(run, timeoutMs = 2000) {
   });
 }
 
-function createAssistantRunPlaceholder(sessionId) {
-  const session = activeSession();
-  const botName = peerName(session?.peer || 'codex');
+function createAssistantRunPlaceholder(sessionId, modelSource = null) {
+  const session = sessions.find((item) => item.id === sessionId) || activeSession();
+  const assistant = getAssistantForSession(session);
+  const botName = window.E4ChatState?.normalizeModelSource(modelSource)?.assistantName || assistant?.name || peerName(session?.peer || 'codex');
   const el = document.createElement('div');
   el.className = 'msg msg-assistant msg-run';
   el.dataset.runId = 'pending';
@@ -1892,43 +2059,35 @@ function renderPlanCard(ev) {
 
 async function approvePlanFromCard(card, planEv) {
   if (card && card.classList.contains('resolved')) return;
-  if (sending) return toast('请先停止当前生成再批准执行');
+  if (sending) return toast('已有前台任务运行；批准未发送，也不会停止原任务');
   const planId = card?.dataset.planId || planEv?.planId;
   const sessionId = card?.dataset.sessionId || planEv?.sessionId || activeSessionId;
   const session = sessions.find((s) => s.id === sessionId);
-  if (!session || !planId) return;
+  if (!session || !planId || !window.codex?.approvePlan || !modelManager) return;
   const project = sessionProject(session);
-  if (chatRun && !chatRun.finalized) finalizeChatRun();
-  const history = session.messages.filter((m) => !m.error).map((m) => window.codex.messageSchema.projectToStorageJson(m));
-  setSending(true);
-  createAssistantRunPlaceholder(sessionId);
-  const approvalRun = chatRun;
+  const outbox = window.E4ChatState.createOutbox({ state: chatState, sessionId,
+    assistantId: session.assistantId, modelProfileId: session.modelProfileId || null,
+    expectedRegistryRevision: modelManager.getState().revision, projectBindingId: '',
+    messages: session.messages.filter((message) => !message.error), text: '' });
+  const entry = { outbox, session, userMessage: null, consumeDraft: false, planId,
+    ledger: window.E4ChatState.createRunLedger({ sessionId, clientRequestId: outbox.clientRequestId }), accepted: false, ack: null };
+  pendingChatRequests.set(outbox.clientRequestId, entry); setSending(true);
   try {
-    const res = await window.codex.approvePlan({ sessionId, planId, messages: history, project: project?.path ? { id: project.id, name: project.name, path: project.path } : null, projectBindingId: project?.id ? (worktreeBindings.get(project.id) || '') : '' });
-    await waitForChatRunEvents(approvalRun);
-    if (!res?.ok) {
-      if (res?.isRetryable === true) setPersistedPlanStatus(sessionId, planId, 'proposed');
-      else if (res?.isRetryable === false) setPersistedPlanStatus(sessionId, planId, 'expired');
-      if (chatRun === approvalRun && !chatRun.finalized) {
-        if (res?.userMessage || chatRun.textBuffer || chatRun.trajectory.length) finalizeChatRun({ error: true, errorMessage: res?.error || '批准失败' });
-        else { chatRun.el.remove(); chatRun = null; }
-      }
-      toast(res?.error || '批准失败');
-      return;
+    const projectBindingId = project?.path ? await bindWorktreeProject(project) : '';
+    if (project?.path && !projectBindingId) return rejectChatEntry(entry, 'PROJECT_BINDING_STALE', '项目绑定已失效');
+    await syncModelSessionReferences();
+    const res = await window.codex.approvePlan({ sessionId, planId,
+      assistantId: outbox.assistantId, modelProfileId: outbox.modelProfileId,
+      clientRequestId: outbox.clientRequestId, expectedRegistryRevision: outbox.expectedRegistryRevision,
+      messages: cloneForIpc(outbox.messages), project: project?.path ? { id: project.id, name: project.name, path: project.path } : null,
+      projectBindingId });
+    if (res?.ok === false) {
+      if (res.isRetryable === true) setPersistedPlanStatus(sessionId, planId, 'proposed');
+      else if (res.isRetryable === false) setPersistedPlanStatus(sessionId, planId, 'expired');
     }
-    setPersistedPlanStatus(sessionId, planId, 'approved');
-    session.agentMode = 'agent'; updateAgentModeToggle();
-    if (res.userMessage) session.messages.push(window.codex.messageSchema.projectToStorageJson(res.userMessage));
-    if (chatRun === approvalRun && !chatRun.finalized) {
-      const result = res.result || {};
-      chatRun.invokeDone = true;
-      finalizeChatRun({ content: result.content || chatRun.contentFinal || chatRun.textBuffer || '', applied: result.applied, error: result.ok === false, errorMessage: result.error, aborted: result.aborted });
-    }
-  } catch (err) {
-    await waitForChatRunEvents(approvalRun);
-    if (chatRun === approvalRun && !chatRun.finalized) finalizeChatRun({ error: true, errorMessage: err?.message || String(err) });
-    toast(err?.message || String(err));
-  } finally { setSending(false); saveState(); renderMessages(); renderLeftDynamic(); }
+    settleChatInvoke(entry, res);
+  } catch (error) { rejectChatEntry(entry, error?.code, error?.message || String(error)); }
+  saveState(); renderMessages(); renderLeftDynamic();
 }
 function setPersistedPlanStatus(sessionId, planId, status) {
   const session = sessions.find((s) => s.id === sessionId);
@@ -2208,6 +2367,7 @@ function finalizeChatRun(opts = {}) {
   if (chatRun.planPart) {
     parts.push(chatRun.planPart);
   }
+  const modelSource = window.E4ChatState.normalizeModelSource(chatRun.modelSource);
   const assistantMsg = {
     role: 'assistant',
     content,
@@ -2215,6 +2375,7 @@ function finalizeChatRun(opts = {}) {
     parts,
     trajectory,
     error: Boolean(error && !aborted),
+    ...(modelSource ? { modelSource } : {}),
     createdAt: Date.now(),
     ...(fileChanges ? { fileChanges } : {}),
     ...(chatRun.planPart ? {
@@ -2358,6 +2519,7 @@ async function showEngineeringRepair(token, repairRef) {
   detail.innerHTML = [
     `<div class="engineering-detail-title">修复建议 · ${escapeHtml(engineeringRepairStatusText(repair.status))}</div>`,
     `<div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · 来源 ${escapeHtml(engineeringRepairSourceText(repair.source))} · ${escapeHtml(repair.profileId || '')}</div>`,
+    repair.modelSource ? `<div class="work-card-meta">固定模型 · ${escapeHtml(modelSourceLabel(repair.modelSource))}</div>` : '',
     repair.source?.kind === 'pr_review' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-review">查看原审查线程</button>' : '',
     repair.source?.kind === 'pr_audit' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-audit">查看原 AI 审查发现</button>' : '',
     repair.source?.kind === 'pr_audit_recheck' ? '<button type="button" class="ghost-btn" id="engineering-repair-open-recheck">查看来源复审</button>' : '',
@@ -2420,7 +2582,7 @@ async function loadEngineeringRepairs(token = engineeringBindingToken()) {
     const actions = active
       ? `<button type="button" class="ghost-btn" data-repair-cancel="${escapeHtml(repair.repairRef)}">取消</button>`
       : `<button type="button" class="ghost-btn" data-repair-view="${escapeHtml(repair.repairRef)}">查看</button>${repair.resultId && validation.status === 'running' ? `<button type="button" class="ghost-btn" data-repair-validate-cancel="${escapeHtml(repair.repairRef)}">取消验证</button>` : repair.resultId ? `<button type="button" class="ghost-btn" data-repair-validate="${escapeHtml(repair.repairRef)}">验证</button>` : ''}<button type="button" class="ghost-btn" data-repair-retry="${escapeHtml(repair.repairRef)}">重试</button>`;
-    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(engineeringRepairSourceText(repair.source))} · 隔离修复建议</strong><div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · <span class="badge ${escapeHtml(repair.status || '')}">${escapeHtml(engineeringRepairStatusText(repair.status))}</span>${validationLabel} · ${escapeHtml(repair.createdAt || '')}</div>${repair.diagnosticCount ? `<div class="work-card-meta">来源诊断 ${repair.diagnosticCount} 条${repair.outputExcerpted ? ' · 含输出摘录' : ''}</div>` : ''}${repair.errorCode ? `<div class="work-card-notice">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : ''}</div><div class="work-card-actions">${actions}</div></div>`;
+    return `<div class="engineering-job"><div class="engineering-profile-main"><strong>${escapeHtml(engineeringRepairSourceText(repair.source))} · 隔离修复建议</strong><div class="work-card-meta"><code>${escapeHtml(repair.repairRef)}</code> · <span class="badge ${escapeHtml(repair.status || '')}">${escapeHtml(engineeringRepairStatusText(repair.status))}</span>${validationLabel} · ${escapeHtml(repair.createdAt || '')}</div>${repair.modelSource ? `<div class="work-card-meta">固定模型 · ${escapeHtml(modelSourceLabel(repair.modelSource))}</div>` : ''}${repair.diagnosticCount ? `<div class="work-card-meta">来源诊断 ${repair.diagnosticCount} 条${repair.outputExcerpted ? ' · 含输出摘录' : ''}</div>` : ''}${repair.errorCode ? `<div class="work-card-notice">${escapeHtml(repair.errorCode)}：${escapeHtml(repair.statusMessage || '')}</div>` : ''}</div><div class="work-card-actions">${actions}</div></div>`;
   }).join('') : '<div class="work-empty">暂无隔离修复建议</div>');
   el.querySelectorAll('[data-repair-view]').forEach((button) => button.addEventListener('click', () => showEngineeringRepair(token, button.dataset.repairView)));
   el.querySelectorAll('[data-repair-cancel]').forEach((button) => button.addEventListener('click', async () => { const result = await window.codex.cancelEngineeringRepair({ projectBindingId: token, repairRef: button.dataset.repairCancel }); if (!result?.ok) toast(result?.error || '取消修复失败'); await loadEngineeringRepairs(token); }));
@@ -2759,37 +2921,149 @@ function handleWorktreeEvent(ev) {
   if (activeSession()?.projectId === projectId) renderMessages();
 }
 
+function handleCompactEvent(ev) {
+  const requestId = String(ev.clientRequestId || '');
+  const request = pendingCompactRequests.get(requestId);
+  const ledger = request?.ledger || completedChatRuns.get(requestId);
+  if (!ledger || ledger.kind !== 'session_compact') return true;
+  const outcome = window.E4ChatState.applyRunEvent(ledger, ev);
+  if (outcome.ignore) return true;
+  const session = sessions.find((item) => item.id === ledger.sessionId);
+  if (ev.type === 'compact-start') {
+    request.accepted = true; request.runId = String(ev.runId);
+    activeForegroundTask = { ...ev.task, kind: 'session_compact', sessionId: ledger.sessionId,
+      runId: ledger.runId, clientRequestId: requestId, stopping: false };
+    setSending(true); return true;
+  }
+  if (ev.type === 'usage') {
+    if (session) { applyUsageToSession(session, ev); saveState(); if (session.id === activeSessionId) { renderUsageBar(); renderContextMeter(); } }
+    return true;
+  }
+  if (!outcome.terminal || !request) return true;
+  const response = ['compact-done', 'compact-result'].includes(ev.type)
+    ? { ok: true, ...(ev.result && typeof ev.result === 'object' ? ev.result : ev) }
+    : { ok: false, error: ev.error || (ev.type === 'compact-cancelled' ? '压缩已取消' : '压缩失败') };
+  setTimeout(() => {
+    if (pendingCompactRequests.get(requestId) !== request) return;
+    pendingCompactRequests.delete(requestId); rememberCompletedRun(ledger);
+    if (activeForegroundTask?.clientRequestId === requestId) { activeForegroundTask = null; setSending(false); }
+    request.resolve({ response, originProjectRef: request.originProjectRef });
+  }, 0);
+  return true;
+}
+
+function rememberCompletedRun(ledger) {
+  completedChatRuns.set(ledger.clientRequestId, ledger);
+  while (completedChatRuns.size > 32) completedChatRuns.delete(completedChatRuns.keys().next().value);
+}
+
+function appendAcceptedUserMessage(entry) {
+  if (!entry.accepted || entry.userInserted || !entry.userMessage) return;
+  entry.session.messages.push(window.codex.messageSchema.projectToStorageJson(entry.userMessage));
+  entry.userInserted = true; entry.session.updatedAt = Date.now();
+  saveState(); if (activeSessionId === entry.session.id) renderMessages();
+}
+
+function scheduleChatRunFinalization(run, options = {}) {
+  if (!run || run.finalized || run.finalizeQueued || chatRun !== run) return;
+  run.finalizeQueued = true;
+  setTimeout(() => {
+    if (chatRun !== run || run.finalized) return;
+    run.ledger.terminal = true;
+    const final = run.terminalOptions || options;
+    const content = final.content ?? run.contentFinal ?? run.textBuffer ?? '';
+    rememberCompletedRun(run.ledger);
+    pendingChatRequests.delete(run.clientRequestId);
+    if (activeForegroundTask?.clientRequestId === run.clientRequestId) activeForegroundTask = null;
+    setSending(false);
+    finalizeChatRun({ ...final, content });
+    updateHeader(); renderOutboxRecovery();
+  }, 0);
+}
+
 function handleChatEvent(ev) {
   if (!ev) return;
-  // Terminal panel events (agent + manual) always go to the shared panel.
-  // Manual approvals may also land here without an active chatRun.
+  if (ev.task?.kind === 'session_compact' || /^compact-/.test(String(ev.type || ''))) { handleCompactEvent(ev); return; }
+  if (ev.type === 'context-compacted') return;
   if (handleTerminalPanelEvent(ev)) return;
-
-  if (ev.type === 'worktree-ready' || ev.type === 'worktree-state' || ev.type === 'worktree-recovered') {
-    handleWorktreeEvent(ev);
-    return;
-  }
-
+  if (ev.type === 'worktree-ready' || ev.type === 'worktree-state' || ev.type === 'worktree-recovered') { handleWorktreeEvent(ev); return; }
   if (['plan-approved', 'plan-rejected', 'plan-superseded', 'plan-approval-failed', 'plan-approving'].includes(ev.type)) {
     const status = ev.type === 'plan-approval-failed'
       ? (ev.isRetryable === true ? 'proposed' : 'expired')
       : ({ 'plan-approved': 'approved', 'plan-rejected': 'rejected', 'plan-superseded': 'superseded', 'plan-approving': 'executing' })[ev.type];
-    setPersistedPlanStatus(ev.sessionId, ev.planId, status); saveState(); renderMessages();
+    setPersistedPlanStatus(ev.sessionId, ev.planId, status); saveState();
+    if (ev.sessionId === activeSessionId) renderMessages();
   }
-  if (!chatRun || chatRun.finalized) return;
-  // Route by active run once runId is known; accept first event to bind runId
-  if (chatRun.runId && ev.runId && chatRun.runId !== ev.runId) return;
-  if (chatRun.sessionId !== activeSessionId && chatRun.sessionId !== activeSession()?.id) {
-    // still process if run belongs to its session; allow background finalize
-  }
-
-  const type = ev.type;
-  if (type === 'run-start') {
-    if (ev.runId) {
-      chatRun.runId = ev.runId;
-      chatRun.el.dataset.runId = ev.runId;
+  if (ev.type === 'run-start') {
+    const entry = pendingChatRequests.get(String(ev.clientRequestId || ''));
+    if (!entry || entry.accepted || String(ev.sessionId || '') !== entry.outbox.sessionId
+      || (entry.runId && String(ev.runId || '') !== entry.runId)) return;
+    const outcome = window.E4ChatState.applyRunEvent(entry.ledger, ev);
+    if (!outcome.accepted || outcome.ignore) return;
+    const session = sessions.find((item) => item.id === entry.outbox.sessionId);
+    if (!session) return;
+    entry.accepted = true; entry.runId = String(ev.runId);
+    const run = createAssistantRunPlaceholder(session.id, ev.modelSource); entry.run = run;
+    run.runId = entry.runId; run.clientRequestId = entry.outbox.clientRequestId;
+    run.ledger = entry.ledger; run.accepted = true;
+    run.modelSource = window.E4ChatState.normalizeModelSource(ev.modelSource || entry.ack?.modelSource);
+    run.el.dataset.runId = run.runId;
+    activeForegroundTask = { ...ev.task, sessionId: session.id, runId: run.runId,
+      clientRequestId: run.clientRequestId, kind: ev.task?.kind || 'chat_agent', stopping: false };
+    if (ev.userMessage && !entry.consumeDraft) entry.userMessage = ev.userMessage;
+    appendAcceptedUserMessage(entry);
+    if (!entry.consumeDraft) { session.agentMode = 'agent'; updateAgentModeToggle(); }
+    if (entry.consumeDraft) {
+      const input = document.getElementById('chat-input');
+      const currentDraft = chatState.draftsBySession?.[session.id];
+      const editorUnchanged = activeSessionId !== session.id || (input?.value === entry.editorText
+        && JSON.stringify(currentAttachmentRefs(session)) === JSON.stringify(entry.attachmentRefs));
+      const cleared = editorUnchanged && currentDraft?.revision === entry.outbox.draftRevision
+        ? window.E4ChatState.finishOutbox(chatState, entry.outbox, { accepted: true }) : false;
+      chatOutboxStore.accept(entry.outbox.clientRequestId);
+      if (cleared) {
+        pendingAttachmentsBySession.delete(session.id);
+        if (activeSessionId === session.id) { input.value = ''; pendingAttaches = []; renderAttachPreview(); }
+      }
     }
-    setRunStatus('生成中…');
+    sessions = [session, ...sessions.filter((item) => item.id !== session.id)];
+    saveState(); renderOutboxRecovery(); setSending(true);
+    if (activeSessionId === session.id) { renderMessages(); setRunStatus('生成中…'); }
+    renderLeftDynamic();
+    if (entry.invokeResult) { run.invokeDone = true; waitForChatRunEvents(run).then(() => scheduleChatRunFinalization(run, entry.invokeResult)); }
+    return;
+  }
+  if (ev.type === 'usage') {
+    const ledger = completedChatRuns.get(String(ev.clientRequestId || ''));
+    if (ledger) {
+      if (!window.E4ChatState.applyRunEvent(ledger, ev).ignore) {
+        const session = sessions.find((item) => item.id === ledger.sessionId);
+        if (session) { applyUsageToSession(session, ev); saveState(); if (session.id === activeSessionId) { renderUsageBar(); renderContextMeter(); } }
+      }
+      return;
+    }
+  }
+  if (!chatRun || chatRun.finalized || !chatRun.accepted) return;
+  if (String(ev.sessionId || '') !== chatRun.sessionId || String(ev.runId || '') !== chatRun.runId
+    || String(ev.clientRequestId || '') !== chatRun.clientRequestId) return;
+  const outcome = window.E4ChatState.applyRunEvent(chatRun.ledger, ev);
+  if (outcome.ignore || (['done', 'error', 'aborted', 'cancelled'].includes(ev.type) && !outcome.terminal)) return;
+  const type = ev.type;
+  if (type === 'session-compacted') {
+    if (!Array.isArray(ev.messages)) return;
+    const entry = pendingChatRequests.get(chatRun.clientRequestId);
+    const session = sessions.find((item) => item.id === chatRun.sessionId);
+    if (!entry || !session) return;
+    const compacted = ev.messages.map((message) => window.codex.messageSchema.projectToStorageJson(message));
+    session.messages = [...compacted, ...(entry.userInserted ? [window.codex.messageSchema.projectToStorageJson(entry.userMessage)] : [])];
+    if (window.MemoryCandidateState && Array.isArray(ev.candidates)) {
+      const originProjectRef = currentProjectRef(session);
+      session.pendingMemoryCandidates = window.MemoryCandidateState.mergePendingCandidates(ensureSessionCandidateState(session), ev.candidates,
+        { max: window.MemoryCandidateState.PENDING_MAX, defaultScope: originProjectRef ? 'project' : 'user', projectRef: originProjectRef }).items;
+      updateMemoryCandidateCount();
+    }
+    session.updatedAt = Date.now(); saveState(); if (session.id === activeSessionId) renderMessages();
+    if (ev.warning) toast(ev.warning);
     return;
   }
   if (type === 'text-delta') {
@@ -2934,30 +3208,26 @@ function handleChatEvent(ev) {
         chatRun.streamEl.innerHTML = renderMarkdownLite(chatRun.contentFinal);
       }
     }
-    setRunStatus('');
-    // Finalize when invoke also settled (or if invoke already done)
-    if (chatRun.invokeDone) {
-      finalizeChatRun({ content: chatRun.contentFinal, applied: chatRun.applied });
-      setSending(false);
-    }
+    chatRun.terminalOptions = { content: chatRun.contentFinal, applied: chatRun.applied };
+    scheduleChatRunFinalization(chatRun);
     return;
   }
-  if (type === 'aborted') {
+  if (type === 'aborted' || type === 'cancelled') {
     chatRun.aborted = true;
     chatRun.doneEvent = true;
+    if (typeof ev.partialOutput === 'string' && ev.partialOutput) chatRun.contentFinal = ev.partialOutput;
     disableApprovalCards(chatRun.el);
     setRunStatus('已停止', 'aborted');
     if (chatRun.streamEl) chatRun.streamEl.classList.remove('is-streaming');
-    if (chatRun.invokeDone) {
-      finalizeChatRun({ aborted: true, content: chatRun.contentFinal || chatRun.textBuffer });
-      setSending(false);
-    }
+    chatRun.terminalOptions = { aborted: true, content: chatRun.contentFinal || chatRun.textBuffer };
+    scheduleChatRunFinalization(chatRun);
     return;
   }
   if (type === 'error') {
     chatRun.error = true;
     chatRun.doneEvent = true;
-    const msg = ev.message || '未知错误';
+    if (typeof ev.partialOutput === 'string' && ev.partialOutput) chatRun.contentFinal = ev.partialOutput;
+    const msg = ev.error || ev.message || '未知错误';
     disableApprovalCards(chatRun.el);
     setRunStatus(msg, 'error');
     if (chatRun.streamEl) chatRun.streamEl.classList.remove('is-streaming');
@@ -2968,10 +3238,8 @@ function handleChatEvent(ev) {
         chatRun.streamEl.innerHTML = renderMarkdownLite(chatRun.contentFinal);
       }
     }
-    if (chatRun.invokeDone) {
-      finalizeChatRun({ error: true, errorMessage: msg, content: chatRun.contentFinal || chatRun.textBuffer });
-      setSending(false);
-    }
+    chatRun.terminalOptions = { error: true, errorMessage: msg, content: chatRun.contentFinal || chatRun.textBuffer };
+    scheduleChatRunFinalization(chatRun);
     return;
   }
 }
@@ -3051,23 +3319,33 @@ function renderLeftDynamic() {
   const nt = document.getElementById('btn-left-new-task');
   if (nt) nt.addEventListener('click', (e) => { e.stopPropagation(); openTaskModal(); });
 }
+function sessionHasForegroundWork(id) {
+  if (chatRun && !chatRun.finalized && chatRun.sessionId === id) return true;
+  if (activeForegroundTask?.sessionId === id) return true;
+  for (const entry of pendingChatRequests.values()) if (entry.outbox?.sessionId === id) return true;
+  for (const entry of pendingCompactRequests.values()) if ((entry.session?.id || entry.ledger?.sessionId) === id) return true;
+  return false;
+}
 async function deleteSession(id) {
   if (sessions.length <= 1) return toast('至少保留一个会话');
   const s = sessions.find((x) => x.id === id); if (!s) return;
-  if (chatRun && !chatRun.finalized && chatRun.sessionId === id) {
-    return toast('生成中无法删除该会话，请先停止');
-  }
+  if (sessionHasForegroundWork(id)) return toast('任务执行或等待接受中，无法删除该会话，请先停止并等待清理');
   if (!(await appConfirm('确定删除「' + s.title + '」？'))) return;
+  if (sessionHasForegroundWork(id)) return toast('任务执行或等待接受中，无法删除该会话，请先停止并等待清理');
+  const wasActive = activeSessionId === id;
   sessions = sessions.filter((x) => x.id !== id);
-  if (activeSessionId === id) activeSessionId = sessions[0].id;
+  delete chatState.draftsBySession[id]; pendingAttachmentsBySession.delete(id);
+  if (wasActive) activeSessionId = sessions[0].id;
+  chatState.sessions = sessions; chatState.activeSessionId = activeSessionId;
+  if (wasActive) restoreSessionDraft(activeSession());
   saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); toast('已删除');
 }
 async function deleteProject(id) {
   const p = getProject(id); if (!p) return;
-  const running = chatRun && !chatRun.finalized
-    && sessions.some((session) => session.id === chatRun.sessionId && session.projectId === id);
-  if (running) return toast('生成中无法删除该项目，请先停止');
+  const hasWork = () => sessions.some((session) => session.projectId === id && sessionHasForegroundWork(session.id));
+  if (hasWork()) return toast('任务执行或等待接受中，无法删除该项目，请先停止并等待清理');
   if (!(await appConfirm('删除项目「' + p.name + '」？\n（不会删除磁盘上的真实文件夹）'))) return;
+  if (hasWork()) return toast('任务执行或等待接受中，无法删除该项目，请先停止并等待清理');
   const worktreeBindingId = worktreeBindings.get(id);
   ciWatchUi?.forgetProject(id);
   prReviewUi?.forgetProject(id);
@@ -3079,10 +3357,17 @@ async function deleteProject(id) {
     window.codex.unbindWorktreeProject({ projectBindingId: worktreeBindingId }).catch(() => {});
     worktreeBindings.delete(id);
   }
+  const removedSessionIds = sessions.filter((session) => session.projectId === id).map((session) => session.id);
+  const wasActive = removedSessionIds.includes(activeSessionId);
+  for (const sessionId of removedSessionIds) {
+    delete chatState.draftsBySession[sessionId]; pendingAttachmentsBySession.delete(sessionId);
+  }
   projects = projects.filter((x) => x.id !== id);
   sessions = sessions.filter((s) => s.projectId !== id);
   if (!sessions.length) sessions = defaultSessions();
   if (!sessions.some((s) => s.id === activeSessionId)) activeSessionId = sessions[0].id;
+  chatState.sessions = sessions; chatState.activeSessionId = activeSessionId;
+  if (wasActive) restoreSessionDraft(activeSession());
   saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); toast('项目已删除（磁盘文件未动）');
 }
 async function renameProject(id) {
@@ -3400,25 +3685,25 @@ async function editEngineeringWorkflow(token, current, options = {}) {
 }
 function openProjectChat(projectId) {
   const p = getProject(projectId); if (!p) return;
+  if (!persistBeforeSessionChange()) return;
   let session = sessions.find((s) => s.kind === 'project' && s.projectId === projectId);
   if (!session) {
     const tip = p.path
       ? ('已连接真实目录：\n`' + p.path + '`\n\n你可以像 Codex 一样让我改代码，例如：\n- 列出文件\n- 读取 package.json\n- 新建 README.md 并写介绍')
       : ('项目「' + p.name + '」尚未绑定真实目录。\n\n请右键 → **绑定真实目录**。');
     session = {
-      id: uid('ps'), title: p.name, kind: 'project', peer: 'codex', projectId: p.id, pinned: false,
+      id: uid('ps'), title: p.name, kind: 'project', peer: 'codex', identityType: 'ai', assistantId: 'assistant_codex', modelProfileId: null, projectId: p.id, pinned: false,
       agentMode: defaultAgentModeSeed,
-      messages: [{ role: 'assistant', content: tip }], updatedAt: Date.now(),
+      messages: [{ role: 'assistant', content: tip, modelSource: { kind: 'legacy-demo' } }], updatedAt: Date.now(),
     };
     sessions.unshift(session);
   }
-  activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle();
+  activeSessionId = session.id; ensureDraftSlot(session); restoreSessionDraft(session); saveState(); setView('chat'); updateAgentModeToggle();
   reconcileWorktreeResults(p);
 }
 function renderFriends() {
   const ul = document.getElementById('friend-list');
-  const online = FRIENDS.filter((f) => f.status === '在线').length;
-  document.getElementById('friend-list-head').textContent = '我的好友 (' + online + '/' + FRIENDS.length + ')';
+  document.getElementById('friend-list-label').textContent = 'AI 与示例联系人 (' + FRIENDS.length + ')';
   ul.innerHTML = FRIENDS.map((f) => '<li data-friend="'+f.id+'" class="'+(f.id===activeSession()?.peer?'active-friend':'')+'"><span class="avatar-sm">'+f.avatar+'</span><span><div>'+escapeHtml(f.name)+'</div><div class="contact-status '+(f.status==='在线'?'online':'')+'">'+escapeHtml(f.status)+'</div></span></li>').join('');
   ul.querySelectorAll('[data-friend]').forEach((el) => el.addEventListener('click', () => openFriendChat(el.getAttribute('data-friend'))));
 }
@@ -3426,10 +3711,48 @@ function updateHeader() {
   const s = activeSession(); const title = s?.title || 'Codex'; const proj = sessionProject(s);
   document.getElementById('session-title').textContent = title;
   document.getElementById('session-heading').textContent = title;
-  let sub = '与 ' + peerName(s?.peer || 'codex') + ' 对话';
+  const assistant = getAssistantForSession(s);
+  let sub = s?.identityType === 'demo-contact'
+    ? `旧演示联系人 · ${s.legacyPeer || 'legacy'} · 只读，不是真实通信`
+    : `AI 助手不是在线真人 · ${assistant?.name || 'AI 助手'}`;
   if (proj) sub += proj.path ? (' · 📁 ' + proj.path) : ' · 未绑定目录';
   document.getElementById('session-sub').textContent = sub;
   document.title = 'Codex 2007 - ' + title;
+
+  const registry = modelManager?.getState?.().registry || {};
+  const assistantSelect = document.getElementById('chat-assistant-select');
+  if (assistantSelect) {
+    const choices = (registry.assistants || []).filter((item) => item.identityType === 'ai');
+    assistantSelect.innerHTML = choices.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+    assistantSelect.value = s?.assistantId || '';
+    assistantSelect.disabled = s?.identityType === 'demo-contact' || choices.length === 0;
+  }
+  const modelSelect = document.getElementById('chat-model-select');
+  if (modelSelect) {
+    const providers = registry.providers || [];
+    modelSelect.innerHTML = '<option value="">跟随助手 / 全局默认</option>' + (registry.models || []).map((item) => {
+      const provider = providers.find((entry) => entry.id === item.providerId);
+      return `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${escapeHtml(provider?.name || '服务商')}</option>`;
+    }).join('');
+    modelSelect.value = s?.modelProfileId || '';
+    modelSelect.disabled = s?.identityType === 'demo-contact' || !registry.models?.length;
+  }
+  const source = document.getElementById('chat-model-source');
+  if (source) {
+    const lastSource = [...(s?.messages || [])].reverse().find((message) => message.role === 'assistant' && message.modelSource)?.modelSource;
+    const target = getEffectiveModelForSession(s);
+    const mode = modelManager?.getState?.().mode;
+    source.textContent = lastSource
+      ? '最近回复 · ' + modelSourceLabel(lastSource)
+      : target ? `下一轮 · ${mode === 'api' ? 'API' : '本地'} · ${target.name}` : (registry.models?.length ? '下一轮 · 跟随默认模型' : '未配置可用模型');
+    source.title = lastSource ? '历史来源保持为本轮固定来源' : '模型切换只影响下一轮';
+  }
+  const composer = document.getElementById('chat-input');
+  if (composer) {
+    const readOnly = s?.identityType === 'demo-contact';
+    composer.readOnly = readOnly;
+    composer.placeholder = readOnly ? '旧演示联系人为只读历史' : '输入消息，Enter 发送...';
+  }
   const bindBtn = document.getElementById('btn-bind-project');
   if (bindBtn) { bindBtn.classList.toggle('hidden', !(s?.kind === 'project')); bindBtn.textContent = proj?.path ? '换目录' : '绑定目录'; }
   updateMemoryCandidateCount();
@@ -3562,30 +3885,52 @@ function showChatView() {
 }
 function switchSession(id) {
   if (!sessions.some((s) => s.id === id)) return;
-  activeSessionId = id; saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
+  persistActiveDraft();
+  activeSessionId = id;
+  restoreSessionDraft(activeSession());
+  saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
   const project = sessionProject();
   if (project?.path) reconcileWorktreeResults(project);
 }
 function openFriendChat(friendId) {
   const friend = FRIENDS.find((f) => f.id === friendId); if (!friend) return;
-  let session = sessions.find((s) => s.kind === 'friend' && s.peer === friendId);
+  if (!persistBeforeSessionChange()) return;
+  let session = sessions.find((s) => s.kind === 'friend' && (s.peer === friendId || s.legacyPeer === friendId || (friendId === 'codex' && s.assistantId === 'assistant_codex')));
   if (!session) {
+    const isCodex = friendId === 'codex';
     session = {
-      id: uid('friend'), title: friend.name, kind: 'friend', peer: friendId, projectId: null, pinned: false,
-      agentMode: defaultAgentModeSeed,
-      messages: [{ role: 'assistant', content: friend.kind === 'bot' ? '在呢。直接说需求，或先绑定真实项目再让我改代码。' : ('（模拟）' + friend.name + '：你好。') }], updatedAt: Date.now(),
+      id: uid(isCodex ? 'assistant' : 'demo'), title: friend.name, kind: isCodex ? 'assistant' : 'friend',
+      peer: isCodex ? 'codex' : 'demo-contact', identityType: isCodex ? 'ai' : 'demo-contact',
+      assistantId: isCodex ? 'assistant_codex' : null, legacyPeer: isCodex ? null : friendId,
+      modelProfileId: null, projectId: null, pinned: false, agentMode: defaultAgentModeSeed,
+      messages: isCodex ? [] : [{ role: 'assistant', content: `旧演示联系人「${friend.name}」仅保留历史，不提供真实通信。`, modelSource: { kind: 'legacy-demo' } }], updatedAt: Date.now(),
     };
     sessions.unshift(session);
+  } else if (session.identityType !== 'demo-contact') {
+    session.identityType = 'ai'; session.assistantId ||= 'assistant_codex';
   }
-  activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle(); toast('已打开与 ' + friend.name + ' 的会话');
+  activeSessionId = session.id; ensureDraftSlot(session); restoreSessionDraft(session);
+  saveState(); setView('chat'); updateAgentModeToggle(); toast('已打开 ' + friend.name + ' 的会话');
+}
+function createAiSession(assistantId = 'assistant_general', title = '新建 AI 会话') {
+  if (!persistBeforeSessionChange()) return;
+  const session = {
+    id: uid('assistant'), title, kind: 'assistant', peer: 'codex', identityType: 'ai', assistantId,
+    modelProfileId: null, projectId: null, pinned: false, agentMode: defaultAgentModeSeed,
+    messages: [], updatedAt: Date.now(),
+  };
+  sessions.unshift(session); activeSessionId = session.id; ensureDraftSlot(session); restoreSessionDraft(session);
+  saveState(); setView('chat'); updateAgentModeToggle();
+  return session;
 }
 function ensureTaskAndAsk(title, firstUserMessage) {
+  if (!persistBeforeSessionChange()) return;
   const session = {
-    id: uid('task'), title, kind: 'task', peer: 'codex', projectId: null, pinned: false,
+    id: uid('task'), title, kind: 'task', peer: 'codex', identityType: 'ai', assistantId: 'assistant_general', modelProfileId: null, projectId: null, pinned: false,
     agentMode: defaultAgentModeSeed, messages: [], updatedAt: Date.now(),
   };
-  sessions.unshift(session); activeSessionId = session.id; saveState(); setView('chat'); updateAgentModeToggle();
-  document.getElementById('chat-input').value = firstUserMessage; sendMessage();
+  sessions.unshift(session); activeSessionId = session.id; ensureDraftSlot(session); restoreSessionDraft(session); saveState(); setView('chat'); updateAgentModeToggle();
+  document.getElementById('chat-input').value = firstUserMessage; persistActiveDraft(); sendMessage();
 }
 function openTaskModal() {
   document.getElementById('task-title').value = ''; document.getElementById('task-brief').value = '';
@@ -3603,6 +3948,7 @@ function createTaskFromModal() {
   if (brief && (sending || chatRun)) {
     return toast('当前有正在执行的生成任务，请等待完成后再开始新任务');
   }
+  if (!persistBeforeSessionChange()) return;
 
   taskModalSubmitting = true;
   const okBtn = document.getElementById('btn-task-ok');
@@ -3610,11 +3956,11 @@ function createTaskFromModal() {
 
   try {
     const session = {
-      id: uid('task'), title, kind: 'task', peer: 'codex', projectId: sessionProject()?.id || null, pinned: false,
+      id: uid('task'), title, kind: 'task', peer: 'codex', identityType: 'ai', assistantId: 'assistant_general', modelProfileId: null, projectId: sessionProject()?.id || null, pinned: false,
       agentMode: defaultAgentModeSeed,
-      messages: [{ role: 'assistant', content: '新任务「' + title + '」已创建。' + (brief ? ('\n\n说明：' + brief + '\n\n') : '\n\n') + '继续补充细节即可。' }], updatedAt: Date.now(),
+      messages: [], updatedAt: Date.now(),
     };
-    sessions.unshift(session); activeSessionId = session.id; saveState(); closeTaskModal(); setView('chat'); updateAgentModeToggle();
+    sessions.unshift(session); activeSessionId = session.id; ensureDraftSlot(session); restoreSessionDraft(session); saveState(); closeTaskModal(); setView('chat'); updateAgentModeToggle();
     if (brief) {
       document.getElementById('chat-input').value = brief;
       toast('任务已创建并开始执行');
@@ -4616,17 +4962,57 @@ function cloneForIpc(value) {
  */
 async function requestCompact(session, force) {
   const originProjectRef = currentProjectRef(session);
-  const res = await window.codex.compactSession({
-    force: !!force,
-    sessionId: String(session?.id || ''),
-    messages: cloneForIpc(session?.messages || []),
-    candidateLimit: window.MemoryCandidateState.candidateLimit(
-      ensureSessionCandidateState(session),
-      { perBatch: window.MemoryCandidateState.PER_BATCH_MAX, max: window.MemoryCandidateState.PENDING_MAX }
-    ),
-  });
-  if (res.usage) applyUsageToSession(session, res.usage);
-  return { response: res, originProjectRef };
+  if (sending || chatRun) return { response: { ok: false, code: 'BUSY', error: '已有前台任务；草稿未消费' }, originProjectRef };
+  if (!session || session.identityType === 'demo-contact') return { response: { ok: false, code: 'READ_ONLY', error: '旧演示联系人不能压缩' }, originProjectRef };
+  if (session.id === activeSessionId) persistActiveDraft();
+  const modelState = modelManager?.getState?.() || {};
+  const sessionProjectRecord = sessionProject(session);
+  const clientRequestId = `compact_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  const ledger = window.E4ChatState.createRunLedger({ sessionId: session.id, clientRequestId, kind: 'session_compact' });
+  const payload = {
+    force: !!force, sessionId: String(session.id), assistantId: session.assistantId || 'assistant_general', modelProfileId: session.modelProfileId || null,
+    clientRequestId, expectedRegistryRevision: Number.isSafeInteger(modelState.revision) ? modelState.revision : 0,
+    projectBindingId: sessionProjectRecord?.path ? (worktreeBindings.get(sessionProjectRecord.id) || '') : '',
+    project: sessionProjectRecord?.path ? { name: sessionProjectRecord.name, path: sessionProjectRecord.path } : null,
+    messages: cloneForIpc(session.messages || []),
+    candidateLimit: window.MemoryCandidateState.candidateLimit(ensureSessionCandidateState(session), { perBatch: window.MemoryCandidateState.PER_BATCH_MAX, max: window.MemoryCandidateState.PENDING_MAX }),
+  };
+  let resolveResult;
+  const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+  const entry = { session, originProjectRef, clientRequestId, ledger, resolve: resolveResult };
+  pendingCompactRequests.set(clientRequestId, entry);
+  activeForegroundTask = { kind: 'session_compact', sessionId: session.id, clientRequestId, ledger };
+  setSending(true);
+  try {
+    if (sessionProjectRecord?.path && !payload.projectBindingId) payload.projectBindingId = await bindWorktreeProject(sessionProjectRecord);
+    await syncModelSessionReferences();
+    const ack = await window.codex.compactSession(payload);
+    if (ack?.accepted !== true) {
+      if (ledger.accepted) return resultPromise;
+      pendingCompactRequests.delete(clientRequestId);
+      if (activeForegroundTask?.clientRequestId === clientRequestId) activeForegroundTask = null;
+      setSending(false);
+      return { response: ack || { ok: false, error: '压缩未被接受' }, originProjectRef };
+    }
+    if (ack.sessionId !== session.id || ack.clientRequestId !== clientRequestId || !ack.runId || (ledger.runId && ledger.runId !== ack.runId)) {
+      if (ledger.accepted) return resultPromise;
+      throw new Error('压缩接受结果归属不匹配');
+    }
+    entry.ack = ack;
+    // An authoritative accepted reply may arrive after or in place of compact-start; unlike chat it consumes no draft or bubble.
+    if (!ledger.accepted) handleCompactEvent({ ...ack, type: 'compact-start', task: { ...(ack.task || {}), kind: 'session_compact' } });
+    if (!ledger.terminal && (ack.ok === false || ack.aborted === true || ack.error != null || Array.isArray(ack.messages) || typeof ack.needed === 'boolean')) {
+      handleCompactEvent({ ...ack, type: ack.aborted ? 'compact-cancelled' : (ack.ok === false || ack.error != null ? 'compact-error' : 'compact-done'),
+        task: { ...(ack.task || {}), kind: 'session_compact' } });
+    }
+    return resultPromise;
+  } catch (error) {
+    if (ledger.accepted) { toast(error.message || '压缩响应异常，任务仍保留，可定向停止'); return resultPromise; }
+    pendingCompactRequests.delete(clientRequestId);
+    if (activeForegroundTask?.clientRequestId === clientRequestId) activeForegroundTask = null;
+    setSending(false);
+    return { response: { ok: false, error: error?.message || String(error) }, originProjectRef };
+  }
 }
 
 function applyCompactResult(session, response, originProjectRef) {
@@ -5353,10 +5739,6 @@ async function openSettings() {
   const settings = await window.codex.getSettings();
   mcpSavedFingerprint = mcpConfigFingerprint(settings.mcpServers);
   document.getElementById('set-mode').value = settings.mode || 'local';
-  document.getElementById('set-base-url').value = settings.baseUrl || '';
-  document.getElementById('set-model').value = settings.model || '';
-  document.getElementById('set-api-key').value = '';
-  document.getElementById('set-api-hint').textContent = settings.apiKeySet ? '已配置 API Key（留空保存则保留原 Key）' : '尚未配置 API Key';
   const pm = document.getElementById('set-permission-mode');
   if (pm) pm.value = settings.permissionMode || 'confirm-writes';
   const ep = document.getElementById('set-execution-policy');
@@ -5630,8 +6012,6 @@ async function saveSettingsFromForm() {
   const maxAgentTurns = turnsRaw === '' ? 8 : (Number.isFinite(Number(turnsRaw)) && Number(turnsRaw) >= 0 ? Number(turnsRaw) : 8);
   const partial = {
     mode: document.getElementById('set-mode').value,
-    baseUrl: document.getElementById('set-base-url').value.trim(),
-    model: document.getElementById('set-model').value.trim(),
     permissionMode: document.getElementById('set-permission-mode')?.value || 'confirm-writes',
     agentEnabled: document.getElementById('set-agent-enabled')?.checked !== false,
     maxAgentTurns,
@@ -5678,7 +6058,6 @@ async function saveSettingsFromForm() {
   const targetExecutionPolicy = document.getElementById('set-execution-policy')?.value || 'strict-isolated';
   const doSave = async () => {
     partial.executionPolicy = targetExecutionPolicy;
-    const key = document.getElementById('set-api-key').value; if (key) partial.apiKey = key;
     const saved = await window.codex.saveSettings(partial);
     if (saved?.ok === false) {
       if (saved.code === 'MCP_TASKS_CONFIG_LOCKED') {
@@ -5711,161 +6090,157 @@ async function saveSettingsFromForm() {
   }
 }
 async function sendMessage() {
-  if (sending) return;
+  if (sending) return toast('已有前台任务运行；草稿未发送，也不会停止原任务');
   const input = document.getElementById('chat-input');
-  const raw = input.value || ''; const text = buildOutgoingText(raw); if (!text.trim()) return;
-  if (handleSlashCommand(raw.trim())) { input.value = ''; pendingAttaches = []; renderAttachPreview(); return; }
-  const session = activeSession(); const proj = sessionProject(session);
-  if (session.kind === 'project' && !proj?.path) {
-    session.messages.push({ role: 'user', content: text });
-    session.messages.push({ role: 'assistant', content: '此项目还没有绑定真实目录。\n\n请点标题旁 **绑定目录**，或右键项目 → 绑定真实目录。', error: true });
-    input.value = ''; pendingAttaches = []; renderAttachPreview(); saveState(); renderMessages(); return;
-  }
-  // Resolve the sender-owned binding before a project chat can invoke the
-  // engineering tools. This also covers the short window after app startup,
-  // before background worktree reconciliation has finished.
-  const projectBindingId = proj?.path ? await bindWorktreeProject(proj) : '';
-  if (proj?.path && !projectBindingId) {
-    return toast('项目绑定已失效，请重新绑定目录');
-  }
-  const userParts = [{ type: 'text', text }];
-  if (Array.isArray(pendingAttaches) && pendingAttaches.length) {
-    for (const a of pendingAttaches) {
-      userParts.push({
-        type: 'attachment_ref',
-        name: a.name || 'attachment',
-        size: a.size || 0,
-        mime: a.type || 'application/octet-stream',
-        attachmentId: a.id || a.name,
-      });
-    }
-  }
-  session.messages.push({
-    role: 'user',
-    content: text,
-    schemaVersion: 2,
-    parts: userParts,
-    createdAt: Date.now(),
-  });
-  session.updatedAt = Date.now();
-  sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
-  input.value = ''; pendingAttaches = []; renderAttachPreview(); hideAtComplete(); setSending(true); saveState();
-  if (session.peer && session.peer !== 'codex') {
-    renderMessages(); renderLeftDynamic();
-    const token = { aborted: false };
-    localSendToken = token;
-    setTimeout(() => {
-      if (localSendToken === token) localSendToken = null;
-      if (token.aborted) {
-        session.messages.push({ role: 'assistant', content: '⏹ 已停止生成。已完成的文件改动会保留，可继续发送新消息。' });
-      } else {
-        session.messages.push({ role: 'assistant', content: '（模拟 ' + peerName(session.peer) + '）收到：' + (raw.trim().slice(0, 80) || '[附件]') + '。技术问题可以丢给 Codex 小蓝。' });
-      }
-      session.updatedAt = Date.now(); setSending(false); saveState(); renderMessages(); input.focus();
-    }, 450); return;
-  }
-
-  // Phase D.1: optional compact before the model call. Runs while activeRun is
-  // still null so the main-side gate lets it through; failures never block send.
-  await maybeAutoCompact(session);
-
-  // Live assistant placeholder driven by onChatEvent
-  const sendingRun = createAssistantRunPlaceholder(session.id);
-  renderMessages();
-  renderLeftDynamic();
-
-  let invokeResult = null;
-  let invokeError = null;
+  const raw = input.value || '';
+  const text = buildOutgoingText(raw);
+  if (!text.trim()) return;
+  if (handleSlashCommand(raw.trim())) return;
+  const session = activeSession();
+  if (session?.identityType === 'demo-contact') return toast('此历史演示联系人为只读，不能发送消息');
+  if (!session?.assistantId) return toast('此会话未绑定AI助手');
+  const proj = sessionProject(session);
+  if (session.kind === 'project' && !proj?.path) return toast('此项目还没有绑定真实目录，请先绑定目录');
+  if (!window.codex?.sendChat || !modelManager) return toast('AI服务尚未就绪');
+  if (pendingAttaches.some((item) => item.unavailableAfterRestart)) return toast('历史附件内容不可用，请重新选择附件；草稿未发送');
+  const draftResult = persistActiveDraft();
+  if (!draftResult.ok) return toast(draftResult.error || '草稿暂不可发送');
+  const sessionId = String(session.id);
+  const attachmentRefs = currentAttachmentRefs(session);
+  const userMessage = { role: 'user', content: text, schemaVersion: 2,
+    parts: [{ type: 'text', text }, ...attachmentRefs.map((ref) => ({ type: 'attachment_ref', ...ref }))], createdAt: Date.now() };
+  let outbox;
   try {
-    const payload = {
-      messages: session.messages.filter((m) => !m.error).map((m) => ({
-        role: m.role,
-        content: m.content,
-        schemaVersion: m.schemaVersion || 2,
-        parts: m.parts,
-      })),
-      project: proj?.path ? { name: proj.name, path: proj.path } : null,
-      projectBindingId,
-      sessionId: session.id,
-      agentMode: sessionAgentMode(session),
-    };
-    invokeResult = await window.codex.sendChat(payload);
-    if (invokeResult?.ok === false && invokeResult.error) {
-      const error = new Error(invokeResult.error);
-      error.code = invokeResult.code;
-      invokeError = error;
-      invokeResult = null;
-    }
-  } catch (err) {
-    invokeError = err;
-  } finally {
-    localSendToken = null;
-  }
+    outbox = window.E4ChatState.createOutbox({ state: chatState, sessionId,
+      assistantId: session.assistantId, modelProfileId: session.modelProfileId || null,
+      expectedRegistryRevision: modelManager.getState().revision, projectBindingId: '',
+      messages: [...session.messages.filter((message) => !message.error), userMessage], text });
+  } catch (error) { return toast(error?.message || '无法创建发送请求'); }
+  const queued = chatOutboxStore.add(outbox);
+  if (!queued.ok) return toast(queued.error);
+  const entry = { outbox, session, userMessage, attachmentRefs, editorText: raw,
+    agentMode: sessionAgentMode(session), consumeDraft: true,
+    ledger: window.E4ChatState.createRunLedger({ sessionId, clientRequestId: outbox.clientRequestId }), accepted: false, ack: null };
+  pendingChatRequests.set(outbox.clientRequestId, entry);
+  setSending(true); renderOutboxRecovery(); hideAtComplete();
+  try {
+    // The draft, history, assistant, model and mode above are immutable before any await.
+    const projectBindingId = proj?.path ? await bindWorktreeProject(proj) : '';
+    if (proj?.path && !projectBindingId) return rejectChatEntry(entry, 'PROJECT_BINDING_STALE', '项目绑定已失效，请重新绑定目录');
+    outbox = Object.freeze({ ...outbox, projectBindingId });
+    const rebound = chatOutboxStore.replace(outbox);
+    if (!rebound.ok) return rejectChatEntry(entry, rebound.code, rebound.error);
+    entry.outbox = outbox;
+    await syncModelSessionReferences();
+    const ack = await window.codex.sendChat({ assistantId: outbox.assistantId,
+      modelProfileId: outbox.modelProfileId, clientRequestId: outbox.clientRequestId,
+      expectedRegistryRevision: outbox.expectedRegistryRevision, sessionId: outbox.sessionId,
+      projectBindingId: outbox.projectBindingId, project: proj?.path ? { name: proj.name, path: proj.path } : null,
+      messages: cloneForIpc(outbox.messages), agentMode: entry.agentMode });
+    settleChatInvoke(entry, ack);
+  } catch (error) { rejectChatEntry(entry, error?.code, error?.message || String(error)); }
+}
 
-  await waitForChatRunEvents(sendingRun);
-  // Merge carefully: prefer done-event content, then invoke result
-  if (chatRun === sendingRun && !chatRun.finalized) {
-    chatRun.invokeDone = true;
-    if (invokeResult) {
-      if (chatRun.contentFinal == null && invokeResult.content != null) {
-        chatRun.contentFinal = String(invokeResult.content);
-      }
-      if (!chatRun.applied && invokeResult.applied) chatRun.applied = invokeResult.applied;
-      if (!Array.isArray(chatRun.fileChanges)) chatRun.fileChanges = [];
-      if (Array.isArray(invokeResult.fileChanges) && invokeResult.fileChanges.length) {
-        for (const fc of invokeResult.fileChanges) mergeFileChangeEntry(chatRun.fileChanges, fc);
-      }
-      if (chatRun.fileChanges.length) renderFileChangesStrip();
-      // Prefer event content already set; ensure final content exists
-      const content = chatRun.contentFinal != null ? chatRun.contentFinal : (invokeResult.content || chatRun.textBuffer || '');
-      finalizeChatRun({ content, applied: chatRun.applied || invokeResult.applied });
-    } else if (invokeError) {
-      let msg = invokeError?.message || String(invokeError);
-      msg = msg.replace(/^Error invoking remote method '[^']+':\s*/i, '').replace(/^Error:\s*/i, '');
-      const stopped = invokeError?.code === 'ABORTED'
-        || chatRun.aborted
-        || /已停止|ABORTED|The user aborted a request|AbortError/i.test(msg);
-      if (stopped) {
-        chatRun.aborted = true;
-        finalizeChatRun({
-          aborted: true,
-          content: chatRun.contentFinal || chatRun.textBuffer || '',
-        });
-      } else {
-        // Prefer event-filled content; avoid double toast/bubble noise
-        if (chatRun.doneEvent && (chatRun.contentFinal || chatRun.textBuffer)) {
-          finalizeChatRun({
-            error: chatRun.error,
-            errorMessage: msg,
-            content: chatRun.contentFinal || chatRun.textBuffer,
-          });
-        } else {
-          chatRun.error = true;
-          finalizeChatRun({ error: true, errorMessage: msg, content: chatRun.contentFinal || chatRun.textBuffer || '' });
-        }
-      }
-    } else if (chatRun.doneEvent) {
-      finalizeChatRun({ content: chatRun.contentFinal || chatRun.textBuffer || '', applied: chatRun.applied });
-    } else {
-      // Invoke returned nothing and no events — still clear UI
-      finalizeChatRun({ content: chatRun.textBuffer || '', applied: chatRun.applied });
-    }
-  }
+function rejectChatEntry(entry, code, message) {
+  if (entry.accepted) return;
+  pendingChatRequests.delete(entry.outbox.clientRequestId);
+  if (entry.consumeDraft) chatOutboxStore.fail(entry.outbox.clientRequestId, message);
+  if (activeForegroundTask?.clientRequestId === entry.outbox.clientRequestId) activeForegroundTask = null;
+  setSending(false); renderOutboxRecovery();
+  if (['CONFLICT', 'CONFIG_CONFLICT'].includes(code)) modelManager?.load?.().catch(() => {});
+  toast(message || '请求未被接受；草稿与未发送快照均保留');
+}
 
-  session.updatedAt = Date.now();
-  setSending(false);
-  saveState();
-  renderMessages();
-  input.focus();
+function settleChatInvoke(entry, ack) {
+  const result = ack?.result && typeof ack.result === 'object' ? ack.result : ack;
+  const acceptedReply = ack?.accepted === true || result?.accepted === true;
+  const compatibleFinal = result && (result.content != null || result.partialOutput != null
+    || result.aborted === true || result.error != null || (acceptedReply && result.ok === false));
+  if (!acceptedReply && (!ack?.ok || !compatibleFinal)) {
+    return rejectChatEntry(entry, ack?.code, ack?.error || '请求未被接受');
+  }
+  const runId = String(ack?.runId || result?.runId || '');
+  const sessionId = String(ack?.sessionId || result?.sessionId || '');
+  const requestId = String(ack?.clientRequestId || result?.clientRequestId || '');
+  if (!runId || sessionId !== entry.outbox.sessionId || requestId !== entry.outbox.clientRequestId
+    || (entry.ledger.runId && runId !== entry.ledger.runId) || (entry.runId && runId !== entry.runId)) {
+    if (entry.accepted) { toast('服务返回的请求标识不匹配；保留原运行'); return; }
+    return rejectChatEntry(entry, 'REQUEST_ID_MISMATCH', '服务返回的请求标识不匹配');
+  }
+  entry.ack = ack; entry.runId = runId;
+  if (ack.userMessage && !entry.consumeDraft) entry.userMessage = ack.userMessage;
+  if (entry.accepted) appendAcceptedUserMessage(entry);
+  if (!compatibleFinal || pendingChatRequests.get(entry.outbox.clientRequestId) !== entry) return;
+  const aborted = result.aborted === true || ack.aborted === true;
+  const failed = result.ok === false || ack.ok === false || result.error != null;
+  const final = { ...result, aborted,
+    ...(result.content == null && typeof result.partialOutput === 'string' ? { content: result.partialOutput } : {}),
+    ...(failed && !aborted ? { error: true, errorMessage: String(result.error || ack.error || '请求失败') } : {}),
+  };
+  entry.invokeResult = final;
+  const run = entry.run;
+  if (run) {
+    run.invokeDone = true;
+    if (!run.modelSource) run.modelSource = window.E4ChatState.normalizeModelSource(ack.modelSource || result.modelSource);
+    waitForChatRunEvents(run).then(() => scheduleChatRunFinalization(run, final));
+  }
 }
 function bindEvents() {
   document.getElementById('btn-send').addEventListener('click', sendMessage);
   document.getElementById('btn-stop')?.addEventListener('click', () => { stopGenerating(); });
+  document.getElementById('btn-open-model-manager')?.addEventListener('click', () => {
+    const modal = document.getElementById('model-manager-modal');
+    modal?.classList.remove('hidden');
+    modelSettingsUi?.open?.().catch((error) => toast(error?.message || '模型列表加载失败'));
+  });
+  const closeModelManager = () => document.getElementById('model-manager-modal')?.classList.add('hidden');
+  document.getElementById('btn-close-model-manager')?.addEventListener('click', closeModelManager);
+  document.getElementById('model-manager-modal')?.addEventListener('click', (event) => { if (event.target.id === 'model-manager-modal') closeModelManager(); });
+  const confirmTargetChange = async (session, nextAssistantId, nextModelId) => {
+    const before = getEffectiveModelForSession(session);
+    const assistant = (modelManager?.getState?.().registry?.assistants || []).find((item) => item.id === nextAssistantId);
+    const afterId = nextModelId || assistant?.modelProfileId || modelManager?.getState?.().registry?.defaultModelProfileId;
+    const after = (modelManager?.getState?.().registry?.models || []).find((item) => item.id === afterId) || null;
+    const current = before && { id: before.id, providerId: before.providerId, origin: modelOrigin(before) };
+    const next = after && { id: after.id, providerId: after.providerId, origin: modelOrigin(after) };
+    const warning = window.E4Models?.getSwitchWarning({ current, next, hasContext: (session.messages || []).length > 0, autoCompact: true });
+    if (!warning?.required) return true;
+    const target = warning.autoCompactTarget ? `\n\n自动压缩目标也将变为：${warning.autoCompactTarget}。` : '';
+    return await appConfirm(`切换只影响下一轮。现有对话上下文会发送给所选模型${next?.origin ? `（${next.origin}）` : '（服务 origin 未知）'}。${target}\n\n继续？`, '切换下一轮模型');
+  };
+  let targetChangeRequest = 0;
+  const applyTargetChange = async (field, value) => {
+    const session = activeSession(); if (!session || session.identityType === 'demo-contact') return;
+    const request = ++targetChangeRequest;
+    const beforeAssistantId = session.assistantId;
+    const beforeModelId = session.modelProfileId || null;
+    const beforeRevision = modelManager?.getState?.().registry?.revision;
+    const nextAssistantId = field === 'assistantId' ? value : beforeAssistantId;
+    const nextModelId = field === 'modelProfileId' ? value : beforeModelId;
+    let allowed = false;
+    try { allowed = await confirmTargetChange(session, nextAssistantId, nextModelId || ''); }
+    catch { toast('无法确认模型切换；当前选择与草稿保持不变'); }
+    const current = request === targetChangeRequest && activeSession() === session
+      && session.assistantId === beforeAssistantId && (session.modelProfileId || null) === beforeModelId
+      && modelManager?.getState?.().registry?.revision === beforeRevision;
+    if (!allowed || !current) {
+      if (request === targetChangeRequest && activeSession() === session) updateHeader();
+      return;
+    }
+    session[field] = value; saveState(); updateHeader();
+  };
+  document.getElementById('chat-assistant-select')?.addEventListener('change', async (event) => {
+    await applyTargetChange('assistantId', event.target.value);
+  });
+  document.getElementById('chat-model-select')?.addEventListener('change', async (event) => {
+    await applyTargetChange('modelProfileId', event.target.value || null);
+  });
   document.getElementById('agent-mode-toggle')?.addEventListener('click', (e) => {
     const btn = e.target.closest('.mode-btn');
     if (!btn || btn.disabled) return;
     setSessionAgentMode(btn.getAttribute('data-mode'));
   });
+  document.getElementById('chat-input').addEventListener('input', () => { persistActiveDraft(); });
   document.getElementById('chat-input').addEventListener('keydown', (e) => {
     if (onAtCompleteKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
@@ -5948,6 +6323,7 @@ function bindEvents() {
   document.getElementById('left-search').addEventListener('input', (e) => { searchQuery = e.target.value.trim(); renderLeftDynamic(); });
   document.getElementById('contact-randy').addEventListener('click', () => openFriendChat('randy'));
   document.getElementById('robot-card').addEventListener('click', () => openFriendChat('codex'));
+  document.getElementById('btn-general-ai')?.addEventListener('click', () => createAiSession());
   document.getElementById('btn-clear-chat').addEventListener('click', clearCurrentChat);
   document.getElementById('btn-compact')?.addEventListener('click', () => {
     runCompactOnSession(activeSession(), { force: true }).catch((e) => toast(e.message || String(e)));
@@ -5995,6 +6371,19 @@ function bindEvents() {
 }
 function boot() {
   loadState();
+  // Hydrate the editor before any bound input/session handler can persist its initially empty value.
+  restoreSessionDraft(activeSession());
+  modelSettingsUi = window.E4Models?.createModelSettingsUi?.({
+    root: document.getElementById('e4-model-manager-root'),
+    api: window.codex,
+    getProjects: () => projects.map(({ id, name }) => ({ id, name })),
+    beforeMutation: syncModelSessionReferences,
+    onClose: () => document.getElementById('model-manager-modal')?.classList.add('hidden'),
+  }) || null;
+  modelManager = modelSettingsUi?.manager || null;
+  syncModelSessionReferences().catch((error) => toast(error?.message || '会话引用同步失败；暂不可修改模型配置'));
+  modelManager?.subscribe(() => { updateHeader(); updateStatusBar(); });
+  modelManager?.load().then(() => modelManager?.loadAssistants()).then(() => { updateHeader(); updateStatusBar(); }).catch((error) => toast(error?.message || '模型列表加载失败'));
   prReviewUi = window.PrReviewUi?.create({
     api: window.codex, document, getProject, getToken: (id) => worktreeBindings.get(id), getSessionId: () => activeSessionId,
     isVisible: (projectId, prNumber) => currentView === 'prs' && sessionProject()?.id === projectId && pullRequestView.detail?.number === prNumber,

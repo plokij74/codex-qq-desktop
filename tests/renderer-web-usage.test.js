@@ -72,17 +72,39 @@ describe('D.3 preload and main-process integration', () => {
     assert.match(clear, /clearRecords\(usageFilePath\(userDataPath\(\)\)\)/);
   });
 
-  it('meters the fallback chatCompletionMessage call exactly once', () => {
-    const fallback = section(main, '// Fallback single-shot', 'if (signal.aborted) throwAborted();');
-    assert.equal(countOf(fallback, 'chatCompletionMessage({'), 1);
-    assert.equal(countOf(fallback, 'buildUsageEvent({'), 1);
-    assert.equal(countOf(fallback, 'emit(usageEvent)'), 1);
-    assert.ok(fallback.indexOf('chatCompletionMessage({') < fallback.indexOf('buildUsageEvent({'));
-    assert.ok(fallback.indexOf('buildUsageEvent({') < fallback.indexOf('emit(usageEvent)'));
-    assert.match(fallback, /if\s*\(!content\)\s*throw new Error\(['"]API 返回空内容['"]\)/);
+  it('meters the accepted single-shot route through the bound model exactly once', () => {
+    const singleShot = section(main, '// Fallback single-shot', 'if (signal.aborted) throwAborted();');
+    assert.equal(countOf(singleShot, 'boundModelChat('), 1);
+    assert.match(singleShot, /boundModelChat\(modelBinding,\s*settings,\s*\{\s*signal,\s*onUsage:\s*emit\s*\}\)\s*\(\s*\{/);
+    assert.doesNotMatch(singleShot, /\b(?:chatCompletionMessage|buildUsageEvent|buildModelUsageEvent)\s*\(/);
+    assert.match(singleShot, /if\s*\(settings\.mode\s*===\s*['"]api['"]\)/);
+    assert.match(singleShot, /if\s*\(!content\)[^;\n]*\bMODEL_EMPTY_RESPONSE\b/);
+    assert.match(singleShot, /\}\s*else\s*\{\s*content\s*=\s*generateLocalReply\(/);
+    assert.doesNotMatch(singleShot, /\bcatch\s*(?:\([^)]*\))?\s*\{/);
 
-    const emit = section(main, "if (e && e.type === AGENT_EVENTS.USAGE)", "safeSend(sender, 'chat:event'");
-    assert.equal(countOf(emit, 'persistUsageEvent(settings, sessionId, e)'), 1);
+    const bound = section(main, 'function boundModelChat(binding, settings,', 'function assistantPermissionsRevoked(');
+    assert.equal(countOf(bound, 'createModelChatFunction('), 1);
+    assert.match(bound, /createModelChatFunction\(\s*\{\s*binding,\s*signal,\s*kind,/);
+    assert.match(bound, /resolveCredential:\s*\(accepted\)\s*=>\s*getModelIpc\(\)\.resolveCredential\(accepted\)/);
+    assert.equal(countOf(bound, 'buildModelUsageEvent('), 1);
+    assert.match(bound, /buildModelUsageEvent\(\s*\{\s*binding,\s*settings,\s*attempt,\s*kind\s*\}\)/);
+    assert.match(bound, /if\s*\(!usage\)\s*return/);
+    assert.equal(countOf(bound, 'onUsage(usage)'), 1);
+    assert.equal(countOf(bound, 'persistUsageEvent('), 1);
+    assert.match(bound, /if\s*\(onUsage\)\s*onUsage\(usage\);\s*else\s*persistUsageEvent\(settings,\s*binding\.sessionId,\s*usage\)/);
+
+    const client = section(source('src/ai/llm-client.js'), 'function createModelChatFunction(', null);
+    assert.match(client, /isResolvedModelBinding\(binding\)/);
+    assert.match(client, /invokeModelTurn\(\s*\{\s*binding,\s*resolveCredential,/);
+    assert.equal(countOf(client, 'notify(onUsage,'), 2);
+    assert.match(client, /if\s*\(result\.attemptId\)\s*notify\(onUsage,\s*\{[^}]*attemptId:\s*result\.attemptId[^}]*status:\s*['"]completed['"]/);
+    assert.match(client, /if\s*\(error\.attemptId\)\s*notify\(onUsage,\s*\{[^}]*attemptId:\s*error\.attemptId[^}]*status:\s*error\.code\s*===\s*['"]ABORTED['"]\s*\?\s*['"]cancelled['"]\s*:\s*['"]failed['"]/);
+    assert.match(client, /catch\s*\(error\)[\s\S]*throw error;/);
+
+    const emit = section(main, 'function emitAcceptedRun(lease, event)', 'function preflightAcceptedRun(');
+    assert.equal(countOf(emit, 'persistUsageEvent('), 1);
+    assert.match(emit, /if\s*\(event\.type\s*===\s*AGENT_EVENTS\.USAGE\)\s*persistUsageEvent\(lease\.settings,\s*lease\.sessionId,\s*event\)/);
+    assert.ok(emit.indexOf('persistUsageEvent(') < emit.indexOf('safeSend('));
   });
 });
 
@@ -158,10 +180,52 @@ describe('D.3 renderer behavior', () => {
     assert.match(app, /getElementById\(\s*['"]usage-bar['"]\s*\)[\s\S]{0,300}addEventListener\(\s*['"]click['"]/);
   });
 
-  it('attributes compact usage to its session and merges the returned event', () => {
-    const compact = section(app, 'function requestCompact(session, force)', '/** Manual `/compact`');
-    assert.match(compact, /sessionId:\s*String\(session\?\.id\s*\|\|\s*['"]['"]\)/);
-    assert.match(app, /if\s*\(res\.usage\)\s*applyUsageToSession\(session,\s*res\.usage\)/);
+  it('attributes compact usage to its accepted session through the event ledger', () => {
+    const compact = section(app, 'function requestCompact(session, force)', 'function applyCompactResult(');
+    assert.match(compact, /if\s*\(!session\s*\|\|\s*session\.identityType\s*===\s*['"]demo-contact['"]\)/);
+    assert.match(compact, /sessionId:\s*String\(session\.id\)/);
+    assert.match(compact, /assistantId:\s*session\.assistantId/);
+    assert.match(compact, /modelProfileId:\s*session\.modelProfileId/);
+    assert.match(compact, /expectedRegistryRevision:\s*Number\.isSafeInteger\(modelState\.revision\)/);
+    assert.match(compact, /messages:\s*cloneForIpc\(session\.messages\s*\|\|\s*\[\]\)/);
+    assert.ok(compact.indexOf('messages: cloneForIpc(') < compact.indexOf('await '));
+    assert.match(compact, /createRunLedger\(\s*\{\s*sessionId:\s*session\.id,\s*clientRequestId,\s*kind:\s*['"]session_compact['"]\s*\}\)/);
+    assert.equal(countOf(compact, 'window.codex.compactSession(payload)'), 1);
+    assert.ok(compact.indexOf('pendingCompactRequests.set(') < compact.indexOf('window.codex.compactSession(payload)'));
+    assert.match(compact, /if\s*\(ack\.sessionId\s*!==\s*session\.id\s*\|\|\s*ack\.clientRequestId\s*!==\s*clientRequestId\s*\|\|\s*!ack\.runId\s*\|\|/);
+    assert.match(compact, /ledger\.runId\s*&&\s*ledger\.runId\s*!==\s*ack\.runId/);
+    assert.match(compact, /if\s*\(!ledger\.accepted\)\s*handleCompactEvent\(\s*\{\s*\.\.\.ack,\s*type:\s*['"]compact-start['"]/);
+
+    const events = section(app, 'function handleCompactEvent(ev)', 'function rememberCompletedRun(');
+    assert.match(events, /ledger\.kind\s*!==\s*['"]session_compact['"]/);
+    assert.match(events, /const\s+outcome\s*=\s*window\.E4ChatState\.applyRunEvent\(ledger,\s*ev\)/);
+    assert.match(events, /if\s*\(outcome\.ignore\)\s*return/);
+    assert.ok(events.indexOf('if (outcome.ignore)') < events.indexOf('applyUsageToSession('));
+    assert.match(events, /sessions\.find\(\(item\)\s*=>\s*item\.id\s*===\s*ledger\.sessionId\)/);
+    assert.match(events, /if\s*\(ev\.type\s*===\s*['"]usage['"]\)[\s\S]*?applyUsageToSession\(session,\s*ev\)/);
+    assert.equal(countOf(events, 'applyUsageToSession('), 1);
+    const completion = section(app, 'function applyCompactResult(', '/** `/export');
+    assert.doesNotMatch(completion, /applyUsageToSession\s*\(/);
+
+    // Canonical usage events identify physical attempts; token totals are not identities.
+    const { createRunLedger, applyRunEvent } = require('../src/renderer/e4-chat-state');
+    const identity = { sessionId: 'usage-session', clientRequestId: 'compact-request', runId: 'compact-run',
+      task: { kind: 'session_compact' } };
+    const ledger = createRunLedger({ sessionId: identity.sessionId, clientRequestId: identity.clientRequestId, kind: 'session_compact' });
+    const usage = { ...identity, type: 'usage', attemptId: 'physical-attempt-1', kind: 'session_compact',
+      inputTokens: 10, outputTokens: 5, cost: null, currency: '$' };
+    assert.equal(applyRunEvent(ledger, usage).ignore, true, 'usage before acceptance must not be counted');
+    assert.equal(applyRunEvent(ledger, { ...identity, type: 'compact-start' }).ignore, false);
+    for (const field of ['sessionId', 'clientRequestId', 'runId']) {
+      assert.equal(applyRunEvent(ledger, { ...usage, [field]: 'other-identity' }).ignore, true, `${field} must match the accepted run`);
+    }
+    assert.equal(applyRunEvent(ledger, usage).ignore, false);
+    assert.equal(applyRunEvent(ledger, { ...usage }).ignore, true, 'a replay must not count the same physical attempt again');
+    assert.equal(applyRunEvent(ledger, { ...usage, attemptId: 'physical-attempt-2' }).ignore, false, 'distinct physical attempts with identical totals must both count');
+    assert.equal(applyRunEvent(ledger, { ...usage, inputTokens: 100 }).ignore, true, 'attempt identity, not changed token totals, controls replay deduplication');
+    assert.equal(applyRunEvent(ledger, { ...identity, type: 'compact-done' }).terminal, true);
+    assert.equal(applyRunEvent(ledger, usage).ignore, true, 'terminal delivery must not allow usage replays');
+    assert.equal(applyRunEvent(ledger, { ...usage, attemptId: 'physical-attempt-3' }).ignore, false, 'late unique usage still belongs to the accepted run');
   });
 
   it('loads, saves, summarizes, and clears D.3 settings', () => {

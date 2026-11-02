@@ -24,9 +24,13 @@ const { gitStatus, gitDiff, gitCommit } = require('./git');
 const {
   normalizeAgentMode,
   filterToolsForMode,
+  toolName,
   makePlanId,
   truncatePlanMarkdown,
 } = require('./agent-mode');
+const { isResolvedModelBinding } = require('./model-profiles');
+const { filterAssistantTools, assertAssistantToolAllowed, assistantContextPolicy } = require('./assistant-policy');
+const { EXPLORE_READONLY, ENGINEERING_READONLY, IMPLEMENT_TOOLS } = require('./providers/builtin');
 const { resolveVerifyCommand } = require('./verify');
 const { createDefaultRegistry: buildDefaultRegistry } = require('./providers');
 const { loadHooks } = require('./hooks-loader');
@@ -439,7 +443,159 @@ function appendSubagentProjectContext(parts, project) {
  * @param {object} settings
  * @param {{ agentMode?: string, verifyCmd?: string|null, subagentDepth?: number, subagentKind?: string, exploreReadonly?: boolean }} [opts]
  */
+function requireModelBinding(modelBinding) {
+  if (isResolvedModelBinding(modelBinding)) return;
+  const error = new Error('Agent 需要由模型配置解析得到的真实绑定');
+  error.code = 'MODEL_BINDING_INVALID';
+  throw error;
+}
+
+function requireBoundChat(chatFn) {
+  if (typeof chatFn === 'function') return;
+  const error = new Error('Agent 绑定模型后需要 host 提供 model-bound chatFn');
+  error.code = 'MODEL_BOUND_CHAT_REQUIRED';
+  throw error;
+}
+
+function assertBindingToolCapability(modelBinding) {
+  if (modelBinding.compatibility?.toolMode === 'text-compat') return;
+  const state = modelBinding.capabilities?.nativeTools?.state;
+  if (modelBinding.compatibility?.toolMode === 'native' && state === 'supported') return;
+  const error = new Error('当前模型未声明支持本轮原生工具；请显式选择 text-compat 或使用支持工具的模型');
+  error.code = state === 'unsupported' ? 'MODEL_CAPABILITY_UNSUPPORTED' : 'MODEL_CAPABILITY_UNKNOWN';
+  throw error;
+}
+
+function boundSettings(settings, modelBinding) {
+  if (modelBinding == null) return settings;
+  const allows = (name) => modelBinding.compatibility.toolMode !== 'none'
+    && filterAssistantTools([{ name }], modelBinding).length > 0;
+  const allowed = modelBinding.assistant.toolPolicy.allowedTools;
+  const any = (names) => names.some(allows);
+  return {
+    ...settings,
+    terminalEnabled: Boolean(settings?.terminalEnabled && allows('run_terminal')),
+    skillsEnabled: settings?.skillsEnabled !== false && any(['list_skills', 'use_skill', 'run_skill']),
+    memoryEnabled: settings?.memoryEnabled !== false && any(['recall', 'remember', 'forget']),
+    subagentEnabled: settings?.subagentEnabled !== false && any(['spawn_explore', 'spawn_explores', 'spawn_implement']),
+    mcpEnabled: Boolean(settings?.mcpEnabled && modelBinding.compatibility.toolMode !== 'none'
+      && (allows('mcp__host_authorized_probe') || allowed.some((name) => name.startsWith('mcp_')))),
+  };
+}
+
+function boundHostTools(tools, ctx) {
+  if (ctx.modelBinding.compatibility.toolMode === 'none') return [];
+  const child = Number(ctx.subagentDepth) >= 1 || ctx.exploreReadonly;
+  const childAllow = ctx.subagentKind === 'implement'
+    ? IMPLEMENT_TOOLS : new Set([...EXPLORE_READONLY, ...ENGINEERING_READONLY]);
+  return tools.filter((tool) => {
+    const name = toolName(tool);
+    if (!name || (child && !childAllow.has(name))) return false;
+    if (name === 'run_terminal' && !ctx.settings?.terminalEnabled) return false;
+    if (['recall', 'remember', 'forget'].includes(name) && ctx.settings?.memoryEnabled === false) return false;
+    if (['list_skills', 'use_skill', 'run_skill'].includes(name) && ctx.settings?.skillsEnabled === false) return false;
+    if (['spawn_explore', 'spawn_explores', 'spawn_implement'].includes(name) && ctx.settings?.subagentEnabled === false) return false;
+    if (name.startsWith('mcp_') && !ctx.settings?.mcpEnabled) return false;
+    if (name.startsWith('code_index_') && ctx.settings?.codeIndexEnabled === false) return false;
+    if (name === 'web_fetch' && !ctx.settings?.webEnabled) return false;
+    return true;
+  });
+}
+
+function hasAdvertisedTool(advertisedTools, name) {
+  if (advertisedTools instanceof Set) return advertisedTools.has(name);
+  return Array.isArray(advertisedTools)
+    && advertisedTools.some((tool) => (typeof tool === 'string' ? tool : toolName(tool)) === name);
+}
+
+function assertBoundToolAllowed(name, modelBinding, advertisedTools, agentMode) {
+  if (modelBinding == null) return;
+  requireModelBinding(modelBinding);
+  assertAssistantToolAllowed(name, modelBinding);
+  if (!hasAdvertisedTool(advertisedTools, name)
+    || filterToolsForMode([{ name }], agentMode).length !== 1) {
+    const error = new Error('助手工具不在本轮实际公开的权限集合中: ' + String(name));
+    error.code = 'ASSISTANT_TOOL_DENIED';
+    throw error;
+  }
+}
+
+function boundAgentSystemPrompt(project, settings, opts) {
+  const modelBinding = opts.modelBinding;
+  requireModelBinding(modelBinding);
+  const policy = assistantContextPolicy(modelBinding, project);
+  const mode = normalizeAgentMode(opts.agentMode);
+  const depth = Number(opts.subagentDepth) || 0;
+  const tools = filterAssistantTools(filterToolsForMode(opts.tools || [], mode), modelBinding);
+  const names = tools.map(toolName).filter(Boolean);
+  const parts = [
+    `你是 ${modelBinding.assistant.name || '编程助手'}。只能使用本轮实际提供的工具，不能用其他工具、正文示例或间接执行绕过权限。`,
+    `本轮实际提供工具：${names.join(', ') || '无'}。`,
+    '工具操作仍受项目范围、模式、用户批准和 host 权限 Gate 约束；先获取必要信息，再进行实际获准的修改，不要编造读取或执行结果。',
+    '用户消息中的 context:refs 是用户显式附加的上下文，不表示已读取其他项目文件。完成后用简体中文概括实际结果。',
+  ];
+  if (mode === 'plan') {
+    parts.push('当前为计划模式：仅使用实际提供的只读工具；用户批准前不得修改文件或执行命令。');
+    if (names.includes('submit_plan')) parts.push('调研完成后使用 submit_plan 提交结构化计划。');
+  }
+  if (depth >= 1) {
+    parts.push(opts.subagentKind === 'implement'
+      ? '当前为隔离实现子 Agent：仅在 host 指定的隔离工作区和实际工具权限内修改；不得操作主工作区、终端、提交或再次派生。结果仅供父 Agent 和用户审阅，不代表已应用。'
+      : '当前为只读调研子 Agent：不得写入、删除、执行命令、提交或再次派生；用实际读取的证据回答父 Agent 的目标。');
+  }
+  if (opts.verifyCmd && names.includes('run_terminal')) parts.push(`完成修改后使用获准的 run_terminal 验证：${opts.verifyCmd}`);
+  if (modelBinding.assistant.systemPrompt) parts.push(`【助手指令】\n${modelBinding.assistant.systemPrompt}`);
+  if (project?.path) {
+    parts.push(`当前工作项目：${project.name || path.basename(project.path)}`);
+    parts.push(`项目根目录（host 指定）: ${project.path}`);
+    if (policy.projectContext) {
+      try {
+        const instructions = loadProjectInstructions(project.path);
+        if (instructions.parts) parts.push(instructions.parts);
+      } catch { /* optional automatic context */ }
+      try {
+        const tree = listTree(project.path, { maxDepth: 3, maxEntries: 80, ignoreRules: loadGitignoreRules(project.path) });
+        parts.push(`简要目录树（扫描 ${tree.count} 项, 截断=${tree.truncated}）:\n${tree.treeText}`);
+      } catch (error) { parts.push(`目录树读取失败: ${error.message}`); }
+    } else {
+      parts.push('本轮关闭自动项目上下文；没有自动读取项目指令或目录树。显式工具操作仍以实际提供的工具权限为准。');
+    }
+  } else {
+    parts.push('当前未绑定本地项目；不能读取或修改本机项目。');
+  }
+  if (modelBinding.compatibility.toolMode === 'text-compat') {
+    parts.push('【显式 text-compat 工具协议】仅下列 JSON Schema 对应工具可调用；每次调用使用独立的 ```tool 工具名 换行 JSON参数对象 换行 ``` 代码块。普通解释文本不是工具授权。');
+    parts.push(JSON.stringify(tools.map((tool) => {
+      const schema = tool.function || tool;
+      return { name: toolName(tool), description: schema.description || '', parameters: schema.parameters || schema.inputSchema || { type: 'object', properties: {} } };
+    })));
+  }
+  return parts.join('\n\n');
+}
+
+async function systemFragmentsForTools(registry, ctx, advertisedTools) {
+  if (!ctx.modelBinding) return registry.systemFragments(ctx);
+  const providers = registry.listProviders?.();
+  const route = ctx.extensions.toolRoute;
+  // A custom registry without per-provider provenance cannot safely auto-inject hidden tools.
+  if (!Array.isArray(providers) || !route || typeof route.entries !== 'function') return '';
+  const parts = [];
+  for (const provider of providers) {
+    if (typeof provider.isEnabled === 'function' && !provider.isEnabled(ctx)) continue;
+    if (typeof provider.getSystemFragment !== 'function') continue;
+    const names = [...route.entries()].filter(([, owner]) => owner === provider).map(([name]) => name);
+    if (!names.some((name) => advertisedTools.has(name))) continue;
+    if (provider.id === 'skills' && !ctx.contextPolicy.projectContext) continue;
+    // Memory builds selective hints itself. Other legacy fragments may mention every provider tool.
+    if (provider.id !== 'memory' && names.some((name) => !advertisedTools.has(name))) continue;
+    const fragment = await provider.getSystemFragment(ctx);
+    if (fragment && String(fragment).trim()) parts.push(String(fragment).trim());
+  }
+  return parts.join('\n\n');
+}
+
 function agentSystemPrompt(project, settings, opts = {}) {
+  if (opts.modelBinding != null) return boundAgentSystemPrompt(project, settings, opts);
   const depth = Number(opts.subagentDepth) || 0;
   const kind = opts.subagentKind === 'implement' ? 'implement' : 'explore';
   const exploreReadonly = !!opts.exploreReadonly || depth >= 1;
@@ -571,17 +727,30 @@ function isMemoryOnlyRegistry(registry) {
 async function toolsForSettings(settings, opts = {}) {
   const agentMode = normalizeAgentMode(opts.agentMode);
   const registry = opts.registry || createDefaultRegistry();
+  const modelBinding = opts.modelBinding ?? opts.extensions?.modelBinding;
+  const project = opts.project || null;
+  if (modelBinding != null) requireModelBinding(modelBinding);
+  const contextPolicy = modelBinding ? assistantContextPolicy(modelBinding, project) : null;
+  const extensions = opts.extensions || {};
+  if (modelBinding) {
+    extensions.modelBinding = modelBinding;
+    extensions.projectBindingId = modelBinding.projectBindingId;
+    extensions.contextPolicy = contextPolicy;
+  }
   const ctx = {
-    settings,
+    settings: boundSettings(settings, modelBinding),
     agentMode,
     subagentDepth: Number(opts.subagentDepth) || 0,
     subagentKind: opts.subagentKind === 'implement' ? 'implement' : (opts.subagentKind || 'explore'),
     exploreReadonly: !!opts.exploreReadonly,
-    project: opts.project || null,
-    extensions: opts.extensions || {},
+    project,
+    modelBinding,
+    projectBindingId: modelBinding?.projectBindingId,
+    contextPolicy,
+    extensions,
   };
-  const tools = await registry.collectTools(ctx);
-  return filterToolsForMode(tools, agentMode);
+  const tools = filterToolsForMode(await registry.collectTools(ctx), agentMode);
+  return modelBinding != null ? filterAssistantTools(boundHostTools(tools, ctx), modelBinding) : tools;
 }
 
 function parseArgs(raw) {
@@ -617,7 +786,7 @@ function parseTextToolCalls(content) {
   // ```tool list_dir
   // {"path":"."}
   // ```
-  const re = /```tool[ \t]+([a-z_]+)\s*\n([\s\S]*?)```/gi;
+  const re = /```tool[ \t]+([a-z0-9_][a-z0-9_.:-]{0,127})[ \t]*\r?\n([\s\S]*?)```/gi;
   let m;
   while ((m = re.exec(text)) !== null) {
     calls.push({
@@ -1313,12 +1482,15 @@ async function applyWriteFencesWithGate(projectRoot, content, {
   onEvent,
   fileChanges,
   agentMode,
+  modelBinding,
+  advertisedTools,
 }) {
   const ops = parseWriteFences(content);
   if (!ops.length) {
     return { applied: [], displayContent: content };
   }
 
+  assertBoundToolAllowed('write_file', modelBinding, advertisedTools, agentMode);
   const applied = [];
   for (const op of ops) {
     assertNotAborted(signal);
@@ -1333,6 +1505,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
         const checked = await gate.validatePath({
           tool: 'write_file', risk: 'write', path: op.path, allowMissing: true,
         });
+        assertNotAborted(signal);
         if (!checked?.allowed) {
           const reason = checked?.reason || '隔离写入路径不安全';
           applied.push({ path: op.path, ok: false, error: reason });
@@ -1369,6 +1542,7 @@ async function applyWriteFencesWithGate(projectRoot, content, {
           diff: diffPayload,
           agentMode,
         });
+        assertNotAborted(signal);
       } catch (err) {
         if (err?.code === 'ABORTED' || err?.name === 'AbortError') throw err;
         auth = { allowed: false, reason: err.message || String(err) };
@@ -1393,8 +1567,10 @@ async function applyWriteFencesWithGate(projectRoot, content, {
           const checked = await gate.validatePath({
             tool: 'write_file', risk: 'write', path: op.path, allowMissing: true,
           });
+          assertNotAborted(signal);
           if (!checked?.allowed) throw new Error(checked?.reason || '隔离写入路径不安全');
         }
+        assertNotAborted(signal);
         const r = writeFile(projectRoot, op.path, op.content);
         applied.push({ path: r.path, ok: true, bytes: r.bytes, mode: 'write_fence' });
         if (fileChanges) {
@@ -1415,6 +1591,10 @@ async function applyWriteFencesWithGate(projectRoot, content, {
         });
         endEmitted = true;
       } catch (err) {
+        if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+          assertNotAborted(signal);
+          throw err;
+        }
         applied.push({ path: op.path, ok: false, error: err.message || String(err) });
         onEvent?.({
           type: AGENT_EVENTS.TOOL_END,
@@ -1476,8 +1656,20 @@ async function callModelTurn({
   onEvent,
   streamFailedOnce,
   streamOptionsFailedOnce,
+  modelBinding,
+  strict = false,
 }) {
-  const baseOpts = {
+  if (modelBinding != null) {
+    requireModelBinding(modelBinding);
+    requireBoundChat(chatFn);
+  }
+  const baseOpts = modelBinding != null ? {
+    modelBinding,
+    messages: working,
+    tools,
+    signal,
+    fetchFn,
+  } : {
     baseUrl: settings.baseUrl,
     apiKey: settings.apiKey,
     model: settings.model,
@@ -1487,6 +1679,21 @@ async function callModelTurn({
     fetchFn,
     signal,
   };
+
+  if (modelBinding != null || strict) {
+    const msg = await chatFn({
+      ...baseOpts,
+      stream: true, // the bound wrapper, not legacy stream flags, owns the selected streamMode
+      onDelta: (delta) => {
+        if (delta?.text) onEvent?.({ type: AGENT_EVENTS.TEXT_DELTA, text: delta.text });
+      },
+    });
+    if (modelBinding == null) {
+      const event = buildUsageEvent({ settings, messages: working, msg });
+      if (event) onEvent?.(event);
+    }
+    return { msg, streamFailedOnce, streamOptionsFailedOnce };
+  }
 
   const useStream = !streamFailedOnce;
   const includeUsage = !streamOptionsFailedOnce;
@@ -1513,6 +1720,7 @@ async function callModelTurn({
     emitUsage(msg);
     return { msg, streamFailedOnce, streamOptionsFailedOnce };
   } catch (err) {
+    if (typeof err?.code === 'string' && err.code.startsWith('MODEL_')) throw err;
     if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
       const e = new Error('已停止');
       e.code = 'ABORTED';
@@ -1573,7 +1781,16 @@ async function runAgentLoop({
   subagentKind = 'explore',
   registry: registryOpt,
   extensions: extensionsOpt,
+  modelBinding,
 }) {
+  modelBinding = modelBinding ?? extensionsOpt?.modelBinding;
+  if (modelBinding != null) {
+    requireModelBinding(modelBinding);
+    requireBoundChat(chatFn);
+  }
+  const contextPolicy = modelBinding != null ? assistantContextPolicy(modelBinding, project) : null;
+  if (contextPolicy?.toolsAllowed && modelBinding.compatibility.toolMode === 'native') assertBindingToolCapability(modelBinding);
+  settings = boundSettings(settings, modelBinding);
   const hasProject = Boolean(project?.path);
   if (!hasProject && !isMemoryOnlyRegistry(registryOpt)) {
     throw new Error('Agent 未绑定项目时只能使用记忆专用 registry');
@@ -1585,7 +1802,14 @@ async function runAgentLoop({
   const effectiveGate = resolveGate({ gate });
   const chat = typeof chatFn === 'function' ? chatFn : chatCompletionMessage;
   const registry = registryOpt || createDefaultRegistry();
-  const extensions = extensionsOpt || {};
+  const extensions = modelBinding ? { ...(extensionsOpt || {}) } : (extensionsOpt || {});
+  if (modelBinding) {
+    delete extensions.toolRoute;
+    delete extensions.skillCatalog;
+    extensions.modelBinding = modelBinding;
+    extensions.projectBindingId = modelBinding.projectBindingId;
+    extensions.contextPolicy = contextPolicy;
+  }
   // Skills trigger matching: last user message text for system fragment
   extensions.userPromptText = extractLastUserText(messages);
 
@@ -1594,9 +1818,9 @@ async function runAgentLoop({
   const unlimited = rawTurns === 0;
   const maxTurns = unlimited ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(50, rawTurns || 8));
 
-  const verifyCmd = !hasProject || settings.verifyBeforeDone === false
-    ? null
-    : resolveVerifyCommand(project.path, settings);
+  let verifyCmd = !modelBinding && hasProject && settings.verifyBeforeDone !== false
+    ? resolveVerifyCommand(project.path, settings)
+    : null;
   let verifyPrompted = false;
   let verifyRepairPrompted = false;
   let verifySucceeded = false;
@@ -1604,6 +1828,9 @@ async function runAgentLoop({
 
   const runCtx = {
     project,
+    modelBinding,
+    projectBindingId: modelBinding?.projectBindingId,
+    contextPolicy,
     settings,
     agentMode: mode,
     subagentDepth: depth,
@@ -1613,6 +1840,7 @@ async function runAgentLoop({
     onEvent,
     signal,
     sessionKey,
+    chatFn: chat,
     extensions,
     registry,
   };
@@ -1623,8 +1851,30 @@ async function runAgentLoop({
 
   try {
     await registry.onRunStart(runCtx);
+    const tools = await toolsForSettings(settings, {
+      agentMode: mode,
+      subagentDepth: depth,
+      subagentKind: kind,
+      exploreReadonly: depth >= 1 && kind !== 'implement',
+      project,
+      modelBinding,
+      extensions,
+      registry,
+    });
+    const advertisedTools = new Set(tools.map(toolName).filter(Boolean));
+    // Keep the enforcement snapshot private; providers only receive a detached view.
+    runCtx.advertisedTools = new Set(advertisedTools);
+    extensions.advertisedTools = new Set(advertisedTools);
+    const terminalAvailable = !modelBinding
+      || (settings.terminalEnabled && mode === 'agent' && depth === 0 && advertisedTools.has('run_terminal'));
+    if (modelBinding && tools.length) assertBindingToolCapability(modelBinding);
+    if (modelBinding && hasProject && terminalAvailable && settings.verifyBeforeDone !== false
+      && (contextPolicy.projectContext || String(settings.verifyCommand || '').trim())) {
+      verifyCmd = resolveVerifyCommand(project.path, settings);
+    }
 
-    if (hasProject && depth === 0 && settings.hooksEnabled !== false && userDataPath) {
+    if (hasProject && depth === 0 && terminalAvailable && (!modelBinding || contextPolicy.projectContext)
+      && settings.hooksEnabled !== false && userDataPath) {
       const resolved = loadHooks({ userDataPath, projectPath: project.path });
       hooksRunner = createHooksRunner({
         hooks: resolved,
@@ -1647,28 +1897,22 @@ async function runAgentLoop({
     runCtx.hooksRunner = hooksRunner;
 
     try {
-      const tools = await toolsForSettings(settings, {
-        agentMode: mode,
-        subagentDepth: depth,
-        subagentKind: kind,
-        exploreReadonly: depth >= 1 && kind !== 'implement',
-        project,
-        extensions,
-        registry,
-      });
       const agentLog = [];
       const applied = [];
       /** @type {{ path: string, op: string, stats: { additions: number, deletions: number } }[]} */
       const fileChanges = [];
 
       let systemContent = agentSystemPrompt(project, settings, {
+        modelBinding,
+        tools,
+        contextPolicy,
         agentMode: mode,
         verifyCmd,
         subagentDepth: depth,
         subagentKind: kind,
         exploreReadonly: depth >= 1 && kind !== 'implement',
       });
-      const fragments = await registry.systemFragments(runCtx);
+      const fragments = await systemFragmentsForTools(registry, runCtx, advertisedTools);
       if (fragments && String(fragments).trim()) {
         systemContent = `${systemContent}\n\n${String(fragments).trim()}`;
       }
@@ -1692,6 +1936,8 @@ async function runAgentLoop({
       try {
         const called = await callModelTurn({
           chatFn: chat,
+          modelBinding,
+          strict: modelBinding != null,
           settings,
           working,
           tools,
@@ -1706,6 +1952,7 @@ async function runAgentLoop({
         streamFailedOnce = called.streamFailedOnce;
         streamOptionsFailedOnce = called.streamOptionsFailedOnce;
       } catch (err) {
+        if (modelBinding != null || (typeof err?.code === 'string' && err.code.startsWith('MODEL_'))) throw err;
         if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
           const e = new Error('已停止');
           e.code = 'ABORTED';
@@ -1747,7 +1994,7 @@ async function runAgentLoop({
       }
 
       let toolCalls = msg.tool_calls;
-      if (!toolCalls?.length) {
+      if (!toolCalls?.length && (modelBinding == null || modelBinding.compatibility.toolMode === 'text-compat')) {
         const textCalls = parseTextToolCalls(msg.content);
         if (textCalls.length) toolCalls = textCalls;
       }
@@ -1765,7 +2012,8 @@ async function runAgentLoop({
         }
 
         for (const tc of toolCalls) {
-          const name = tc.function?.name || tc.name;
+          const name = toolName(tc);
+          assertBoundToolAllowed(name, modelBinding, advertisedTools, mode);
           const args = parseArgs(tc.function?.arguments ?? tc.arguments);
           assertNotAborted(signal);
 
@@ -1796,6 +2044,7 @@ async function runAgentLoop({
             let diffPayload;
 
             async function validateMutationPath(pathToCheck, toolName = name) {
+              assertNotAborted(signal);
               if (!hasProject || !MUTATING_TOOLS.has(toolName)
                 || !effectiveGate || typeof effectiveGate.validatePath !== 'function') return true;
               const checked = await effectiveGate.validatePath({
@@ -1804,6 +2053,7 @@ async function runAgentLoop({
                 path: pathToCheck || '',
                 allowMissing: toolName === 'write_file',
               });
+              assertNotAborted(signal);
               if (!checked?.allowed) throw new Error(checked?.reason || '隔离写入路径不安全');
               return true;
             }
@@ -1851,6 +2101,7 @@ async function runAgentLoop({
              */
             async function executeAllowedTool() {
               await validateMutationPath(effectiveRelPath);
+              assertNotAborted(signal);
               if (name === 'search_replace' && mutatePreview) {
                 // Apply approved preview.after (do not re-run searchReplace / re-preview).
                 try {
@@ -1940,6 +2191,7 @@ async function runAgentLoop({
                   authDiff: diffPayload,
                   authScope: scope,
                 });
+              assertNotAborted(signal);
               authAllowed = gate1.allowed;
               authReason = gate1.reason;
               if (!authAllowed) {
@@ -1951,6 +2203,7 @@ async function runAgentLoop({
                  * args, re-preview mutating tools and re-authorize before the next Pre.
                  */
                 const onArgsChanged = async ({ args: nextArgs }) => {
+                  assertNotAborted(signal);
                   effectiveArgs = nextArgs && typeof nextArgs === 'object' ? { ...nextArgs } : {};
                   effectiveRelPath = toolPath(name, effectiveArgs);
                   const g2Summary = toolSummary(name, effectiveArgs);
@@ -2014,6 +2267,7 @@ async function runAgentLoop({
                       authDiff: g2DiffPayload,
                       authScope: toolScope(name, effectiveArgs),
                     });
+                  assertNotAborted(signal);
                   if (!gate2.allowed) {
                     return {
                       allowed: false,
@@ -2030,6 +2284,7 @@ async function runAgentLoop({
                   risk,
                   onArgsChanged,
                 });
+                assertNotAborted(signal);
                 if (pre.args && typeof pre.args === 'object') {
                   effectiveArgs = pre.args;
                   if (pre.argsChanged) {
@@ -2059,6 +2314,7 @@ async function runAgentLoop({
                 // No hooks: existing apply path.
                 try {
                   await validateMutationPath(relPath);
+                  assertNotAborted(signal);
                   const w = writeFile(project.path, relPath || '', mutatePreview.after);
                   const replacements = mutatePreview.previewMeta?.replacements ?? 1;
                   resultStr = JSON.stringify({
@@ -2069,10 +2325,15 @@ async function runAgentLoop({
                     mode: 'search_replace',
                   });
                 } catch (err) {
+                  if (err?.code === 'ABORTED' || err?.name === 'AbortError' || signal?.aborted) {
+                    assertNotAborted(signal);
+                    throw err;
+                  }
                   resultStr = JSON.stringify({ ok: false, error: err.message || String(err) });
                 }
               } else {
                 await validateMutationPath(relPath);
+                assertNotAborted(signal);
                 resultStr = await registry.execute(name, args, {
                   ...runCtx,
                   project,
@@ -2246,6 +2507,8 @@ async function runAgentLoop({
           onEvent,
           fileChanges,
           agentMode: mode,
+          modelBinding,
+          advertisedTools,
         });
         if (fence.applied.length) {
           applied.push(...fence.applied);

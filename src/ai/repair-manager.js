@@ -30,6 +30,13 @@ const {
 } = require('./repair-state');
 const { createRepairStore } = require('./repair-store');
 const AuditRepairState = require('./pr-audit-repair-state');
+const { acceptAuditModel } = require('./pr-audit-runtime');
+
+function withoutModelTransport(settings) {
+  const next = { ...settings };
+  for (const key of ['apiKey', 'baseUrl', 'model', 'modelRegistry']) delete next[key];
+  return next;
+}
 
 const SOURCE_OUTPUT_MAX = MAX_OUTPUT_EXCERPT_BYTES;
 const D5_RECOVERY_INTEGRITY_CODES = new Set([
@@ -56,7 +63,9 @@ function resultError(code, message, extra = {}) {
 }
 
 function fixedFailure(error, fallback = 'REPAIR_GENERATION_FAILED') {
-  const code = normalizeErrorCode(error?.code) || fallback;
+  const capabilityCode = error?.code === 'MODEL_CAPABILITY_REQUIRED'
+    ? require('./model-errors').publicModelError(error).code : undefined;
+  const code = normalizeErrorCode(capabilityCode || error?.code) || fallback;
   return { code, message: FIXED_MESSAGES[code] || code };
 }
 
@@ -138,6 +147,7 @@ class RepairManager {
     this.runImplement = typeof options.runImplement === 'function' ? options.runImplement : null;
     this.getProfiles = typeof options.getProfiles === 'function' ? options.getProfiles : null;
     this.getSettings = typeof options.getSettings === 'function' ? options.getSettings : (() => options.settings || DEFAULT_SETTINGS);
+    this.acceptBoundModel = typeof options.acceptBoundModel === 'function' ? options.acceptBoundModel : null;
     this.settings = options.settings || {};
     this.permissionGate = options.permissionGate || null;
     this.workspaceFingerprint = options.workspaceFingerprint || workspaceFingerprint;
@@ -404,10 +414,11 @@ class RepairManager {
   }
 
   _newRecord(root, resolved, note, lineage = {}) {
-    const repairRef = createRepairRef();
+    const repairRef = lineage.repairRef || createRepairRef();
     const now = new Date(this.now()).toISOString();
     return normalizeRepair({
       repairRef, projectKey: this._projectKey(root), source: resolved.source,
+      ...(lineage.modelSource ? { modelSource: lineage.modelSource } : {}),
       sourceFingerprint: resolved.sourceFingerprint,
       ...(resolved.validationProfile ? { validationProfile: resolved.validationProfile } : (resolved.profile && resolved.job ? { validationProfile: { profileId: resolved.job.profileId, profileFingerprint: resolved.job.profileFingerprint } } : {})),
       status: 'queued',
@@ -418,6 +429,63 @@ class RepairManager {
       outputExcerpted: Boolean(resolved.result && this._buildContext(resolved, note, root).outputExcerpted),
       createdAt: now,
     });
+  }
+
+  async _enqueue(root, resolved, note, context, validationProfile, lineage = {}) {
+    const abort = new AbortController();
+    const onContextAbort = () => abort.abort();
+    if (context.signal?.aborted) abort.abort();
+    else context.signal?.addEventListener('abort', onContextAbort, { once: true });
+    const repairRef = createRepairRef();
+    const inherited = context.modelBinding ?? context.extensions?.modelBinding;
+    const settings = this._settings(context);
+    const runtimeContext = { ...context, projectPath: root,
+      project: { ...context.project, id: context.binding?.projectId || context.project?.id, path: root },
+      signal: abort.signal, abortController: abort,
+      ...(inherited != null ? { modelBinding: inherited } : {}) };
+    let accepted; let retained = false; let released = false;
+    const release = async () => {
+      if (released) return;
+      released = true;
+      context.signal?.removeEventListener('abort', onContextAbort);
+      await accepted?.release?.();
+    };
+    try {
+      if (abort.signal.aborted || context.isCurrent?.() === false) throw repairError('REPAIR_CANCEL_FAILED');
+      accepted = acceptAuditModel(this.acceptBoundModel, { kind: 'repair', taskId: repairRef,
+        context: runtimeContext, settings: withoutModelTransport(settings) });
+      if (accepted) {
+        runtimeContext.modelBinding = accepted.binding;
+        runtimeContext.settings = withoutModelTransport(settings);
+        // This task reserves exactly one fresh closure for its implement child.
+        // It is never the parent chatFn and is not shared by another repair attempt.
+        runtimeContext.extensions = { ...context.extensions, modelBinding: accepted.binding,
+          projectBindingId: accepted.binding.projectBindingId, createBoundChat: () => accepted.chatFn };
+      }
+      resolved = await this.materializeRepairSource(root, resolved, { ...runtimeContext, validationProfile });
+      const builtContext = this._buildContext(resolved, note, root);
+      if (abort.signal.aborted || context.isCurrent?.() === false) throw repairError('REPAIR_CANCEL_FAILED');
+      const item = this._newRecord(root, resolved, note, { ...lineage, repairRef, modelSource: accepted?.modelSource });
+      const detail = { note, context: builtContext, abort, acceptedModel: Boolean(accepted), handle: null,
+        sourceKey: sourceKey(resolved.source), projectPath: root,
+        ownerAgentRunId: context.agentRunId == null ? null : String(context.agentRunId) };
+      context.retainUntilFinished?.();
+      this.details.set(item.repairRef, detail);
+      this.activeByProject.set(item.projectKey, item.repairRef);
+      this._persist(item, 'queued');
+      retained = true;
+      detail.completion = this._run(item, resolved, detail, runtimeContext).finally(async () => {
+        try { await release(); } finally { await context.release?.(); }
+      });
+      detail.completion.catch(() => {});
+      return { ok: true, repairRef: item.repairRef, repair: publicRepairSummary(item),
+        ...(accepted ? { modelSource: accepted.modelSource } : {}) };
+    } catch (cause) {
+      const failure = fixedFailure(cause);
+      return resultError(failure.code, failure.message);
+    } finally {
+      if (!retained) await release();
+    }
   }
 
   async start(projectPath, payload = {}, context = {}) {
@@ -438,25 +506,13 @@ class RepairManager {
       const auth = await this._authorize(context, source, resolved.profile, resolved);
       if (!auth.ok) return auth;
       // Recheck after an approval wait; stale approvals must never create a worktree.
-      try {
-        resolved = await this.resolveMetadata(root, source, context);
-        resolved = await this.materializeRepairSource(root, resolved, { ...context, validationProfile: this._validationProfile(root, source, payload.validationProfileId, resolved) });
-      } catch (error) { return resultError(error.code, error.message); }
+      try { resolved = await this.resolveMetadata(root, source, context); }
+      catch (error) { return resultError(error.code, error.message); }
       const note = ['pr_audit', 'pr_audit_recheck'].includes(source.kind) ? AuditRepairState.normalizeNote(payload.note) : normalizeNote(payload.note);
-      try { this._buildContext(resolved, note, root); } catch (cause) { return resultError(cause.code, cause.message); }
-      if (context.isCurrent?.() === false) return resultError('REPAIR_PROJECT_BINDING_INVALID');
-      const item = this._newRecord(root, resolved, note);
-      const detail = { note, context: this._buildContext(resolved, note, root), abort: new AbortController(), handle: null, sourceKey: sourceKey(source), projectPath: root, ownerAgentRunId: context.agentRunId == null ? null : String(context.agentRunId) };
-      if (context.signal) {
-        if (context.signal.aborted) return resultError('REPAIR_CANCEL_FAILED', '修复已取消');
-        context.signal.addEventListener('abort', () => detail.abort.abort(), { once: true });
-      }
-      this.details.set(item.repairRef, detail);
-      this.activeByProject.set(item.projectKey, item.repairRef);
-      this._persist(item, 'queued');
-      context.retainUntilFinished?.();
-      void this._run(item, resolved, detail, context).finally(() => context.release?.());
-      return { ok: true, repairRef: item.repairRef, repair: publicRepairSummary(item) };
+      let validationProfile;
+      try { validationProfile = this._validationProfile(root, source, payload.validationProfileId, resolved); }
+      catch (error) { return resultError(error.code, error.message); }
+      return this._enqueue(root, resolved, note, context, validationProfile);
     });
   }
 
@@ -474,7 +530,7 @@ class RepairManager {
       const prompt = detail.context.text;
       let generated;
       const runtime = this.subagentRuntime;
-      const runtimeSettings = this._settings(context);
+      const runtimeSettings = detail.acceptedModel ? withoutModelTransport(this._settings(context)) : this._settings(context);
       // A production repair must have the same usable model context as the
       // current session. Test-injected runners may intentionally omit these
       // fields, so only explicit unavailable settings fail closed here.
@@ -482,7 +538,7 @@ class RepairManager {
         runtimeSettings.agentEnabled === false
         || runtimeSettings.mode === 'local'
         || runtimeSettings.mode === 'mock'
-        || (runtimeSettings.mode === 'api' && (!runtimeSettings.apiKey || !runtimeSettings.model))
+        || (!detail.acceptedModel && runtimeSettings.mode === 'api' && (!runtimeSettings.apiKey || !runtimeSettings.model))
       )) {
         throw repairError('REPAIR_AGENT_UNAVAILABLE', '没有可用的修复 Agent');
       }
@@ -491,10 +547,11 @@ class RepairManager {
         const execute = runtime.runIsolatedImplement || runtime.runImplement;
         const markerGoal = current.source.kind === 'pr_audit_recheck' ? '继续修复 PR 复审问题' : current.source.kind === 'pr_audit' ? '处理 AI PR 审查发现' : current.source.kind === 'pr_review' ? '处理 PR 审查反馈' : '修复验证失败';
         generated = await execute.call(runtime, {
-          project: { path: detail.projectPath }, projectBindingId: context.projectBindingId,
+          project: { ...context.project, path: detail.projectPath }, projectBindingId: context.projectBindingId,
+          ...(detail.acceptedModel ? { modelBinding: context.modelBinding } : {}),
           sessionKey: context.sessionKey || '', settings: { ...runtimeSettings, terminalEnabled: false }, gate: context.gate || context.permissionGate,
           signal: detail.abort.signal, subagentDepth: 0, worktreeGoal: markerGoal,
-          onEvent: () => {}, extensions: { worktreeManager: this.worktree },
+          onEvent: () => {}, extensions: { ...(detail.acceptedModel ? context.extensions : {}), worktreeManager: this.worktree },
         }, { goal: prompt, maxTurns: 6, subagentId: current.repairRef, markerGoal, createWorktree: resolved.createWorktree });
       } else {
         throw repairError('REPAIR_AGENT_UNAVAILABLE', '没有可用的 implement Agent');
@@ -587,25 +644,11 @@ class RepairManager {
       let resolved;
       try { resolved = await this.resolveMetadata(root, old.source, context); } catch (error) { return resultError(error.code, error.message); }
       const auth = await this._authorize(context, old.source, resolved.profile, resolved); if (!auth.ok) return auth;
-      try {
-        resolved = await this.resolveMetadata(root, old.source, context);
-        resolved = await this.materializeRepairSource(root, resolved, { ...context, validationProfile: old.validationProfile });
-      } catch (error) { return resultError(error.code, error.message); }
+      try { resolved = await this.resolveMetadata(root, old.source, context); }
+      catch (error) { return resultError(error.code, error.message); }
       const note = ['pr_audit', 'pr_audit_recheck'].includes(old.source.kind) ? AuditRepairState.normalizeNote(payload.note) : normalizeNote(payload.note);
-      try { this._buildContext(resolved, note, root); } catch (cause) { return resultError(cause.code, cause.message); }
-      if (context.isCurrent?.() === false) return resultError('REPAIR_PROJECT_BINDING_INVALID');
-      const item = this._newRecord(root, resolved, note, { retryOf: old.repairRef, rootRepairRef: old.rootRepairRef || old.repairRef, attempt: old.attempt + 1 });
-    // start() would re-resolve and allocate another lineage; enqueue directly
-    // after the same approval and freshness checks.
-      const detail = { note, context: this._buildContext(resolved, note, root), abort: new AbortController(), handle: null, sourceKey: sourceKey(old.source), projectPath: root, ownerAgentRunId: context.agentRunId == null ? null : String(context.agentRunId) };
-      if (context.signal) {
-        if (context.signal.aborted) return resultError('REPAIR_CANCEL_FAILED', '修复已取消');
-        context.signal.addEventListener('abort', () => detail.abort.abort(), { once: true });
-      }
-      this.details.set(item.repairRef, detail); this.activeByProject.set(item.projectKey, item.repairRef); this._persist(item, 'queued');
-      context.retainUntilFinished?.();
-      void this._run(item, resolved, detail, context).finally(() => context.release?.());
-      return { ok: true, repairRef: item.repairRef, repair: publicRepairSummary(item) };
+      return this._enqueue(root, resolved, note, context, old.validationProfile,
+        { retryOf: old.repairRef, rootRepairRef: old.rootRepairRef || old.repairRef, attempt: old.attempt + 1 });
     });
   }
 

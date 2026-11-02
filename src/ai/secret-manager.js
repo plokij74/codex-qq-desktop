@@ -39,6 +39,8 @@ class SecretManager {
       secrets: {},
     };
 
+    this.vaultState = 'ready';
+    this._vaultLoaded = false;
     this.registeredSecrets = registeredSecrets; // Process-wide: settings, tools and exports share registrations.
     if (this.vaultPath) {
       this.load();
@@ -46,23 +48,34 @@ class SecretManager {
   }
 
   load() {
-    if (!this.vaultPath || !fs.existsSync(this.vaultPath)) return;
+    if (!this.vaultPath) return this.vaultState === 'ready';
     try {
       const raw = fs.readFileSync(this.vaultPath, 'utf8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        this.vault = {
-          version: parsed.version || 1,
-          salt: parsed.salt || crypto.randomBytes(16).toString('hex'),
-          secrets: parsed.secrets || {},
-        };
-      }
-    } catch (_) {
-      // Keep empty vault on read error
+      const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+      if (!object(parsed) || parsed.version !== 1 || typeof parsed.salt !== 'string' || !/^[a-f0-9]{32}$/i.test(parsed.salt)
+        || !object(parsed.secrets) || !Object.values(parsed.secrets).every(object)) throw new Error('Invalid vault document');
+      this.vault = parsed;
+      this._vaultLoaded = true;
+      this.vaultState = 'ready';
+      return true;
+    } catch (error) {
+      // Only a never-loaded, genuinely absent vault is safe to initialize. An
+      // unreadable/corrupt existing vault (or a failed reload) must remain intact.
+      if (error?.code === 'ENOENT' && !this._vaultLoaded && this.vaultState === 'ready') return false;
+      this.vaultState = 'unavailable';
+      return false;
+    }
+  }
+
+  _assertVaultAvailable() {
+    if (this.vaultState !== 'ready') {
+      throw Object.assign(new Error('密钥保管库不可读取，已保留原文件；请先恢复并重新加载。'), { code: 'SECRET_VAULT_UNAVAILABLE' });
     }
   }
 
   save() {
+    this._assertVaultAvailable();
     if (!this.vaultPath) return;
     try {
       const dir = path.dirname(this.vaultPath);
@@ -70,10 +83,26 @@ class SecretManager {
       const tempPath = `${this.vaultPath}.tmp.${Date.now()}`;
       fs.writeFileSync(tempPath, JSON.stringify(this.vault, null, 2), 'utf8');
       fs.renameSync(tempPath, this.vaultPath);
+      this._vaultLoaded = true;
     } catch (e) {
       // Handle write failure
       throw new Error(`无法保存密钥保管库: ${e.message}`);
     }
+  }
+
+  _commitSecrets(secrets) {
+    this._assertVaultAvailable();
+    // Stage a copy for synchronous save; on failure preserve the loaded records
+    // so credential cleanup cannot mistake a failed delete for success.
+    const previous = this.vault;
+    this.vault = { ...previous, secrets };
+    try {
+      this.save();
+    } catch (error) {
+      this.vault = previous;
+      throw error;
+    }
+    return true;
   }
 
   _encryptValue(plaintext) {
@@ -127,24 +156,26 @@ class SecretManager {
   }
 
   setSecret(key, value, metadata = {}) {
+    this._assertVaultAvailable();
     if (!key || typeof key !== 'string') throw new Error('无效的密钥名称');
     if (typeof value !== 'string') throw new Error('无效的密钥内容');
 
     const encrypted = this._encryptValue(value);
     const now = new Date().toISOString();
-    this.vault.secrets[key] = {
+    const record = {
       ...encrypted,
       label: metadata.label || key,
       createdAt: this.vault.secrets[key]?.createdAt || now,
       updatedAt: now,
     };
 
+    // Keep candidates registered even on save failure; redaction is monotonic.
     this.registerSecret(value, metadata.label || key);
-    this.save();
-    return true;
+    return this._commitSecrets({ ...this.vault.secrets, [key]: record });
   }
 
   getSecret(key) {
+    if (this.vaultState !== 'ready') return null;
     if (!key || !this.vault.secrets[key]) return null;
     const record = this.vault.secrets[key];
     const decrypted = this._decryptValue(record);
@@ -155,17 +186,20 @@ class SecretManager {
   }
 
   hasSecret(key) {
+    this._assertVaultAvailable();
     return Boolean(this.vault.secrets && this.vault.secrets[key]);
   }
 
   deleteSecret(key) {
+    this._assertVaultAvailable();
     if (!key || !this.vault.secrets[key]) return false;
-    delete this.vault.secrets[key];
-    this.save();
-    return true;
+    const secrets = { ...this.vault.secrets };
+    delete secrets[key];
+    return this._commitSecrets(secrets);
   }
 
   listSecrets() {
+    this._assertVaultAvailable();
     return Object.entries(this.vault.secrets).map(([key, record]) => ({
       key,
       label: record.label || key,

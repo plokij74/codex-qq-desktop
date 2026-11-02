@@ -2,7 +2,7 @@
 
 const crypto = require('node:crypto');
 const { REVIEW_REF_RE, ERROR_CODES: REVIEW_ERRORS } = require('./pr-review-state');
-const { CODES: AUDIT_CODES } = require('./pr-audit-state');
+const { CODES: AUDIT_CODES, normalizeModelSource } = require('./pr-audit-state');
 const { REF_RE: AUDIT_REPAIR_REF_RE } = require('./pr-audit-repair-state');
 const { REF_RE: RECHECK_REPAIR_REF_RE } = require('./pr-audit-recheck-repair-state');
 
@@ -66,6 +66,12 @@ const FIXED_ERROR_CODES = new Set([
   'REPAIR_PATCH_CHANGED', 'REPAIR_VALIDATION_RUNNING', 'REPAIR_VALIDATION_UNAVAILABLE',
   'REPAIR_VALIDATION_CANCEL_FAILED', 'REPAIR_TERMINAL_DISABLED', 'REPAIR_STORE_CORRUPT',
   'REPAIR_STORE_UNAVAILABLE',
+  'MODEL_BINDING_INVALID', 'MODEL_BOUND_CHAT_REQUIRED', 'MODEL_CREDENTIAL_UNAVAILABLE',
+  'MODEL_CAPABILITY_UNKNOWN', 'MODEL_CAPABILITY_UNSUPPORTED', 'MODEL_SENDER_INVALID',
+  'MODEL_INPUT_INVALID', 'MODEL_SCHEMA_UNSUPPORTED', 'MODEL_CONTEXT_LIMIT',
+  'MODEL_INSECURE_HTTP_CONFIRMATION_REQUIRED', 'MODEL_CONNECTION_FAILED', 'MODEL_HTTP_ERROR',
+  'MODEL_PROTOCOL_ERROR', 'MODEL_TOOL_INVALID', 'MODEL_LIMIT_EXCEEDED', 'MODEL_TIMEOUT',
+  'ASSISTANT_TOOL_DENIED',
   'REMOTE_CI_PROJECT_BINDING_INVALID', 'REMOTE_CI_INVALID', 'REMOTE_CI_NOT_FOUND',
   'REMOTE_CI_UNSUPPORTED_REPOSITORY', 'REMOTE_CI_GH_UNAVAILABLE',
   'REMOTE_CI_PR_NOT_FOUND', 'REMOTE_CI_PR_NOT_OPEN', 'REMOTE_CI_FORK_UNSUPPORTED',
@@ -198,7 +204,7 @@ function normalizeValidation(raw, { rejectUnknown = true } = {}) {
 function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw repairError('REPAIR_INVALID', '修复记录无效');
   const allowed = new Set([
-    'repairRef', 'projectKey', 'source', 'sourceFingerprint', 'validationProfile',
+    'repairRef', 'projectKey', 'source', 'sourceFingerprint', 'validationProfile', 'modelSource',
     'profileId', 'profileFingerprint', 'sourceWorkspaceFingerprint',
     'status', 'resultId', 'rootRepairRef', 'retryOf', 'attempt', 'incomplete', 'diagnosticCount',
     'outputExcerpted', 'createdAt', 'startedAt', 'finishedAt', 'errorCode', 'statusMessage', 'validation',
@@ -248,6 +254,7 @@ function normalizeRepair(raw, { now = Date.now(), rejectUnknown = true } = {}) {
   if (!createdAt) throw repairError('REPAIR_INVALID', '修复时间无效');
   const out = {
     repairRef, projectKey, source, sourceFingerprint, status,
+    ...(raw.modelSource != null ? { modelSource: normalizeModelSource(raw.modelSource) } : {}),
     ...(validationProfile ? { validationProfile } : {}),
     ...(raw.resultId != null ? { resultId: String(raw.resultId) } : {}),
     rootRepairRef: String(raw.rootRepairRef || repairRef),
@@ -302,6 +309,7 @@ function publicRepairSummary(raw) {
   return {
     repairRef: repair.repairRef,
     source: { ...repair.source },
+    ...(repair.modelSource ? { modelSource: repair.modelSource } : {}),
     ...(repair.validationProfile ? {
       validationProfile: { ...repair.validationProfile },
       profileId: repair.validationProfile.profileId,

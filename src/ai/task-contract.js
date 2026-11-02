@@ -14,6 +14,8 @@ const TASK_KINDS = Object.freeze({
   BACKGROUND_JOB: 'background_job',
   VERIFICATION: 'verification',
   SUBAGENT: 'subagent',
+  SESSION_COMPACT: 'session_compact',
+  MODEL_DIAGNOSTIC: 'model_diagnostic',
 });
 
 const TASK_STATES = Object.freeze({

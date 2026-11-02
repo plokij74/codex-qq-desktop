@@ -32,8 +32,7 @@ async function runRecheck({ snapshot, findings, ...options }) {
       '可以引用工具确认的目标路径缺失，但必须分析调用方或功能移除是否确实消除了原触发条件，不能仅凭缺失判定解决。',
       'still_present 必须引用目标提交代码并说明当前触发条件。证据不足、范围外、读取受限或无法核实原问题时使用 unknown 并说明原因。',
       '不能运行测试、修改文件、调用终端、网络、其他 Agent、MCP 或发布评论；不宣称测试通过、人工确认或可以合并。',
-      '最后调用 submit_recheck。也可直接返回同字段完整 JSON；非原生工具使用 ```tool 工具名\n{"参数":"值"}\n```。',
-      `工具定义：${JSON.stringify(TOOLS.map((t) => t.function))}`,
+      '返回 summary、findings 的完整 JSON；工具调用方式和可用定义仅以本轮实际提供的目录为准。',
     ].join('\n'),
     execute: (name, args) => {
       if (name === 'recheck_read_file') return snapshot.read(args);

@@ -65,7 +65,7 @@ function report(raw, ids, ledger) {
   } catch { throw A.fail('REPORT_INVALID'); }
 }
 function record(raw) {
-  A.keys(raw, ['recheckRef', 'projectKey', 'prNumber', 'source', 'target', 'status', 'freshness', 'createdAt', 'finishedAt', 'model', 'turns', 'usage', 'errorCode', 'report', 'evidence']);
+  A.keys(raw, ['recheckRef', 'projectKey', 'prNumber', 'source', 'target', 'status', 'freshness', 'createdAt', 'finishedAt', 'model', 'modelSource', 'turns', 'usage', 'errorCode', 'report', 'evidence']);
   if (!isRef(raw.recheckRef) || !normalizeProjectKey(raw.projectKey) || !STATES.has(raw.status) || !A.number(raw.prNumber)
     || typeof raw.createdAt !== 'string' || !Number.isFinite(Date.parse(raw.createdAt)) || !['current', 'stale', 'unknown'].includes(raw.freshness)
     || Buffer.byteLength(JSON.stringify(raw)) > 1024 * 1024) throw A.fail();
@@ -76,10 +76,11 @@ function record(raw) {
     if (['repoKey', 'prNumber', 'prefix', 'baseRefName', 'headRefName'].some((k) => row.target[k] !== row.source[k])) throw A.fail();
   }
   if (row.model !== undefined) A.text(row.model, 200, true);
+  if (row.modelSource !== undefined) row.modelSource = A.normalizeModelSource(row.modelSource); else delete row.modelSource;
   if (row.errorCode !== undefined) A.text(row.errorCode, 80);
   if (row.finishedAt !== undefined && !Number.isFinite(Date.parse(row.finishedAt))) throw A.fail();
   if (row.turns !== undefined && (!Number.isSafeInteger(row.turns) || row.turns < 0 || row.turns > 8)) throw A.fail();
-  if (row.usage) { A.keys(row.usage, ['inputTokens', 'outputTokens', 'estimated']); if (!['inputTokens', 'outputTokens'].every((k) => Number.isSafeInteger(row.usage[k]) && row.usage[k] >= 0) || typeof row.usage.estimated !== 'boolean') throw A.fail(); }
+  if (row.usage !== undefined) row.usage = A.validateUsage(row.usage);
   if (row.evidence) {
     if (!Array.isArray(row.evidence) || row.evidence.length > 40) throw A.fail();
     row.evidence = row.evidence.map((e) => evidence(e, row));

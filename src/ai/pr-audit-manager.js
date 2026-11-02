@@ -4,7 +4,7 @@ const { canonicalProjectPath, projectKey } = require('./project-index');
 const { createGithubCli } = require('./github-cli');
 const { createPrAuditStore } = require('./pr-audit-store');
 const { AuditSnapshot, cleanupAuditRefs } = require('./pr-audit-snapshot');
-const { runAudit } = require('./pr-audit-runtime');
+const { runAudit, acceptAuditModel, modelFailure } = require('./pr-audit-runtime');
 const S = require('./pr-audit-state');
 const { AuditTaskPool } = require('./pr-audit-task-pool');
 
@@ -13,6 +13,8 @@ class PrAuditManager {
     this.github = options.githubCli || createGithubCli(); this.store = options.store || createPrAuditStore(options);
     this.runtime = options.runtime || runAudit; this.snapshotFactory = options.snapshotFactory || ((args) => new AuditSnapshot(args));
     this.getSettings = options.getSettings || (() => ({})); this.mutationLock = options.mutationLock;
+    this.acceptBoundModel = options.acceptBoundModel; this.chatFn = options.chatFn; this.fetchFn = options.fetchFn;
+    this.legacyModelInjected = typeof options.runtime === 'function' || typeof this.chatFn === 'function' || typeof this.fetchFn === 'function';
     this.onEvent = options.onEvent; this.now = options.now || Date.now; this.timeoutMs = options.timeoutMs || S.LIMITS.timeout;
     this.runs = new Map(); this.drafts = new Map(); this.pending = new Set(); this.cleaned = new Map(); this.closing = false;
     this.taskPool = options.taskPool || new AuditTaskPool();
@@ -26,7 +28,8 @@ class PrAuditManager {
   save(row, options) {
     const saved = this.store.put(row, options);
     try { this.onEvent?.({ type: 'engineering:pr-audit:event', auditRef: saved.auditRef, projectKey: saved.projectKey,
-      prNumber: saved.prNumber, status: saved.status, publicationStatus: saved.publication?.status, stale: saved.stale, turn: saved.turns || 0 }); } catch {}
+      prNumber: saved.prNumber, status: saved.status, publicationStatus: saved.publication?.status, stale: saved.stale, turn: saved.turns || 0,
+      ...(saved.modelSource !== undefined ? { modelSource: saved.modelSource } : {}) }); } catch {}
     return saved;
   }
   async repository(root, context = {}) {
@@ -68,30 +71,39 @@ class PrAuditManager {
     catch (cause) { await snapshot.cleanup(); throw cause; }
   }
   async start(projectPath, prNumber, note = '', context = {}) {
-    let acquired;
+    let acquired; let accepted; let prepared; let setup; let scheduled = false;
     try {
       const root = canonicalProjectPath(projectPath); const key = projectKey(root); this.current(context);
       if (!root || !S.number(prNumber)) throw S.fail(); S.text(note, 2000, true);
-      const settings = { ...this.getSettings() };
-      if (settings.mode !== 'api' || settings.agentEnabled === false || !settings.apiKey || !settings.model) throw S.fail('MODEL_REQUIRED');
+      const settings = this.getSettings() || {};
+      if (settings.mode !== 'api' || settings.agentEnabled === false) throw S.fail('MODEL_REQUIRED');
+      if (typeof this.acceptBoundModel !== 'function' && context.modelBinding == null && (!settings.apiKey || !settings.model)) throw S.fail('MODEL_REQUIRED');
       if ([...this.runs.values()].some((r) => r.key === key) || this.runs.size >= 2) throw S.fail('BUSY');
       const auditRef = S.ref(); this.taskPool.acquire(auditRef, key); acquired = auditRef;
+      // Synchronous acceptance precedes storage, scheduling and every await.
+      accepted = acceptAuditModel(this.acceptBoundModel, { kind: 'pr-audit', taskId: auditRef, context, settings });
+      if (!accepted && !this.legacyModelInjected) throw modelFailure('MODEL_BOUND_CHAT_REQUIRED');
+      const runtimeSettings = accepted ? { mode: settings.mode, agentEnabled: settings.agentEnabled, compactMaxApproxTokens: settings.compactMaxApproxTokens } : { ...settings };
+      const model = String(accepted ? accepted.modelSource.model : settings.model).slice(0, 200);
       const row = this.save({ auditRef, projectKey: key, prNumber, createdAt: new Date(this.now()).toISOString(),
-        status: 'preparing', stale: false, model: String(settings.model).slice(0, 200) });
+        status: 'preparing', stale: false, model, ...(accepted ? { modelSource: accepted.modelSource } : {}) });
+      prepared = row; const persistence = this.store.persistenceStatus();
       const controller = new AbortController(); const abort = () => controller.abort(context.signal?.reason);
+      const record = { key, root, auditRef: row.auditRef, controller, modelBinding: accepted?.binding }; setup = { record, abort };
       context.signal?.addEventListener('abort', abort, { once: true }); if (context.signal?.aborted) abort();
-      const record = { key, root, auditRef: row.auditRef, controller }; this.runs.set(row.auditRef, record);
-      context.retainUntilFinished?.();
-      const timer = setTimeout(() => controller.abort(S.fail('TIMEOUT')), this.timeoutMs);
+      this.runs.set(row.auditRef, record); context.retainUntilFinished?.();
+      const timer = setTimeout(() => controller.abort(S.fail('TIMEOUT')), this.timeoutMs); setup.timer = timer;
       timer.unref?.();
       record.done = Promise.resolve().then(async () => {
         let snapshot;
         const ctx = { ...context, signal: controller.signal };
         try {
+          this.current(ctx); await context.beforeSnapshot?.(); this.current(ctx);
           snapshot = await this.capture(root, prNumber, row.auditRef, ctx);
           let current = this.save({ ...this.row(root, row.auditRef), status: 'running', source: snapshot.source, coverage: snapshot.coverage });
-          const generated = await this.runtime({ snapshot, settings, note, signal: controller.signal,
-            onProgress: ({ turn }) => { current = this.save({ ...this.row(root, row.auditRef), turns: turn }); } });
+          const generated = await this.runtime({ snapshot, settings: runtimeSettings, note, signal: controller.signal, timeoutMs: this.timeoutMs,
+            modelBinding: accepted?.binding, chatFn: accepted?.chatFn || this.chatFn, fetchFn: accepted ? undefined : this.fetchFn,
+            onProgress: ({ turn }) => { this.current(ctx); current = this.save({ ...this.row(root, row.auditRef), turns: turn }); } });
           this.current(ctx);
           const report = S.normalizeReport({ summary: generated.report.summary, findings: generated.report.findings.map((f) => ({
             priority: f.priority, title: f.title, body: f.body, path: f.path, side: f.side, line: f.line, startLine: f.startLine,
@@ -109,16 +121,29 @@ class PrAuditManager {
         } finally {
           clearTimeout(timer);
           try { await snapshot?.cleanup(); } finally {
-            this.runs.delete(row.auditRef);
-            this.taskPool.release(row.auditRef);
-            context.signal?.removeEventListener('abort', abort); context.release?.();
+            try { await accepted?.release(); } finally {
+              this.runs.delete(row.auditRef); this.taskPool.release(row.auditRef);
+              context.signal?.removeEventListener('abort', abort); context.release?.();
+            }
           }
         }
       });
       // Resource cleanup must run even if storage or an injected observer fails.
-      record.done.catch(() => {});
-      return { ok: true, auditRef: row.auditRef, persistence: this.store.persistenceStatus() };
-    } catch (cause) { if (acquired) this.taskPool.release(acquired); return S.error(cause); }
+      record.done.catch(() => {}); scheduled = true;
+      return { ok: true, auditRef: row.auditRef, persistence, ...(accepted ? { modelSource: accepted.modelSource } : {}) };
+    } catch (cause) {
+      if (scheduled) {
+        setup.record.controller.abort(cause); await setup.record.done.catch(() => {});
+      } else {
+        clearTimeout(setup?.timer);
+        if (setup) { this.runs.delete(setup.record.auditRef); context.signal?.removeEventListener('abort', setup.abort); }
+        if (prepared) { try { this.save({ ...prepared, status: 'failed', errorCode: S.error(cause).code, finishedAt: new Date(this.now()).toISOString() }); } catch {} }
+        try { await accepted?.release(); } catch { /* Do not replace the original safe rejection. */ }
+        if (acquired) this.taskPool.release(acquired);
+        if (setup) { try { context.release?.(); } catch {} }
+      }
+      return S.error(cause);
+    }
   }
   list(root, prNumber) {
     try {
@@ -126,7 +151,8 @@ class PrAuditManager {
       const rows = this.store.list(projectKey(canonicalProjectPath(root))).filter((r) => !prNumber || r.prNumber === prNumber)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       return { ok: true, projectKey: projectKey(canonicalProjectPath(root)), audits: rows.map((r) => ({ auditRef: r.auditRef, prNumber: r.prNumber, status: r.status, stale: r.stale,
-        headSha: r.source?.headSha, createdAt: r.createdAt, findingCount: r.report?.findings.length || 0, publicationStatus: r.publication?.status, errorCode: r.errorCode })),
+        headSha: r.source?.headSha, createdAt: r.createdAt, findingCount: r.report?.findings.length || 0, publicationStatus: r.publication?.status, errorCode: r.errorCode,
+        ...(r.modelSource !== undefined ? { modelSource: r.modelSource } : {}) })),
       persistence: this.store.persistenceStatus() };
     } catch (cause) { return S.error(cause); }
   }
@@ -291,8 +317,5 @@ class PrAuditManager {
     this.drafts.clear(); this.store.close();
   }
 }
-function numericUsage(value = {}) {
-  const bounded = (n) => Number.isFinite(n) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n))) : 0;
-  return { inputTokens: bounded(value.inputTokens), outputTokens: bounded(value.outputTokens), estimated: !!value.estimated };
-}
+function numericUsage(value = {}) { return S.summarizeUsage(value); }
 module.exports = { PrAuditManager, createPrAuditManager: (options) => new PrAuditManager(options) };

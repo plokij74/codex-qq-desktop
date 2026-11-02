@@ -19,6 +19,7 @@ const { createRemoteCiStore } = require('./remote-ci-store');
 const { createGithubCli } = require('./github-cli');
 const { createCiWatchManager } = require('./ci-watch-manager');
 const { validWatchRef, error: ciWatchError } = require('./ci-watch-state');
+const { isResolvedModelBinding } = require('./model-profiles');
 
 function error(code, message) {
   return { ok: false, code, error: String(message || code).slice(0, 500) };
@@ -120,7 +121,7 @@ function createEngineeringIpcHandlers(options = {}) {
   function getPrAudits() {
     if (!prAudits) prAudits = options.prAuditManager || createPrAuditManager({
       githubCli: options.githubCli, userDataPath: options.userDataPath, safeStorage: options.safeStorage,
-      getSettings: options.getSettings, mutationLock: options.withMutation,
+      getSettings: options.getSettings, acceptBoundModel: options.acceptBoundModel, mutationLock: options.withMutation,
       isProtected: (ref) => !prAuditRepairs || prAuditRepairs.protectsReport(ref) || !prAuditRechecks || prAuditRechecks.protectsReport(ref)
         || !prAuditRecheckRepairs || prAuditRecheckRepairs.protectsReport(ref),
       onEvent: (event) => options.onPrAuditEvent?.(event, [...(projectOwners.get(event.projectKey) || [])]),
@@ -194,12 +195,14 @@ function createEngineeringIpcHandlers(options = {}) {
       released = true; active.delete(abort); if (!active.size) remoteOwners.delete(owner);
       if (authorization) unregisterGate(owner, authorization.gate);
     };
-    const context = { signal: abort.signal, projectBindingId: payload.projectBindingId, ownerId: owner,
+    // The main-process model acceptor owns the same controller for the entire task,
+    // including snapshot capture and cleanup, not only the physical model request.
+    const context = { signal: abort.signal, abortController: abort, projectBindingId: payload.projectBindingId, ownerId: owner, sender: event.sender, binding,
+      ...(isResolvedModelBinding(binding.modelBinding) ? { modelBinding: binding.modelBinding } : {}),
       retainUntilFinished: () => { retained = true; }, release,
       isCurrent: () => !abort.signal.aborted && !event.sender?.isDestroyed?.() && getBinding(event, payload)?.projectPath === binding.projectPath };
     try {
       if (mutation) { authorization = permissionContext(event, payload, options.getSettings?.() || {}); Object.assign(context, authorization.options); }
-      await Promise.resolve();
       if (!context.isCurrent()) throw AuditState.fail('BINDING');
       const result = await fn(getPrAudits(), binding, context);
       if (!context.isCurrent()) throw AuditState.fail('BINDING');
@@ -230,7 +233,9 @@ function createEngineeringIpcHandlers(options = {}) {
       active.delete(abort); if (!active.size) remoteOwners.delete(owner);
       if (authorization) unregisterGate(owner, authorization.gate);
     };
-    const context = { ...authorization?.options, signal: abort.signal, projectBindingId: payload.projectBindingId,
+    const context = { ...authorization?.options, signal: abort.signal, abortController: abort,
+      projectBindingId: payload.projectBindingId, ownerId: owner, sender: event.sender, binding,
+      ...(binding.modelBinding !== undefined ? { modelBinding: binding.modelBinding } : {}),
       retainUntilFinished: () => { retained = true; }, release,
       isCurrent: () => !abort.signal.aborted && !event.sender?.isDestroyed?.() && getBinding(event, payload)?.projectPath === binding.projectPath };
     try {
@@ -416,6 +421,7 @@ function createEngineeringIpcHandlers(options = {}) {
         prAuditRecheckRepairManager: getPrAuditRecheckRepairs(),
         subagentRuntime: options.subagentRuntime,
         runLoop: options.runLoop,
+        acceptBoundModel: options.acceptBoundModel,
         getProfiles: (projectPath) => syncProfiles(projectPath).listProfiles(projectPath, { includeDisabled: true, includeCommand: true }),
         getSettings: options.getSettings,
         workspaceFingerprint: options.workspaceFingerprint,
@@ -490,9 +496,13 @@ function createEngineeringIpcHandlers(options = {}) {
   return {
     prAuditTrackingList: (event, payload) => auditRequest(event, payload, ['prNumber'], (_m, b, c) => getPrAuditTracking().list(b.projectPath, payload.prNumber, c)),
     prAuditTrackingGet: (event, payload) => auditRequest(event, payload, ['auditRef'], (_m, b, c) => getPrAuditTracking().get(b.projectPath, payload.auditRef, c)),
-    prAuditRecheckStart: (event, payload) => auditRequest(event, payload, ['resultId'], async (_m, b, c) => {
-      await refreshAuditRepairProtection(b.projectPath);
-      return getPrAuditRechecks().start(b.projectPath, payload.resultId, c);
+    prAuditRecheckStart: (event, payload) => auditRequest(event, payload, ['resultId'], (_m, b, c) => {
+      const rechecks = getPrAuditRechecks();
+      c.beforeSnapshot = () => refreshAuditRepairProtection(b.projectPath);
+      return rechecks.start(b.projectPath, payload.resultId, c).then(async (result) => {
+        if (!result.ok) await refreshAuditRepairProtection(b.projectPath);
+        return result;
+      });
     }),
     prAuditRecheckList: (event, payload) => auditRequest(event, payload, ['prNumber'], (_m, b, c) => getPrAuditRechecks().list(b.projectPath, payload.prNumber, c)),
     prAuditRecheckGet: (event, payload) => auditRequest(event, payload, ['recheckRef'], (_m, b, c) => getPrAuditRechecks().get(b.projectPath, payload.recheckRef, c)),
@@ -504,9 +514,13 @@ function createEngineeringIpcHandlers(options = {}) {
     }),
     prAuditRecheckRepairSource: (event, payload) => auditRequest(event, payload, ['recheckRepairRef'], (_m, b, c) => getPrAuditRecheckRepairs().source(b.projectPath, payload.recheckRepairRef, c)),
     prAuditRecheckUpdatePr: (event, payload) => auditRequest(event, payload, ['resultId', 'subject'], (_m, b, c) => getPrAuditRecheckRepairs().updatePr(b.projectPath, payload.resultId, payload.subject, c), true),
-    prAuditStart: (event, payload) => auditRequest(event, payload, ['prNumber', 'note'], async (m, b, c) => {
-      await refreshAuditRepairProtection(b.projectPath);
-      return m.start(b.projectPath, payload.prNumber, payload.note, c);
+    prAuditStart: (event, payload) => auditRequest(event, payload, ['prNumber', 'note'], (m, b, c) => {
+      getPrAuditRechecks(); // Preserve synchronous restoration even on a rejected model preflight.
+      c.beforeSnapshot = () => refreshAuditRepairProtection(b.projectPath);
+      return m.start(b.projectPath, payload.prNumber, payload.note, c).then(async (result) => {
+        if (!result.ok) await refreshAuditRepairProtection(b.projectPath);
+        return result;
+      });
     }),
     prAuditList: (event, payload) => auditRequest(event, payload, ['prNumber'], (m, b) => m.list(b.projectPath, payload.prNumber)),
     prAuditGet: (event, payload) => auditRequest(event, payload, ['auditRef'], (m, b) => m.get(b.projectPath, payload.auditRef)),
@@ -804,13 +818,10 @@ function createEngineeringIpcHandlers(options = {}) {
       if (payload.source?.kind === 'pr_review') return reviewRequest(event, payload,
         ['source', 'note', 'validationProfileId', 'sessionId'], (_m, b, c) => getRepairs().start(b.projectPath,
           { source: payload.source, note: payload.note, validationProfileId: payload.validationProfileId }, c), true);
-      const settings = options.getSettings ? options.getSettings() : {};
-      const context = permissionContext(event, payload, settings);
-      try {
-        if (Object.keys(payload).some((key) => !['projectBindingId', 'source', 'note', 'validationProfileId', 'sessionId'].includes(key))) return error('REPAIR_INVALID', '修复参数无效');
-        return await getRepairs().start(binding.projectPath, { source: payload.source, note: payload.note, ...(payload.validationProfileId ? { validationProfileId: payload.validationProfileId } : {}) }, { ...context.options, projectBindingId: payload.projectBindingId });
-      }
-      finally { unregisterGate(context.owner, context.gate); }
+      if (Object.keys(payload).some((key) => !['projectBindingId', 'source', 'note', 'validationProfileId', 'sessionId'].includes(key))) return error('REPAIR_INVALID', '修复参数无效');
+      return reviewRequest(event, payload, ['source', 'note', 'validationProfileId', 'sessionId'], (_m, b, c) =>
+        getRepairs().start(b.projectPath, { source: payload.source, note: payload.note,
+          ...(payload.validationProfileId ? { validationProfileId: payload.validationProfileId } : {}) }, c), true);
     }),
     repairRetry: (event, payload = {}) => withBinding(event, payload, async (binding) => {
       if (['pr_audit', 'pr_audit_recheck'].includes(getRepairs().store.get(payload.repairRef, projectKey(binding.projectPath))?.source.kind)) return auditRequest(event, payload,
@@ -818,10 +829,9 @@ function createEngineeringIpcHandlers(options = {}) {
       if (getRepairs().store.get(payload.repairRef, projectKey(binding.projectPath))?.source.kind === 'pr_review') return reviewRequest(event, payload,
         ['repairRef', 'note', 'sessionId'], (_m, b, c) => getRepairs().retry(b.projectPath, payload.repairRef, { note: payload.note }, c), true);
       if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');
-      const settings = options.getSettings ? options.getSettings() : {};
-      const context = permissionContext(event, payload, settings);
-      try { return await getRepairs().retry(binding.projectPath, String(payload.repairRef || ''), { note: payload.note }, { ...context.options, projectBindingId: payload.projectBindingId }); }
-      finally { unregisterGate(context.owner, context.gate); }
+      if (Object.keys(payload).some((key) => !['projectBindingId', 'repairRef', 'note', 'sessionId'].includes(key))) return error('REPAIR_INVALID', '修复参数无效');
+      return reviewRequest(event, payload, ['repairRef', 'note', 'sessionId'], (_m, b, c) =>
+        getRepairs().retry(b.projectPath, String(payload.repairRef || ''), { note: payload.note }, c), true);
     }),
     repairCancel: (event, payload = {}) => withBinding(event, payload, (binding) => {
       if (!isRepairRef(payload.repairRef)) return error('REPAIR_INVALID', '修复引用无效');

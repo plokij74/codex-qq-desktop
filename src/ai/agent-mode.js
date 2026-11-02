@@ -1,5 +1,8 @@
 /** Phase C.1 plan | agent mode helpers */
 
+const { isResolvedModelBinding } = require('./model-profiles');
+const { assistantContextPolicy } = require('./assistant-policy');
+
 const PLAN_BLOCKED_RISKS = new Set(['write', 'delete', 'terminal', 'mcp']);
 
 const PLAN_HIDDEN_TOOLS = new Set([
@@ -31,13 +34,19 @@ function normalizeAgentMode(value) {
   return value === 'plan' ? 'plan' : 'agent';
 }
 
-function shouldUseAgent({ settings, project } = {}) {
-  return Boolean(
-    settings?.mode === 'api'
-      && settings?.agentEnabled !== false
-      && settings?.apiKey
-      && (project?.path || settings?.memoryEnabled !== false)
-  );
+function shouldUseAgent({ settings, project, modelBinding } = {}) {
+  const enabled = settings?.mode === 'api'
+    && settings?.agentEnabled !== false
+    && (project?.path || settings?.memoryEnabled !== false);
+  if (modelBinding != null) {
+    if (!enabled || !isResolvedModelBinding(modelBinding)) return false;
+    const policy = assistantContextPolicy(modelBinding, project);
+    const toolMode = modelBinding.compatibility?.toolMode;
+    const supportsTools = toolMode === 'text-compat'
+      || (toolMode === 'native' && modelBinding.capabilities?.nativeTools?.state === 'supported');
+    return Boolean(policy.toolsAllowed && supportsTools);
+  }
+  return Boolean(enabled && settings?.apiKey);
 }
 
 /**
@@ -60,14 +69,23 @@ function filterToolsForMode(toolDefs, agentMode) {
   const list = Array.isArray(toolDefs) ? toolDefs : [];
   if (mode === 'plan') {
     return list.filter((t) => {
-      const name = t?.function?.name;
+      const name = toolName(t);
       if (!name) return false;
       if (PLAN_HIDDEN_TOOLS.has(name)) return false;
       if (String(name).startsWith('mcp_')) return false;
       return true;
     });
   }
-  return list.filter((t) => t?.function?.name !== 'submit_plan');
+  return list.filter((t) => toolName(t) && toolName(t) !== 'submit_plan');
+}
+
+/** Accept the legacy and canonical schemas without treating conflicting names as a grant. */
+function toolName(tool) {
+  const canonical = tool?.name;
+  const legacy = tool?.function?.name;
+  if (canonical !== undefined && legacy !== undefined && canonical !== legacy) return null;
+  const name = canonical === undefined ? legacy : canonical;
+  return typeof name === 'string' && name ? name : null;
 }
 
 function makePlanId() {
@@ -109,6 +127,7 @@ module.exports = {
   shouldUseAgent,
   isPlanBlockedRisk,
   filterToolsForMode,
+  toolName,
   makePlanId,
   buildApproveExecutionMessage,
   truncatePlanMarkdown,

@@ -76,7 +76,8 @@ function stopReason(result, requestedMax) {
 
 function createMcpSamplingController(options = {}) {
   const settings = options.settings || {};
-  const chatFn = typeof options.chatFn === 'function' ? options.chatFn : chatCompletionMessage;
+  const modelBinding = options.modelBinding;
+  const chatFn = typeof options.chatFn === 'function' ? options.chatFn : modelBinding ? null : chatCompletionMessage;
   const gate = options.gate;
   const onEvent = typeof options.onEvent === 'function' ? options.onEvent : null;
   const onUsage = typeof options.onUsage === 'function' ? options.onUsage : null;
@@ -92,9 +93,12 @@ function createMcpSamplingController(options = {}) {
   async function createMessage(server, rawParams = {}, requestSignal, callOptions = {}) {
     const cfg = options.serverConfig?.(server) || options.server || {};
     if (cfg.sampling?.enabled !== true && options.enabled !== true) throw samplingError(ERROR_CODES.DISABLED, 'MCP sampling disabled');
-    if (settings.mode !== 'api' || !settings.baseUrl || !settings.model) throw samplingError(ERROR_CODES.UNAVAILABLE, 'MCP sampling requires API mode');
+    if (modelBinding != null && !require('./model-profiles').isResolvedModelBinding(modelBinding)) throw samplingError('MODEL_BINDING_INVALID', 'A main-process model binding is required');
+    if (modelBinding && typeof chatFn !== 'function') throw samplingError('MODEL_BOUND_CHAT_REQUIRED', 'A bound model client is required');
+    if (settings.mode !== 'api' || (!modelBinding && (!settings.baseUrl || !settings.model))) throw samplingError(ERROR_CODES.UNAVAILABLE, 'MCP sampling requires API mode');
+    if (signal?.aborted && callOptions.detached !== true || requestSignal?.aborted) throw samplingError(ERROR_CODES.CANCELLED, 'MCP sampling cancelled');
     const request = validateRequest(rawParams);
-    if (request.includeContext === 'allServers') throw samplingError(ERROR_CODES.CONTEXT_DENIED, 'MCP sampling context denied');
+    if (request.includeContext === 'allServers' || (modelBinding && request.includeContext === 'thisServer' && modelBinding.knowledge?.projectContext !== true)) throw samplingError(ERROR_CODES.CONTEXT_DENIED, 'MCP sampling context denied');
     if (calls >= MAX_CALLS_PER_RUN || outputTokens >= MAX_TOTAL_OUTPUT_TOKENS) throw samplingError(ERROR_CODES.LIMIT, 'MCP sampling limit reached');
 
     const serverName = String(server || cfg.name || '').trim().slice(0, 128);
@@ -142,6 +146,7 @@ function createMcpSamplingController(options = {}) {
       }
       if (!result?.allowed) throw samplingError(ERROR_CODES.APPROVAL_REQUIRED, result?.reason || 'MCP sampling approval required');
     };
+    try {
     await authorize(`server:${serverName}`, `MCP sampling request from ${serverName}`, request.includeContext);
     let contextSummary = '';
     if (request.includeContext === 'thisServer') {
@@ -182,12 +187,10 @@ function createMcpSamplingController(options = {}) {
     calls += 1;
     try {
       const requestPromise = Promise.resolve().then(() => chatFn({
-        baseUrl: settings.baseUrl,
-        apiKey: settings.apiKey,
-        model: settings.model,
+        ...(modelBinding ? { modelBinding } : { baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: settings.model }),
         messages,
         temperature: request.temperature,
-        stop: request.stopSequences,
+        ...((!modelBinding || request.stopSequences.length) ? { stop: request.stopSequences } : {}),
         maxTokens: request.maxTokens,
         signal: controller?.signal || effectiveSignal,
         stream: false,
@@ -196,11 +199,12 @@ function createMcpSamplingController(options = {}) {
       }));
       const result = await Promise.race([requestPromise, timeoutPromise]);
       if (timedOut) throw timeoutError;
-      if (result?.tool_calls?.length) throw samplingError(ERROR_CODES.CONTENT_INVALID, 'MCP sampling model returned tools');
+      if (effectiveSignal?.aborted || controller?.signal?.aborted) throw samplingError(ERROR_CODES.CANCELLED, 'MCP sampling cancelled');
+      if (result?.tool_calls?.length || result?.toolCalls?.length) throw samplingError(ERROR_CODES.CONTENT_INVALID, 'MCP sampling model returned tools');
       const content = textContent(result?.content);
       if (!content || content.length > MAX_RESPONSE_CHARS || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(content)) throw samplingError(ERROR_CODES.CONTENT_INVALID, 'MCP sampling model returned invalid text');
       const usage = normalizeUsage(result?.usage) || estimateUsage(messages, content);
-      const usedOutput = Math.max(0, Number(usage.outputTokens) || 0);
+      const usedOutput = Math.max(0, Number.isFinite(usage.outputTokens) ? usage.outputTokens : Math.ceil(content.length / 4));
       if (usedOutput > request.maxTokens) throw samplingError(ERROR_CODES.CONTENT_INVALID, 'MCP sampling output exceeded maxTokens');
       if (outputTokens + usedOutput > MAX_TOTAL_OUTPUT_TOKENS) throw samplingError(ERROR_CODES.LIMIT, 'MCP sampling total limit reached');
       outputTokens += usedOutput;
@@ -216,9 +220,8 @@ function createMcpSamplingController(options = {}) {
         cost: computeCost(usage, pricing),
         currency: String(settings.usageCurrency || '$'),
       };
-      onUsage?.(usageEvent);
-      onEvent?.(usageEvent);
-      return { role: 'assistant', content, stopReason: stopReason(result, request.maxTokens), model: String(settings.model || ''), ...(result?.usage ? { usage: result.usage } : {}) };
+      if (!modelBinding) { onUsage?.(usageEvent); onEvent?.(usageEvent); }
+      return { role: 'assistant', content, stopReason: stopReason(result, request.maxTokens), model: String(modelBinding ? modelBinding.model : settings.model || ''), ...(result?.usage ? { usage: result.usage } : {}) };
     } catch (error) {
       if (timedOut) throw timeoutError;
       if (error?.code?.startsWith?.('MCP_SAMPLING_')) throw error;
@@ -228,6 +231,8 @@ function createMcpSamplingController(options = {}) {
     } finally {
       clearTimeout(timer);
       effectiveSignal?.removeEventListener?.('abort', abort);
+    }
+    } finally {
       for (const cleanup of abortForwarders) cleanup();
     }
   }

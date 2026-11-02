@@ -76,7 +76,7 @@ PTY、OS 隔离、语义索引、子 Agent 续跑、会话导入、回滚、运�
 
 ## E1：基础断点修复与虚假展示止血（已交付）
 
-设计规格见 [E1 spec](docs/superpowers/specs/2026-10-15-phase-e1-basic-break-and-bleeding-stop-design.md)。
+设计规格见 [E1 spec](<../specs/2026-10-15-phase-e1-basic-break-and-bleeding-stop-design.md>)。
 前置：无。状态：已完成，测试全绿（16/16）。
 
 - 修复 `cloneMcpOAuth()` 中误放的命令判断与未定义 `lower/cmd`；分别验证 OAuth 配置读写和 `/mcp-prompts`、`/mcp-prompt` 的真实路由，命令可用。
@@ -85,7 +85,7 @@ PTY、OS 隔离、语义索引、子 Agent 续跑、会话导入、回滚、运�
 - “创建并开始”在有说明时立即创建并调用 `sendMessage()` 启动执行；空说明时明确创建草稿；增加双击防重，遇忙/失败保留输入。
 - 为 Plan 完成后审批丢失建立标准化回归测试（`tests/e1-plan-approval-gap.test.js`），固化基线，交由 E2 完整闭环。
 - 停止插件假启用、站点假健康、好友假在线、附件假理解。把初始 KV 分析话术、示例项目/任务清楚标为示例，不把预置内容当成真实检查结果；不删除用户修改过的历史记录。
-- 单独跟踪全量测试的不稳定失败，建立 [E1 不稳定用例跟踪日志](docs/superpowers/plans/2026-10-15-e1-flaky-test-tracking.md)，保留底层 Git 错误、超时及隔离条件，不通过放宽断言隐藏问题。
+- 单独跟踪全量测试的不稳定失败，建立 [E1 不稳定用例跟踪日志](<2026-10-15-e1-flaky-test-tracking.md>)，保留底层 Git 错误、超时及隔离条件，不通过放宽断言隐藏问题。
 
 验收：三套专项测试（`tests/e1-direct-defects.test.js`、`tests/e1-plan-approval-gap.test.js`、`tests/e1-false-display-stop.test.js` 共 16 项）全部通过；关联回归套件（41 项）全部通过。
 
@@ -104,7 +104,7 @@ PTY、OS 隔离、语义索引、子 Agent 续跑、会话导入、回滚、运�
 
 ## E3：权限、OS 隔离与秘密管理
 
-设计规格见 [E3 spec](docs/superpowers/specs/2026-10-16-phase-e3-permissions-os-isolation-secrets-design.md)。实施计划见 [E3 plan](docs/superpowers/plans/2026-10-16-phase-e3-permissions-os-isolation-secrets.md)。
+设计规格见 [E3 spec](<../specs/2026-10-16-phase-e3-permissions-os-isolation-secrets-design.md>)。实施计划见 [E3 plan](<2026-10-16-phase-e3-permissions-os-isolation-secrets.md>)。
 前置：E2。
 
 - 在既有应用层权限 Gate 上增加明确的执行策略与 OS 级隔离后端；分别声明文件、网络、进程、环境变量和资源边界。
@@ -116,6 +116,9 @@ PTY、OS 隔离、语义索引、子 Agent 续跑、会话导入、回滚、运�
 验收：越界读取/写入/网络/环境访问被真实阻止；撤权、取消、超时后子进程和资源正确回收；现有低风险工具不被无意破坏。
 
 ## E4：模型能力管理与真实助手/好友会话
+
+设计规格见 [E4 spec](<../specs/2026-10-29-phase-e4-model-capabilities-assistants-design.md>)。实施计划见 [E4 plan](<2026-10-29-phase-e4-model-capabilities-assistants.md>)。
+本期首批协议确定为 OpenAI-compatible Chat Completions、OpenAI Responses、Anthropic Messages；三个协议分别实现和验收。相关代码已实施，E4 离线专项为 `691/691` 通过；完整回归、隔离 Electron 证据与未关闭项见[实现与验证记录](<2026-10-30-e4-implementation-verification.md>)。未请求真实端点，不将离线 fixture 当成 E4 正式验收；真实联系人仍由 E26 交付。
 
 前置：E2、E3。
 
@@ -523,7 +526,7 @@ E1–E26 的真实证据 → E27
 - [x] E1 基础断点与展示止血
 - [x] E2 消息、Plan 与工具轨迹
 - [ ] E3 权限、OS 隔离与秘密管理（Windows 原生生产后端及专项已补齐，全量稳定性与最终验收仍开放；见[最新记录](<2026-10-28-e2-e3-frontgate-closure.md>)）
-- [ ] E4 模型能力与真实助手
+- [ ] E4 模型能力与真实助手（代码与离线专项已实施，真实端点验收仍待授权；见[实现与验证记录](<2026-10-30-e4-implementation-verification.md>)）
 - [ ] E5 文本附件
 - [ ] E6 图片多模态
 - [ ] E7 复杂文档与媒体解析
@@ -548,4 +551,4 @@ E1–E26 的真实证据 → E27
 - [ ] E26 真实通信与语音视频
 - [ ] E27 全功能验收发布
 
-**当前说明（2026-10-28）：** E2 即时防重放、E3 Windows 原生生产后端及专项已经补齐；完整检查点/恢复仍按 E10/E12/E13/E23 规划留后，既有全量稳定性由 G43/E1 跟踪并在最终验收关闭。[归属、测试与限制记录](<2026-10-28-e2-e3-frontgate-closure.md>)。阶段勾选不是实际执行或全量验收证明；E3 全量未通过仍保持开放，不宣称 E4–E27 已开发。
+**当前说明（2026-11-02）：** E2 即时防重放、E3 Windows 原生生产后端及专项已经补齐；完整检查点/恢复仍按 E10/E12/E13/E23 规划留后，既有全量稳定性由 G43/E1 跟踪并在最终验收关闭。[归属、测试与限制记录](<2026-10-28-e2-e3-frontgate-closure.md>)。E4 相关代码与离线专项已实施，实际全量/Electron 与真实端点边界见[实现与验证记录](<2026-10-30-e4-implementation-verification.md>)。阶段勾选不是实际执行或全量验收证明；E3 历史全量稳定性仍开放，不宣称 E4 正式验收或 E5–E27 已开发。

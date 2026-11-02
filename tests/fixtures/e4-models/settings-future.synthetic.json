@@ -1,0 +1,13 @@
+{
+  "fixtureKind": "isolated synthetic unknown future schema; no real credentials",
+  "mode": "api",
+  "syntheticUnknownSetting": { "preserved": true },
+  "modelRegistry": {
+    "schemaVersion": 88,
+    "revision": 4,
+    "defaultModelProfileId": "model_future",
+    "providers": [],
+    "models": [],
+    "assistants": []
+  }
+}

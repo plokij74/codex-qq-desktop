@@ -6,9 +6,10 @@ const S = require('./pr-audit-state');
 const pick = (value, fields) => Object.fromEntries(fields.filter((key) => value?.[key] !== undefined).map((key) => [key, value[key]]));
 function durableRecord(raw) {
   const row = pick(raw, ['auditRef', 'projectKey', 'prNumber', 'createdAt', 'finishedAt', 'status', 'stale', 'errorCode', 'turns', 'model']);
+  if (raw.modelSource !== undefined) row.modelSource = S.normalizeModelSource(raw.modelSource);
   if (raw.coverage) row.coverage = { ...pick(raw.coverage, ['total', 'scoped', 'outside', 'reviewed']),
     skipped: raw.coverage.skipped.map((s) => pick(s, ['path', 'reason'])) };
-  if (raw.usage) row.usage = pick(raw.usage, ['inputTokens', 'outputTokens', 'estimated']);
+  if (raw.usage) row.usage = pick(raw.usage, ['inputTokens', 'outputTokens', 'estimated', 'source']);
   if (raw.source) row.source = pick(raw.source, ['repoKey', 'prNumber', 'baseSha', 'headSha', 'mergeBaseSha', 'baseRefName', 'headRefName', 'descriptionHash', 'changedFiles', 'prefix']);
   if (raw.report) row.report = { summary: raw.report.summary, findings: raw.report.findings.map((f) => pick(f, ['findingId', 'priority', 'title', 'body', 'path', 'contextPath', 'side', 'line', 'startLine'])) };
   if (raw.publication) row.publication = { ...pick(raw.publication, ['status', 'publicationRef', 'actorId', 'commitId', 'bodyHash', 'reviewId', 'createdAt', 'confirmedAt', 'errorCode']),

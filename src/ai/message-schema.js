@@ -14,6 +14,35 @@ const SCHEMA_VERSION = 2;
 
 const { DEFAULT_BUDGETS } = require('./task-contract');
 
+const MODEL_SOURCE_KINDS = new Set(['api', 'local-demo', 'legacy-demo', 'unknown']);
+const MODEL_SOURCE_PROTOCOLS = new Set(['openai-chat-completions', 'openai-responses', 'anthropic-messages']);
+
+function normalizeModelSource(raw) {
+  if (!raw || typeof raw !== 'object' || !MODEL_SOURCE_KINDS.has(raw.kind)) return undefined;
+  const result = { kind: raw.kind };
+  for (const key of ['assistantId', 'assistantName', 'providerId', 'modelProfileId', 'model', 'runId', 'clientRequestId']) {
+    const value = typeof raw[key] === 'string' ? raw[key].trim().slice(0, key === 'model' ? 256 : 128) : '';
+    if (value) result[key] = value;
+  }
+  if (MODEL_SOURCE_PROTOCOLS.has(raw.protocol)) result.protocol = raw.protocol;
+  for (const key of ['providerRevision', 'modelRevision', 'assistantRevision']) {
+    if (Number.isSafeInteger(raw[key]) && raw[key] >= 0) result[key] = raw[key];
+  }
+  return result;
+}
+
+function normalizeMessageModelSource(message) {
+  const next = { ...message };
+  delete next.source;
+  delete next.providerState;
+  delete next.apiKey;
+  delete next.credential;
+  const modelSource = normalizeModelSource(next.modelSource);
+  if (modelSource) next.modelSource = modelSource;
+  else delete next.modelSource;
+  return next;
+}
+
 const PART_TYPES = Object.freeze({
   TEXT: 'text',
   ATTACHMENT_REF: 'attachment_ref',
@@ -93,7 +122,7 @@ function createAttachmentId() {
  */
 function stripSecrets(value, depth = 0) {
   if (depth > 12) return '[TRUNCATED]';
-  if (typeof value === 'string') return truncateString(require('./secret-manager').redactSecrets(value), 64000);
+  if (typeof value === 'string') return truncateString(require('./secret-manager').redactSecrets(value), 65536);
   if (Array.isArray(value)) return value.slice(0, 256).map((v) => stripSecrets(v, depth + 1));
   if (!value || typeof value !== 'object') return value;
   const out = {};
@@ -297,7 +326,7 @@ function createMessageV2(roleOrOpts = {}, contentOrParts = null, extraOpts = {})
 
   const planPart = parts.find((p) => p && p.type === PART_TYPES.PLAN);
 
-  return {
+  return normalizeMessageModelSource({
     ...opts,
     id: String(opts.id || createMessageId()),
     sessionId: opts.sessionId ? String(opts.sessionId) : null,
@@ -324,7 +353,7 @@ function createMessageV2(roleOrOpts = {}, contentOrParts = null, extraOpts = {})
     planMarkdown: opts.planMarkdown || planPart?.markdown || undefined,
     planSteps: Array.isArray(opts.planSteps) ? opts.planSteps : (planPart?.steps || undefined),
     planStatus: opts.planStatus || planPart?.status || undefined,
-  };
+  });
 }
 
 /**
@@ -355,7 +384,7 @@ function normalizeMessage(msg) {
 
   // Already v2
   if (msg.schemaVersion === SCHEMA_VERSION && Array.isArray(msg.parts)) {
-    return {
+    return normalizeMessageModelSource({
       ...msg,
       id: msg.id || createMessageId(),
       parts: msg.parts.map(normalizePart),
@@ -363,7 +392,7 @@ function normalizeMessage(msg) {
         ? msg.trajectory.map(normalizeTrajectoryItem).filter(Boolean).slice(-LIMITS.MAX_TRAJECTORY_ITEMS)
         : [],
       content: msg.content != null && typeof msg.content === 'string' ? msg.content : extractTextFromParts(msg.parts),
-    };
+    });
   }
 
   // V1 migration
@@ -459,6 +488,7 @@ function projectToUiModel(msg) {
     compact: normalized.compact,
     compactAt: normalized.compactAt,
     compactedCount: normalized.compactedCount,
+    modelSource: normalizeModelSource(normalized.modelSource),
     isUser: normalized.role === 'user',
     isAssistant: normalized.role === 'assistant',
   };
@@ -577,6 +607,7 @@ function projectToStorageJson(msg) {
     planMarkdown: normalized.planMarkdown,
     planSteps: normalized.planSteps,
     planStatus: normalized.planStatus,
+    modelSource: normalizeModelSource(normalized.modelSource),
   });
 }
 
@@ -606,6 +637,7 @@ module.exports = {
   normalizeTrajectoryItem,
   createMessageV2,
   normalizeMessage,
+  normalizeModelSource,
   migrateV1ToV2: normalizeMessage,
   migrateSessionMessages,
   projectToUiModel,

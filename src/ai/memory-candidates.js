@@ -92,19 +92,23 @@ function parseCandidateResponse(raw, { transcript, limit = MAX_CANDIDATES } = {}
 }
 
 async function generateMemoryCandidates({
-  transcript, settings, limit, chatFn, signal, onUsage,
+  transcript, settings, modelBinding, limit, chatFn, signal, onUsage,
 } = {}) {
+  if (modelBinding != null && !require('./model-profiles').isResolvedModelBinding(modelBinding)) throw Object.assign(new Error('候选提炼需要主进程模型绑定。'), { code: 'MODEL_BINDING_INVALID' });
+  if (signal?.aborted) throw Object.assign(new Error('已停止'), { code: 'ABORTED' });
   const s = settings || {};
   const cap = Math.max(0, Math.min(MAX_CANDIDATES, Math.floor(Number(limit) || 0)));
   const text = String(transcript ?? '').trim();
   if (
     s.memoryEnabled === false
+    || (modelBinding && modelBinding.knowledge.projectMemory !== true)
     || s.memoryCandidateEnabled === false
     || s.mode !== 'api'
     || cap === 0
     || !text
   ) return [];
 
+  if (modelBinding && typeof chatFn !== 'function') throw Object.assign(new Error('候选提炼缺少绑定的模型客户端。'), { code: 'MODEL_BOUND_CHAT_REQUIRED' });
   const messages = [
     { role: 'system', content: buildMemoryCandidateSystemPrompt() },
     { role: 'user', content: text.slice(0, TRANSCRIPT_MAX) },
@@ -113,7 +117,7 @@ async function generateMemoryCandidates({
   let rawUsage = null;
   if (typeof chatFn === 'function') {
     const response = await chatFn({
-      baseUrl: s.baseUrl, apiKey: s.apiKey, model: s.model,
+      ...(modelBinding ? { modelBinding } : { baseUrl: s.baseUrl, apiKey: s.apiKey, model: s.model }),
       temperature: 0.1, signal, messages,
     });
     if (response && typeof response === 'object') {
@@ -130,8 +134,9 @@ async function generateMemoryCandidates({
     content = msg?.content || '';
     rawUsage = msg?.usage ?? null;
   }
+  if (signal?.aborted) throw Object.assign(new Error('已停止'), { code: 'ABORTED' });
   const output = String(content ?? '').trim();
-  if (typeof onUsage === 'function') {
+  if (!modelBinding && typeof onUsage === 'function') {
     try {
       const result = onUsage({ rawUsage, messages, content: output });
       if (result && typeof result.catch === 'function') result.catch(() => {});

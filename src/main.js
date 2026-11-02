@@ -9,9 +9,14 @@ const {
   clampMemorySettings,
   normalizeDomainList,
   sanitizePricing,
+  getSettingsSecretManager,
 } = require('./ai/settings');
+const { createModelIpcHandlers, registerModelIpc } = require('./ai/model-ipc');
+const { createForegroundRuntime, publicModelSource } = require('./ai/model-runtime');
+const { createModelChatFunction, preflightModelRequest } = require('./ai/model-router');
+const { buildModelUsageEvent } = require('./ai/model-usage');
+const { assistantContextPolicy, assertAssistantToolAllowed, filterAssistantTools } = require('./ai/assistant-policy');
 const { generateLocalReply } = require('./ai/local-mock');
-const { chatCompletionMessage } = require('./ai/openai-compatible');
 const {
   runAgentLoop,
   applyWriteFencesWithGate,
@@ -24,6 +29,39 @@ const { TaskHandle, TASK_KINDS, createTaskEventEnvelope } = require('./ai/task-c
 const { PlanStateManager } = require('./ai/plan-state');
 const { authorizeHostExecution } = require('./ai/host-execution');
 const { redactSecrets } = require('./ai/secret-manager');
+const { createModelTextRedactor, redactModelPartialOutput } = require('./ai/model-text-redaction');
+const { publicModelError } = require('./ai/model-errors');
+const RUN_BUSINESS_ERRORS = Object.freeze({
+  BUSY: '已有前台任务运行或清理中，请先等待其结束。',
+  CONFIG_CONFLICT: '模型配置已改变，请核对最新配置后重新发送。',
+  CONFIG_IN_USE: '模型配置仍在使用，请等待运行与清理完成。',
+  ASSISTANT_IDENTITY_INVALID: '演示联系人不能调用模型；请新建 AI 助手会话。',
+  ASSISTANT_TOOL_DENIED: '此助手未获准使用请求的工具。',
+  ASSISTANT_PROJECT_MISMATCH: '此助手关联的项目与当前授权项目不一致。',
+  PROJECT_BINDING_INVALID: '项目绑定已失效，请重新打开项目。',
+  TOOL_PERMISSION_DENIED: '操作未获授权，请检查当前权限。',
+  PLAN_BINDING_CHANGED: '模型、助手、权限或项目绑定已改变，请重新生成计划。',
+  PLAN_NOT_FOUND: '计划不存在，请重新生成。',
+  PLAN_NOT_PROPOSED: '计划已处理或过期，请重新生成。',
+  PLAN_EXECUTION_ALREADY_STARTED: '计划执行已开始，请检查现场并生成新计划。',
+  PLAN_EXECUTION_FAILED: '计划执行未完成，请检查现场并生成新计划。',
+  PLAN_APPROVAL_FAILED: '无法接受计划执行，请检查绑定并重新生成计划。',
+  INVALID_BINDING: '计划缺少可信的会话、项目或发送者绑定。',
+  INVALID_CLAIM: '计划执行凭证无效，请重新生成计划。',
+  DUPLICATE_PLAN: '计划标识已存在，请重新生成计划。',
+});
+function publicRunError(error, modelSource) {
+  let code;
+  try { code = Object.getOwnPropertyDescriptor(error || {}, 'code')?.value; } catch { /* no untrusted getter */ }
+  const safeMessage = typeof code === 'string' && Object.hasOwn(RUN_BUSINESS_ERRORS, code) ? RUN_BUSINESS_ERRORS[code] : undefined;
+  return publicModelError(error, { modelSource, redactMessage: redactModelPartialOutput, redactPartial: redactModelPartialOutput,
+    ...(safeMessage ? { preserveCodes: [code], safeMessage } : {}) });
+}
+function busyRunResult() {
+  const projected = publicRunError(Object.assign(new Error(RUN_BUSINESS_ERRORS.BUSY), { code: 'BUSY' }));
+  return { ...projected, ok: false, error: projected.safeMessage };
+}
+const modelTextStreams = new WeakMap();
 const { runTerminal } = require('./ai/terminal');
 const {
   listTree,
@@ -83,7 +121,7 @@ const { createWorktreeIpcHandlers } = require('./ai/worktree-ipc');
 const { createEngineeringIpcHandlers } = require('./ai/engineering-ipc');
 const { createCiWatchNotifier } = require('./ai/ci-watch-notifications');
 const { createSubagentRuntime } = require('./ai/subagent-runtime');
-const { projectKey } = require('./ai/project-index');
+const { projectKey, canonicalProjectPath } = require('./ai/project-index');
 const {
   usageFilePath,
   appendRecord,
@@ -101,6 +139,9 @@ const AGENT_MODES = new Set(['plan', 'agent']);
  * Renderer history keeps the original text/parts (not this expanded copy).
  */
 function messagesForModel(messages, projectPath) {
+  if (Array.isArray(messages) && messages.some((message) => message?.role === 'system')) {
+    throw Object.assign(new Error('会话历史不能提供主机 system 指令；请在助手设置中配置提示词。'), { code: 'MODEL_MESSAGE_ROLE_INVALID' });
+  }
   return projectToModelMessages(messages, {
     projectPath,
     expandAtRefs,
@@ -112,6 +153,210 @@ function messagesForModel(messages, projectPath) {
  * @type {{ abort: AbortController, gate: ReturnType<typeof createPermissionGate>, runId: string, sender: Electron.WebContents } | null}
  */
 let activeRun = null;
+const foregroundModels = createForegroundRuntime({ newRunId: makeRunId });
+const backgroundModelBindings = new Set();
+const backgroundModelBindingRefs = new Map();
+const activeModelRequests = new Map();
+let modelIpc = null;
+let modelDiagnostics = null;
+
+function retainBackgroundModelBinding(binding) {
+  backgroundModelBindingRefs.set(binding, (backgroundModelBindingRefs.get(binding) || 0) + 1);
+  backgroundModelBindings.add(binding);
+}
+
+function releaseBackgroundModelBinding(binding) {
+  const remaining = (backgroundModelBindingRefs.get(binding) || 0) - 1;
+  if (remaining > 0) backgroundModelBindingRefs.set(binding, remaining);
+  else {
+    backgroundModelBindingRefs.delete(binding);
+    backgroundModelBindings.delete(binding);
+  }
+}
+
+function getModelDiagnostics() {
+  if (modelDiagnostics) return modelDiagnostics;
+  const { createModelDiagnosticService } = require('./ai/model-diagnostics');
+  modelDiagnostics = createModelDiagnosticService({
+    resolveCredential: (binding) => getModelIpc().resolveCredential(binding),
+    onEvent: (sender, event) => safeSend(sender, 'models:diagnostic-event', event),
+    onUsage: ({ binding, attempt }) => {
+      const settings = modelSettings();
+      const usage = buildModelUsageEvent({ binding, settings, attempt, kind: 'model-diagnostic' });
+      if (usage) persistUsageEvent(settings, binding.sessionId, usage);
+    },
+    applyResult: (result) => {
+      const registry = modelSettings().modelRegistry;
+      const model = registry.models.find((entry) => entry.id === result.modelProfileId);
+      const provider = model && registry.providers.find((entry) => entry.id === model.providerId);
+      if (!model || !provider || require('./ai/model-profiles').computeBindingRevision(provider, model) !== result.bindingRevision) return { stale: true };
+      return getModelIpc().applyDiagnosticResult(result);
+    },
+    onRetain: retainBackgroundModelBinding,
+    onRelease: releaseBackgroundModelBinding,
+  });
+  return modelDiagnostics;
+}
+
+function startModelDiagnosis(event, payload, binding) {
+  return getModelDiagnostics().start({ binding, checks: payload.checks, sender: event.sender });
+}
+
+function modelSettings() { return loadSettings(userDataPath(), { resolveLegacyApiKey: false }); }
+function getModelIpc() {
+  if (modelIpc) return modelIpc;
+  modelIpc = createModelIpcHandlers({
+    getSettings: modelSettings,
+    saveSettings: (partial, options) => saveSettings(userDataPath(), partial, options),
+    getSecretManager: () => getSettingsSecretManager(userDataPath()),
+    authorizeSender: (event) => BrowserWindow.getAllWindows().some((win) => !win.isDestroyed() && win.webContents === event.sender),
+    isInUse: (query) => [foregroundModels.current?.binding, ...backgroundModelBindings, ...activeModelRequests.keys()].some((binding) => binding && Object.entries(query).every(([key, value]) => binding[key] === value)),
+    startDiagnosis: startModelDiagnosis,
+    cancelDiagnosis: (event, payload) => modelDiagnostics ? modelDiagnostics.cancel({
+      diagnosticId: payload?.diagnosticId, sessionId: payload?.sessionId,
+      runId: payload?.runId, clientRequestId: payload?.clientRequestId,
+      senderId: event.sender.id,
+    }) : { ok: false, code: 'DIAGNOSTIC_TARGET_MISMATCH' },
+    onRegistryChange: (_before, after) => {
+      const { computeBindingRevision } = require('./ai/model-profiles');
+      for (const plan of planState.plans.values()) {
+        if (!plan.bindingRevision || !['proposed', 'executing'].includes(plan.status)) continue;
+        const model = after.models.find((entry) => entry.id === plan.modelProfileId);
+        const provider = model && after.providers.find((entry) => entry.id === model.providerId);
+        const assistant = after.assistants.find((entry) => entry.id === plan.assistantId);
+        if (!model || !provider || !assistant || assistant.archived || assistant.revision !== Number(plan.assistantRevision)
+          || model.revision !== Number(plan.modelRevision) || provider.revision !== Number(plan.providerRevision)
+          || computeBindingRevision(provider, model) !== plan.bindingRevision) planState.expireBinding({ planId: plan.planId });
+      }
+      const lease = foregroundModels.current;
+      const bindings = new Set([lease?.binding, ...activeModelRequests.keys()]);
+      for (const binding of bindings) {
+        if (!binding || !assistantPermissionsRevoked(binding.assistant, after.assistants.find((assistant) => assistant.id === binding.assistantId))) continue;
+        if (lease?.binding === binding) {
+          lease.abort.abort();
+          try { lease.gate?.cancelPending('助手权限已撤销'); } catch { /* old permission cannot survive */ }
+        }
+        for (const controller of activeModelRequests.get(binding) || []) controller.abort();
+      }
+      // Metadata revisions can change after successful observed text evidence too.
+      // Notify all live renderers without disclosing any registry/vault contents.
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) safeSend(win.webContents, 'models:registry-changed', { revision: after.revision });
+      }
+    },
+  });
+  return modelIpc;
+}
+
+/** Resolve file-system and model identities separately; renderer paths are never authority. */
+function resolveModelContext(event, payload = {}, metadata = {}) {
+  if (payload.identityType === 'demo-contact') throw Object.assign(new Error('演示联系人不能调用模型；请新建 AI 助手会话。'), { code: 'ASSISTANT_IDENTITY_INVALID' });
+  const token = typeof payload.projectBindingId === 'string' ? payload.projectBindingId : '';
+  const requestedPath = payload.project?.path || payload.projectPath || '';
+  const trustedProject = token ? worktreeIpc.resolveBinding(event, { projectBindingId: token }) : null;
+  if ((token || requestedPath) && (!trustedProject || (requestedPath && canonicalDirectory(requestedPath) !== trustedProject.projectPath))) throw Object.assign(new Error('项目绑定已失效，请重新打开项目。'), { code: 'PROJECT_BINDING_INVALID' });
+  const project = trustedProject ? { id: trustedProject.projectId, path: trustedProject.projectPath, name: payload.project?.name || path.basename(trustedProject.projectPath) } : null;
+  const binding = getModelIpc().resolveBinding(event, {
+    sessionId: String(payload.sessionId || ''), assistantId: payload.assistantId || 'assistant_codex',
+    modelProfileId: payload.modelProfileId, expectedRegistryRevision: payload.expectedRegistryRevision,
+    projectBindingId: trustedProject ? token : null, ...metadata,
+  });
+  const policy = assistantContextPolicy(binding, project);
+  return { binding, project, contextPolicy: { ...policy, toolsAllowed: policy.toolsAllowed && binding.compatibility.toolMode !== 'none' } };
+}
+
+function isProjectModelBindingCurrent(binding) {
+  return !binding.projectBindingId || Boolean(worktreeIpc.resolveBinding(
+    { sender: { id: binding.senderId } }, { projectBindingId: binding.projectBindingId },
+  ));
+}
+
+/** Revocation is token- and owner-scoped; the foreground lease stays held through cleanup. */
+function revokeInvalidProjectModelBindings(event) {
+  const lease = foregroundModels.current;
+  const bindings = new Set([lease?.binding, ...backgroundModelBindings, ...activeModelRequests.keys()]);
+  for (const binding of bindings) {
+    if (!binding || binding.senderId !== event.sender.id || isProjectModelBindingCurrent(binding)) continue;
+    planState.expireBinding({ senderId: binding.senderId, projectBindingId: binding.projectBindingId });
+    if (lease?.binding === binding) {
+      lease.abort.abort();
+      try { lease.gate?.cancelPending('项目绑定已撤销'); } catch { /* revoked approval cannot survive */ }
+    }
+    for (const controller of activeModelRequests.get(binding) || []) controller.abort();
+  }
+}
+
+function boundModelChat(binding, settings, { kind = binding.kind || 'chat', signal, onUsage } = {}) {
+  const chat = createModelChatFunction({ binding, signal, kind, resolveCredential: (accepted) => getModelIpc().resolveCredential(accepted),
+    onUsage: (attempt) => {
+      const usage = buildModelUsageEvent({ binding, settings, attempt, kind });
+      if (!usage) return;
+      if (onUsage) onUsage(usage); else persistUsageEvent(settings, binding.sessionId, usage);
+    },
+    onResult: (result) => {
+      // A normal successful text request is narrow evidence, never a tool probe.
+      if (result.content && !result.toolCalls.length && binding.capabilities.text.state === 'unknown') {
+        getModelIpc().applyDiagnosticResult(structuredClone({ modelProfileId: binding.modelProfileId, bindingRevision: binding.bindingRevision,
+          observations: { text: { state: 'supported', checkedAt: new Date().toISOString() } },
+          expectedDeclarations: binding.modelProfile.capabilities }));
+      }
+    },
+  });
+  return async (options = {}) => {
+    if (!isProjectModelBindingCurrent(binding)) {
+      throw Object.assign(new Error('项目绑定已撤销，请重新开始运行。'), { code: 'ABORTED' });
+    }
+    const currentAssistant = modelSettings().modelRegistry.assistants.find((assistant) => assistant.id === binding.assistantId);
+    if (assistantPermissionsRevoked(binding.assistant, currentAssistant)) {
+      throw Object.assign(new Error('助手权限已撤销，请重新开始运行。'), { code: 'ABORTED' });
+    }
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    if (options.signal?.aborted) cancel(); else options.signal?.addEventListener('abort', cancel, { once: true });
+    const active = activeModelRequests.get(binding) || new Set();
+    active.add(controller); activeModelRequests.set(binding, active);
+    try { return await chat({ ...options, signal: controller.signal }); }
+    finally {
+      options.signal?.removeEventListener('abort', cancel);
+      active.delete(controller);
+      if (!active.size) activeModelRequests.delete(binding);
+    }
+  };
+}
+
+function assistantPermissionsRevoked(previous, next) {
+  return !next || next.archived || next.identityType !== 'ai'
+    || previous.toolPolicy.allowedTools.some((name) => !next.toolPolicy.allowedTools.includes(name))
+    || previous.knowledge.projectContext && !next.knowledge.projectContext
+    || previous.knowledge.projectMemory && !next.knowledge.projectMemory;
+}
+
+function modelPolicyRevision(settings) {
+  const keys = ['mode', 'executionPolicy', 'permissionMode', 'agentEnabled', 'terminalEnabled', 'terminalRequireConfirm',
+    'webEnabled', 'webRequireConfirm', 'webAllowDomains', 'webDenyDomains', 'skillsEnabled', 'hooksEnabled',
+    'subagentEnabled', 'mcpEnabled', 'mcpServers', 'memoryEnabled', 'memoryCandidateEnabled', 'codeIndexEnabled'];
+  const values = Object.fromEntries(keys.map((key) => [key, settings[key]]));
+  // Never hash vault references, keys, transport env or raw MCP authentication.
+  values.mcpServers = (settings.mcpServers || []).map((server) => ({ name: server.name, enabled: server.enabled !== false,
+    sampling: server.sampling?.enabled === true, tasks: server.tasks?.enabled === true, elicitation: server.elicitation?.enabled !== false }));
+  return require('node:crypto').createHash('sha256').update(JSON.stringify(values)).digest('hex');
+}
+
+function hostPermissionsRevoked(previous, next) {
+  const switches = ['agentEnabled', 'terminalEnabled', 'webEnabled', 'skillsEnabled', 'hooksEnabled',
+    'subagentEnabled', 'mcpEnabled', 'memoryEnabled', 'memoryCandidateEnabled', 'codeIndexEnabled'];
+  if (switches.some((key) => previous[key] === true && next[key] !== true)) return true;
+  if (['terminalRequireConfirm', 'webRequireConfirm'].some((key) => previous[key] === false && next[key] !== false)) return true;
+  const permissionRank = { 'read-only': 0, 'confirm-writes': 1, 'full-auto': 2 };
+  if ((permissionRank[next.permissionMode] ?? 0) < (permissionRank[previous.permissionMode] ?? 0)) return true;
+  const isolationRank = { 'strict-isolated': 0, 'workspace-write': 1, 'host-unconfined': 2 };
+  if ((isolationRank[next.executionPolicy] ?? 0) < (isolationRank[previous.executionPolicy] ?? 0)) return true;
+  const oldServers = previous.mcpServers || [];
+  if (oldServers.some((server) => server.enabled !== false && !(next.mcpServers || []).some((entry) => entry.name === server.name && entry.enabled !== false))) return true;
+  return (next.webDenyDomains || []).some((domain) => !(previous.webDenyDomains || []).includes(domain))
+    || (next.webAllowDomains || []).length > 0 && ((previous.webAllowDomains || []).length === 0
+      || (previous.webAllowDomains || []).some((domain) => !next.webAllowDomains.includes(domain)));
+}
 
 /**
  * Pending plan per session (from submit_plan / plan-ready).
@@ -119,16 +364,22 @@ let activeRun = null;
  */
 const planState = new PlanStateManager();
 
-function resolvePlanBinding(event, payload = {}) {
+function resolvePlanBinding(event, payload = {}, acceptedModelBinding) {
   const sessionId = String(payload.sessionId || '');
   const token = String(payload.projectBindingId || '');
   const requestedPath = payload.project?.path || payload.projectPath || '';
-  const binding = token ? worktreeIpc.resolveBinding(event, { projectBindingId: token }) : null;
-  if (!sessionId || !event.sender?.id || ((requestedPath || token) && (!binding || (requestedPath && canonicalDirectory(requestedPath) !== binding.projectPath)))) {
+  const project = token ? worktreeIpc.resolveBinding(event, { projectBindingId: token }) : null;
+  if (!sessionId || !event.sender?.id || ((requestedPath || token) && (!project || (requestedPath && canonicalDirectory(requestedPath) !== project.projectPath)))) {
     throw Object.assign(new Error('项目绑定已失效，请重新打开项目并生成计划'), { code: 'PLAN_BINDING_CHANGED' });
   }
-  return { sessionId, senderId: event.sender.id, projectId: binding?.projectId || '', projectPath: binding?.projectPath || '', projectBindingId: token };
+  const model = acceptedModelBinding || resolveModelContext(event, payload).binding;
+  return { sessionId, senderId: event.sender.id, projectId: project?.projectId || '', projectPath: project?.projectPath || '', projectBindingId: token,
+    assistantId: model.assistantId, assistantRevision: model.assistantRevision, providerId: model.providerId,
+    providerRevision: model.providerRevision, modelProfileId: model.modelProfileId, modelRevision: model.modelRevision,
+    bindingRevision: model.bindingRevision, policyRevision: modelPolicyRevision(modelSettings()) };
 }
+
+registerModelIpc(ipcMain, getModelIpc());
 
 async function requestHostExecution(sender, request) {
   const native = require('./ai/windows-isolation');
@@ -202,10 +453,88 @@ const worktreeIpc = createWorktreeIpcHandlers({
   openExternal: async (url) => shell.openExternal(url),
 });
 
+/** Accept engineering models synchronously, before private sources or worktrees. */
+function acceptEngineeringModel({ kind, taskId, context, settings }) {
+  const { ModelError } = require('./ai/model-adapters/common');
+  const { isResolvedModelBinding } = require('./ai/model-profiles');
+  if (!['pr-audit', 'pr-audit-recheck', 'repair'].includes(kind)) throw new ModelError('MODEL_INPUT_INVALID', '工程模型任务类型无效。');
+  const inherited = context?.modelBinding;
+  if (inherited !== undefined && !isResolvedModelBinding(inherited)) throw new ModelError('MODEL_BINDING_INVALID', '继承的工程模型绑定无效。');
+  // Associated Agent repairs carry the parent brand, not a renderer-supplied sender.
+  const sender = context?.sender || (kind === 'repair' && inherited
+    ? BrowserWindow.getAllWindows().find((win) => !win.isDestroyed() && win.webContents.id === inherited.senderId)?.webContents : null);
+  if (!sender || !BrowserWindow.getAllWindows().some((win) => !win.isDestroyed() && win.webContents === sender)
+    || sender.isDestroyed?.()) throw new ModelError('MODEL_SENDER_INVALID', '工程窗口已失效。');
+  if ((kind !== 'repair' && !context.isCurrent?.()) || context.isCurrent?.() === false || context.signal?.aborted) {
+    throw new ModelError('ABORTED', '工程项目绑定已撤销。');
+  }
+  const project = worktreeIpc.resolveBinding({ sender }, { projectBindingId: context.projectBindingId });
+  const expectedPath = context.binding?.projectPath || context.projectPath || context.project?.path;
+  const expectedId = context.binding?.projectId || context.project?.id;
+  if (!project || (expectedId && project.projectId !== expectedId)
+    || !expectedPath || canonicalProjectPath(project.projectPath) !== canonicalProjectPath(expectedPath)) {
+    throw new ModelError('MODEL_BINDING_INVALID', '工程任务需要当前窗口的有效项目绑定。');
+  }
+  let binding = inherited;
+  if (binding !== undefined) {
+    if (binding.senderId !== sender.id || binding.projectBindingId !== context.projectBindingId) {
+      throw new ModelError('MODEL_BINDING_INVALID', '继承的工程模型绑定无效。');
+    }
+  } else {
+    const registry = modelSettings().modelRegistry;
+    binding = getModelIpc().resolveBinding({ sender }, {
+      assistantId: 'assistant_codex', modelProfileId: registry.defaultModelProfileId,
+      projectBindingId: context.projectBindingId, runId: taskId, clientRequestId: taskId, kind,
+    });
+  }
+  if (!isProjectModelBindingCurrent(binding)) throw new ModelError('ABORTED', '工程项目绑定已撤销。');
+  assistantContextPolicy(binding, { id: project.projectId, path: project.projectPath });
+  let hostTools;
+  if (kind === 'repair') {
+    if (settings.agentEnabled === false || settings.mode !== 'api') throw new ModelError('REPAIR_AGENT_UNAVAILABLE', '没有可用的修复 Agent。');
+    const { IMPLEMENT_TOOLS } = require('./ai/providers/builtin');
+    hostTools = require('./ai/agent').TOOL_DEFS.filter((tool) => IMPLEMENT_TOOLS.has(tool.function.name));
+  } else {
+    hostTools = (kind === 'pr-audit' ? require('./ai/pr-audit-runtime') : require('./ai/pr-audit-recheck-runtime')).TOOLS;
+  }
+  const tools = binding.compatibility.toolMode === 'none' ? [] : filterAssistantTools(hostTools, binding);
+  if (kind === 'repair' && !tools.some((tool) => ['write_file', 'search_replace'].includes(tool.function?.name))) {
+    throw new ModelError('ASSISTANT_TOOL_DENIED', '当前助手未获隔离修复工具权限。');
+  }
+  const canonicalTools = tools.map((tool) => tool.function
+    ? { name: tool.function.name, description: tool.function.description, parameters: tool.function.parameters } : tool);
+  preflightModelRequest({ binding, messages: [
+    { role: 'system', content: kind === 'repair' ? '仅在已授权的隔离 worktree 中提出必要修复。' : '只读固定快照审计。' },
+    { role: 'user', content: '工程模型接受预检。' },
+  ], tools: canonicalTools, request: { timeoutMs: 120000 } });
+  getModelIpc().resolveCredential(binding);
+  const controller = context.abortController;
+  if (!controller || controller.signal !== context.signal || typeof controller.abort !== 'function') {
+    throw new ModelError('MODEL_BINDING_INVALID', '工程任务缺少可信的取消控制器。');
+  }
+  retainBackgroundModelBinding(binding);
+  let controllers = activeModelRequests.get(binding);
+  if (!controllers) { controllers = new Set(); activeModelRequests.set(binding, controllers); }
+  controllers.add(controller);
+  let released = false;
+  return {
+    binding, chatFn: boundModelChat(binding, settings, { kind, signal: context.signal }),
+    modelSource: publicModelSource(binding),
+    release() {
+      if (released) return;
+      released = true;
+      releaseBackgroundModelBinding(binding);
+      controllers.delete(controller);
+      if (!controllers.size && activeModelRequests.get(binding) === controllers) activeModelRequests.delete(binding);
+    },
+  };
+}
+
 function getEngineeringIpc() {
   if (engineeringIpc) return engineeringIpc;
   engineeringIpc = createEngineeringIpcHandlers({
     resolveBinding: (event, payload) => worktreeIpc.resolveBinding(event, payload),
+    acceptBoundModel: acceptEngineeringModel,
     userDataPath: userDataPath(),
     safeStorage,
     worktreeManager,
@@ -217,14 +546,14 @@ function getEngineeringIpc() {
       try { return await fn(); } finally { worktreeMutation = false; }
     },
     indexStorePathFor: (projectPath) => path.join(userDataPath(), `engineering-index-${crypto.createHash('sha256').update(path.resolve(projectPath)).digest('hex').slice(0, 16)}.json`),
-    isIndexEnabled: () => loadSettings(userDataPath()).codeIndexEnabled !== false,
+    isIndexEnabled: () => modelSettings().codeIndexEnabled !== false,
     getProfiles: (projectPath) => {
       const key = projectKey(projectPath);
-      return (loadSettings(userDataPath()).verificationProfiles || [])
+      return (modelSettings().verificationProfiles || [])
         .filter((profile) => profile.projectKey === key);
     },
     setProfiles: (projectPath, profiles) => {
-      const settings = loadSettings(userDataPath());
+      const settings = modelSettings();
       const key = projectKey(projectPath);
       const retained = (settings.verificationProfiles || [])
         .filter((profile) => profile.projectKey !== key);
@@ -235,7 +564,7 @@ function getEngineeringIpc() {
         ],
       });
     },
-    getSettings: () => loadSettings(userDataPath()),
+    getSettings: () => modelSettings(),
     onCiWatchEvent: (event, ownerIds) => {
       for (const win of BrowserWindow.getAllWindows()) {
         if (ownerIds.includes(win.webContents.id)) safeSend(win.webContents, 'engineering:ci-watch:event', event);
@@ -294,7 +623,7 @@ function getCiWatchNotifier() {
     getOwnerIds: (key) => engineeringIpc?.ciWatchOwnerIds(key) || [],
     canNavigate: (owner, key, ref) => engineeringIpc?.ciWatchNavigation(owner, key, ref),
     navigate: (win, target) => safeSend(win.webContents, 'engineering:ci-watch:navigate', target),
-    isEnabled: () => !quitting && loadSettings(userDataPath()).ciWatchSystemNotifications === true,
+    isEnabled: () => !quitting && modelSettings().ciWatchSystemNotifications === true,
   });
   return ciWatchNotifier;
 }
@@ -355,7 +684,7 @@ function getMcpElicitationController() {
       for (const win of BrowserWindow.getAllWindows()) safeSend(win.webContents, 'mcp:elicitation:event', event);
     },
     openExternal: (url) => shell.openExternal(url),
-    allowPrivateUrlForServer: (name) => loadSettings(userDataPath()).mcpServers
+    allowPrivateUrlForServer: (name) => modelSettings().mcpServers
       .some((server) => server.name === String(name || '') && server.elicitation?.allowPrivateUrl === true),
   });
   return mcpElicitationController;
@@ -365,7 +694,7 @@ async function restoreMcpTasksAtStartup() {
   const taskManager = getMcpTaskManager();
   const active = taskManager.list().filter((task) => task.needsRecovery === true);
   if (!active.length) return;
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const enabledByName = new Map(settings.mcpServers
     .filter((server) => server.enabled !== false)
     .map((server) => [server.name, server]));
@@ -412,22 +741,15 @@ function persistUsageEvent(settings, sessionId, event) {
   if (!event || settings?.usageEnabled === false) return false;
   try {
     const file = usageFilePath(userDataPath());
-    appendRecord(file, {
-      ts: Date.now(),
-      session: String(sessionId || ''),
-      model: String(event.model || ''),
-      kind: String(event.kind || 'main'),
-      in: Number(event.inputTokens) || 0,
-      out: Number(event.outputTokens) || 0,
-      cached: Number(event.cachedInputTokens) || 0,
-      est: event.estimated === true,
-      cost: typeof event.cost === 'number' && Number.isFinite(event.cost)
-        ? event.cost
-        : null,
-      cur: String(event.currency || '$'),
+    const written = appendRecord(file, {
+      ...event, ts: Date.now(), session: String(sessionId || event.sessionId || ''),
+      model: String(event.model || ''), kind: String(event.kind || 'main'),
+      in: event.inputTokens ?? null, out: event.outputTokens ?? null, cached: event.cachedInputTokens ?? null,
+      cacheCreation: event.cacheCreationInputTokens ?? null, est: event.estimated === true,
+      cost: Number.isFinite(event.cost) ? event.cost : null, cur: String(event.currency || '$'),
     });
-    pruneRecords(file, settings.usageMaxRecords);
-    return true;
+    if (written) pruneRecords(file, settings.usageMaxRecords);
+    return written;
   } catch {
     // Usage metering is best-effort and must never interrupt a chat or compact.
     return false;
@@ -533,7 +855,6 @@ function toPublicSettings(s, senderId) {
     model: s.model,
     apiKeySet: Boolean(s.apiKeyConfigured || s.apiKey),
     apiKey: '',
-    secretRef: s.secretRef || (s.apiKeyConfigured ? 'sec_main_api_key' : ''),
     executionPolicy: s.executionPolicy || 'strict-isolated',
     agentEnabled: s.agentEnabled !== false,
     maxAgentTurns: s.maxAgentTurns ?? 8,
@@ -606,9 +927,27 @@ function makeRunId() {
 
 function safeSend(sender, channel, data) {
   try {
-    if (sender && !sender.isDestroyed()) {
-      sender.send(channel, redactSecrets(data));
+    if (!sender || sender.isDestroyed()) return;
+    let outgoing = data;
+    const identity = data && typeof data === 'object' ? String(data.runId || data.taskId || data.clientRequestId || '') : '';
+    const key = `${channel}\u0000${identity}`;
+    let streams = modelTextStreams.get(sender);
+    if (data?.type === AGENT_EVENTS.TEXT_DELTA) {
+      if (!streams) { streams = new Map(); modelTextStreams.set(sender, streams); }
+      if (!streams.has(key)) {
+        if (streams.size >= 64) { const oldest = streams.keys().next().value; streams.get(oldest).finish(); streams.delete(oldest); }
+        streams.set(key, createModelTextRedactor());
+      }
+      const text = streams.get(key).write(String(data.text ?? data.delta ?? ''));
+      if (!text) return;
+      outgoing = { ...data, text }; delete outgoing.delta;
+    } else if ([AGENT_EVENTS.DONE, AGENT_EVENTS.ERROR, AGENT_EVENTS.ABORTED, 'cancelled'].includes(data?.type) && streams?.has(key)) {
+      const text = streams.get(key).finish(); streams.delete(key);
+      if (text) sender.send(channel, redactSecrets({ type: AGENT_EVENTS.TEXT_DELTA, text,
+        runId: data.runId, sessionId: data.sessionId, clientRequestId: data.clientRequestId, modelSource: data.modelSource, task: data.task }));
     }
+    if (typeof outgoing?.partialOutput === 'string') outgoing = { ...outgoing, partialOutput: redactModelPartialOutput(outgoing.partialOutput) };
+    sender.send(channel, redactSecrets(outgoing));
   } catch {
     /* ignore destroyed sender */
   }
@@ -636,6 +975,15 @@ function makeTermId() {
   return `term_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 }
 
+function dropModelOwner(senderId) {
+  modelIpc?.dropSender(senderId);
+  modelDiagnostics?.cancelOwner(senderId);
+  foregroundModels.cancelOwner(senderId);
+  for (const [binding, controllers] of activeModelRequests) if (binding.senderId === senderId) {
+    for (const controller of controllers) controller.abort();
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1100,
@@ -657,6 +1005,7 @@ function createWindow() {
   win.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
     if (isMainFrame !== false) {
       worktreeIpc.dropSender(worktreeSenderId);
+      dropModelOwner(worktreeSenderId);
       planState.expireSender(worktreeSenderId);
       if (activeRun?.sender === windowSender) abortActiveRun();
       if (manualTerm?.sender === windowSender) abortManualTerm();
@@ -664,6 +1013,7 @@ function createWindow() {
     }
   });
   win.webContents.once('destroyed', () => { worktreeIpc.dropSender(worktreeSenderId); planState.expireSender(worktreeSenderId); if (activeRun?.sender === windowSender) abortActiveRun(); if (manualTerm?.sender === windowSender) abortManualTerm(); });
+  win.webContents.once('destroyed', () => dropModelOwner(worktreeSenderId));
   win.webContents.once('destroyed', () => engineeringIpc?.dropSender?.(worktreeSenderId));
   win.webContents.once('destroyed', () => cancelOAuthFlowsForSender(worktreeSenderId));
   win.webContents.once('destroyed', () => mcpElicitationController?.cancelOwner?.(worktreeSenderId));
@@ -711,7 +1061,13 @@ app.on('before-quit', (event) => {
   event.preventDefault();
   quitting = true;
   ciWatchNotifier?.close();
-  Promise.all([
+  const lease = foregroundModels.current;
+  abortActiveRun();
+  try { lease?.gate?.cancelPending('应用正在关闭'); } catch { /* shutdown cannot keep a permission request */ }
+  for (const controllers of activeModelRequests.values()) for (const controller of controllers) controller.abort();
+  Promise.allSettled([
+    Promise.resolve().then(() => lease?.completion),
+    Promise.resolve().then(() => modelDiagnostics?.close?.()),
     Promise.resolve().then(() => mcpOAuthManager?.closeAll?.()),
     Promise.resolve().then(() => mcpSessionManager?.closeAll?.()),
     Promise.resolve().then(() => mcpTaskManager?.close?.()),
@@ -746,12 +1102,12 @@ ipcMain.handle('window:close', (event) => {
   return { ok: Boolean(win) };
 });
 
-ipcMain.handle('settings:get', async (event) => toPublicSettings(loadSettings(userDataPath()), event.sender.id));
+ipcMain.handle('settings:get', async (event) => toPublicSettings(modelSettings(), event.sender.id));
 
 ipcMain.handle('settings:save', async (event, partial = {}) => {
   const nextPartial = { ...partial };
-  const currentSettings = loadSettings(userDataPath());
-  if (!nextPartial.apiKey) delete nextPartial.apiKey;
+  const currentSettings = modelSettings();
+  for (const alias of ['apiKey', 'secretRef', 'apiKeyConfigured', 'apiKeyUnavailable', 'baseUrl', 'model']) delete nextPartial[alias];
   for (const k of [
     'agentEnabled',
     'terminalEnabled',
@@ -861,7 +1217,15 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
       return { ok: false, code: 'MCP_TASKS_CONFIG_LOCKED', error: '该 MCP 服务器仍有后台任务，请先取消或遗弃任务引用', locked };
     }
   }
-  const saved = saveSettings(userDataPath(), nextPartial);
+  const saved = saveSettings(userDataPath(), nextPartial, { resolveLegacyApiKey: false });
+  if (modelPolicyRevision(currentSettings) !== modelPolicyRevision(saved)) {
+    for (const plan of planState.plans.values()) planState.expireBinding({ planId: plan.planId });
+    if (hostPermissionsRevoked(currentSettings, saved)) {
+      abortActiveRun();
+      try { activeRun?.gate?.cancelPending('宿主权限已撤销'); } catch { /* no stale permission */ }
+      for (const controllers of activeModelRequests.values()) for (const controller of controllers) controller.abort();
+    }
+  }
   if ('mcpServers' in nextPartial) {
     await getMcpSessionManager().invalidate(
       (entry) => getMcpTaskManager().canChangeServer(entry.serverName),
@@ -874,7 +1238,7 @@ ipcMain.handle('settings:save', async (event, partial = {}) => {
 ipcMain.handle('isolation:getStatus', async () => {
   const { probeIsolationCapabilities } = require('./ai/os-isolation');
   const caps = probeIsolationCapabilities();
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const executionPolicy = settings.executionPolicy || 'strict-isolated';
   const hostSelected = String(executionPolicy).toLowerCase().replace(/_/g, '-') === 'host-unconfined';
   return {
@@ -905,7 +1269,7 @@ ipcMain.handle('mcp:testServer', async (_e, rawCfg) => {
   const list = sanitizeMcpServers([rawCfg]);
   if (!list.length) return { ok: false, error: '无效配置' };
   let cfg = list[0];
-  const saved = loadSettings(userDataPath()).mcpServers.find((server) => server.name === cfg.name);
+  const saved = modelSettings().mcpServers.find((server) => server.name === cfg.name);
   if (saved && rawCfg && typeof rawCfg === 'object') {
     const sameTransport = saved.transport === cfg.transport;
     const preserved = sameTransport
@@ -956,7 +1320,7 @@ function publicSessionStatus(status) {
 }
 
 function savedMcpServer(name) {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const server = settings.mcpServers.find((item) => item.name === String(name || '').trim());
   return { settings, server };
 }
@@ -1036,7 +1400,7 @@ ipcMain.handle('mcp:roots:remove', async (event, payload = {}) => {
 ipcMain.handle('mcp:session:status', async (_event, payload = {}) => {
   const name = payload?.name ? String(payload.name).trim() : '';
   const statuses = getMcpSessionManager().status(name).map((status) => ({ name: status.server, session: publicSessionStatus(status) }));
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   if (name) return { ok: true, name, session: statuses[0]?.session || { state: 'disabled', reusable: false, lastErrorCode: null } };
   return {
     ok: true,
@@ -1127,7 +1491,7 @@ ipcMain.handle('mcp:elicitation:open-url', async (event, payload = {}) => {
 });
 
 async function withPromptHub(senderId, payload, callback) {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const projectPath = mcpProjectBySender.get(Number(senderId)) || '';
   const requestedServer = payload?.server ? String(payload.server).trim() : '';
   const serverConfigs = requestedServer
@@ -1163,7 +1527,7 @@ ipcMain.handle('mcp:prompts:get', async (event, payload = {}) => {
 });
 
 ipcMain.handle('mcp:oauth:status', async () => {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   return {
     ok: true,
     statuses: getMcpOAuthManager().statuses(settings.mcpServers),
@@ -1172,7 +1536,7 @@ ipcMain.handle('mcp:oauth:status', async () => {
 
 ipcMain.handle('mcp:oauth:authorize', async (event, payload = {}) => {
   const name = String(payload?.name || '').trim();
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const cfg = settings.mcpServers.find((item) => item.name === name);
   if (!cfg || cfg.auth !== 'oauth') return { ok: false, code: 'MCP_OAUTH_METADATA_INVALID', error: '请先保存有效的 OAuth MCP 配置' };
   if (oauthPendingOwnersByName.has(name)) return { ok: false, code: 'MCP_OAUTH_CALLBACK_TIMEOUT', error: '该服务器已有授权流程正在进行' };
@@ -1203,7 +1567,7 @@ ipcMain.handle('mcp:oauth:cancel', async (event, payload = {}) => {
 
 ipcMain.handle('mcp:oauth:logout', async (_event, payload = {}) => {
   const name = String(payload?.name || '').trim();
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const cfg = settings.mcpServers.find((item) => item.name === name);
   if (!cfg || cfg.auth !== 'oauth') return { ok: false, code: 'MCP_OAUTH_METADATA_INVALID', error: 'OAuth MCP 配置不存在' };
   if (!getMcpTaskManager().canChangeServer(name)) {
@@ -1243,7 +1607,7 @@ ipcMain.handle('skills:get', async (_e, payload = {}) => {
 });
 
 ipcMain.handle('hooks:summary', async (_e, payload = {}) => {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   const projectPath = payload.projectPath ? String(payload.projectPath) : null;
   const resolved = loadHooks({
     userDataPath: userDataPath(),
@@ -1258,64 +1622,42 @@ ipcMain.handle('hooks:summary', async (_e, payload = {}) => {
   };
 });
 
-/**
- * Phase D.1 compact. The preload is sandboxed and cannot require local modules,
- * so plan → summarize → apply all happen here in one round trip; the renderer
- * just swaps in the returned messages array.
- */
-ipcMain.handle('session:compact', async (_e, payload = {}) => {
-  try {
-    if (activeRun) return { ok: false, error: '有对话正在进行，请先停止再压缩' };
-    const settings = loadSettings(userDataPath());
-    const messages = Array.isArray(payload.messages) ? payload.messages : [];
-    const plan = planCompact(messages, {
-      keepMessages: settings.compactKeepMessages,
-      maxMessages: settings.compactMaxMessages,
-      maxApproxTokens: settings.compactMaxApproxTokens,
-      force: payload.force === true,
-    });
-    if (!plan.needed) {
-      return { ok: true, needed: false, approxTokens: plan.approxTokens, candidates: [] };
-    }
-    const transcript = serializeOlderTranscript(plan.older);
-    let compactUsage = null;
-    const onUsage = ({ rawUsage, messages: sentMessages, content }) => {
-      const usageEvent = buildUsageEvent({
-        settings,
-        messages: sentMessages,
-        msg: { content, usage: rawUsage },
-      });
-      if (usageEvent) {
-        compactUsage = {
-          ...usageEvent,
-          kind: 'compact',
-        };
-        persistUsageEvent(settings, payload.sessionId, compactUsage);
-      }
-    };
-    const candidateLimit = clampInt(payload.candidateLimit, 0, 5, 0);
-    const artifacts = await generateCompactArtifacts({
-      transcript,
-      settings,
-      chatFn: chatCompletionMessage,
-      candidateLimit,
-      onUsage,
-    });
-    return {
-      ok: true,
-      needed: true,
-      messages: applyCompact(messages, plan, artifacts.summary),
-      compactedCount: plan.older.length,
-      approxTokens: plan.approxTokens,
-      olderApproxTokens: plan.olderApproxTokens,
-      usage: compactUsage,
-      candidates: artifacts.candidates,
-      candidateWarning: artifacts.candidateWarning,
-    };
-  } catch (err) {
-    return { ok: false, error: err?.message || String(err) };
-  }
-});
+/** Compact has the same foreground lease, accepted model, cancellation and task identity as chat. */
+ipcMain.handle('session:compact', async (event, payload = {}) => startForegroundModelRun(event, payload, {}, 'session_compact'));
+
+async function compactAcceptedHistory(messages, payload, lease, manual) {
+  const { settings, binding, contextPolicy } = lease;
+  const plan = planCompact(messages, {
+    keepMessages: manual ? clampInt(payload.keepMessages, 6, 80, settings.compactKeepMessages) : settings.compactKeepMessages,
+    maxMessages: settings.compactMaxMessages, maxApproxTokens: settings.compactMaxApproxTokens,
+    force: manual && payload.force === true,
+  });
+  if (!plan.needed) return { ok: true, needed: false, approxTokens: plan.approxTokens, candidates: [] };
+  if (lease.abort.signal.aborted) throwAborted();
+  let compactUsage = null;
+  const onUsage = (usage) => {
+    if (usage.kind === 'compact') compactUsage = usage;
+    lease.emit(usage);
+  };
+  const candidateLimit = contextPolicy.projectMemory && settings.memoryCandidateEnabled !== false
+    ? clampInt(payload.candidateLimit, 0, 5, manual ? 0 : 5) : 0;
+  const artifacts = await generateCompactArtifacts({
+    transcript: serializeOlderTranscript(plan.older), settings, modelBinding: binding,
+    signal: lease.abort.signal, candidateLimit,
+    chatFn: boundModelChat(binding, settings, { kind: 'compact', signal: lease.abort.signal, onUsage }),
+    candidateChatFn: boundModelChat(binding, settings, { kind: 'memory-candidate', signal: lease.abort.signal, onUsage }),
+  });
+  if (lease.abort.signal.aborted) throwAborted();
+  const compacted = applyCompact(messages, plan, artifacts.summary);
+  if (compacted[0]) compacted[0] = { ...compacted[0], modelSource: lease.modelSource };
+  return { ok: true, needed: true, messages: compacted, compactedCount: plan.older.length,
+    approxTokens: plan.approxTokens, olderApproxTokens: plan.olderApproxTokens, usage: compactUsage,
+    candidates: artifacts.candidates, candidateWarning: artifacts.candidateWarning };
+}
+
+async function executeAcceptedCompact(payload, lease) {
+  return compactAcceptedHistory(Array.isArray(payload.messages) ? payload.messages : [], payload, lease, true);
+}
 
 /** Phase D.1 export: serialize here, then write wherever the user picks. */
 ipcMain.handle('session:export', async (_e, payload = {}) => {
@@ -1344,23 +1686,23 @@ ipcMain.handle('session:export', async (_e, payload = {}) => {
  * the model, not the user). All the logic lives in the pure handlers.
  */
 ipcMain.handle('memory:list', async (_e, payload = {}) => memoryList({
-  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+  settings: modelSettings(), userDataPath: userDataPath(), payload,
 }));
 
 ipcMain.handle('memory:add', async (_e, payload = {}) => memoryAdd({
-  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+  settings: modelSettings(), userDataPath: userDataPath(), payload,
 }));
 
 ipcMain.handle('memory:delete', async (_e, payload = {}) => memoryDelete({
-  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+  settings: modelSettings(), userDataPath: userDataPath(), payload,
 }));
 
 ipcMain.handle('memory:accept', async (_e, payload = {}) => memoryAccept({
-  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+  settings: modelSettings(), userDataPath: userDataPath(), payload,
 }));
 
 ipcMain.handle('memory:update', async (_e, payload = {}) => memoryUpdate({
-  settings: loadSettings(userDataPath()), userDataPath: userDataPath(), payload,
+  settings: modelSettings(), userDataPath: userDataPath(), payload,
 }));
 
 // Phase D.5 worktree results. Only bind accepts a project path; every later
@@ -1369,6 +1711,7 @@ ipcMain.handle('worktree:bind', async (event, payload = {}) => {
   const previousPaths = worktreeIpc.listProjectPaths(event);
   const result = worktreeIpc.bind(event, payload);
   if (result?.ok) {
+    revokeInvalidProjectModelBindings(event);
     planState.expireBinding({ senderId: event.sender.id, projectId: payload.projectId });
     const engineering = getEngineeringIpc();
     for (const root of previousPaths) {
@@ -1381,7 +1724,10 @@ ipcMain.handle('worktree:bind', async (event, payload = {}) => {
 ipcMain.handle('worktree:unbind', async (event, payload = {}) => {
   const binding = worktreeIpc.resolveBinding(event, payload);
   const result = worktreeIpc.unbind(event, payload);
-  if (result?.ok) planState.expireBinding({ senderId: event.sender.id, projectBindingId: payload.projectBindingId });
+  if (result?.ok) {
+    revokeInvalidProjectModelBindings(event);
+    planState.expireBinding({ senderId: event.sender.id, projectBindingId: payload.projectBindingId });
+  }
   if (result?.ok && binding?.projectPath && !worktreeIpc.hasProjectBinding(event, binding.projectPath)) {
     engineeringIpc?.dropProject(event, binding.projectPath);
   }
@@ -1533,11 +1879,11 @@ ipcMain.handle('git:diff', async (_e, payload = {}) => {
   });
 });
 
-ipcMain.handle('chat:stop', async () => {
-  // Abort chat/agent run only — does NOT stop manual terminal panel runs.
-  // PermissionGate waitForApproval rejects pending entries on signal abort.
-  abortActiveRun();
-  return { ok: true };
+ipcMain.handle('chat:stop', async (event, payload = {}) => {
+  // Aborting never releases the lease: finally must finish readers, tools and gates.
+  // Manual terminals, audits and diagnostics have independent owners/controllers.
+  return foregroundModels.cancel({ senderId: event.sender.id, sessionId: payload.sessionId,
+    runId: payload.runId, clientRequestId: payload.clientRequestId });
 });
 
 ipcMain.handle('chat:approve', async (event, payload = {}) => {
@@ -1600,7 +1946,7 @@ ipcMain.handle('terminal:run', async (event, payload = {}) => {
     return { ok: false, error: '项目路径无效' };
   }
 
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   if (!settings.terminalEnabled) {
     return { ok: false, error: '终端未启用。请在设置中打开「允许终端」。' };
   }
@@ -1766,25 +2112,114 @@ ipcMain.handle('atRef:expand', async (_e, payload = {}) => {
  * @param {object} payload
  * @param {{ stopPrevious?: boolean }} [opts]
  */
-async function startChatRun(event, payload = {}, opts = {}) {
-  if (worktreeMutation) return { ok: false, code: 'BUSY', error: '隔离改动正在应用或清理，请稍后重试' };
-  const stopPrevious = opts.stopPrevious !== false;
-  if (stopPrevious) {
-    abortActiveRun();
+function acceptedRunMetadata(lease) {
+  return { runId: lease.runId, sessionId: lease.sessionId, clientRequestId: lease.clientRequestId,
+    modelSource: lease.modelSource, task: lease.task.toSummary() };
+}
+
+function emitAcceptedRun(lease, event) {
+  if (!event || lease.terminalEmitted) return;
+  const terminal = [AGENT_EVENTS.DONE, AGENT_EVENTS.ERROR, AGENT_EVENTS.ABORTED,
+    'compact-done', 'compact-error', 'compact-cancelled'].includes(event.type);
+  if (event.type === AGENT_EVENTS.USAGE) persistUsageEvent(lease.settings, lease.sessionId, event);
+  if (terminal) {
+    lease.terminalEmitted = true;
+    if ([AGENT_EVENTS.ABORTED, 'compact-cancelled'].includes(event.type)) lease.task.cancel();
+    else if ([AGENT_EVENTS.ERROR, 'compact-error'].includes(event.type)) lease.task.fail(event.message || event.error);
+    else lease.task.complete();
   }
+  safeSend(lease.sender, 'chat:event', { ...event, ...acceptedRunMetadata(lease) });
+}
 
-  const runId = makeRunId();
-  const abort = new AbortController();
+function preflightAcceptedRun(binding, settings, contextPolicy, project, payload, kind) {
+  if (settings.mode !== 'api') return;
+  // Pure, no @ref expansion, project files, credentials, events or physical attempts.
+  const projected = messagesForModel(Array.isArray(payload.messages) ? payload.messages : [], null);
+  const messages = [{ role: 'system', content: binding.assistant.systemPrompt || '你是一位 AI 助手。' },
+    ...(projected.length ? projected : [{ role: 'user', content: '总结此会话。' }])];
+  const intendedAgent = kind === 'chat' && contextPolicy.toolsAllowed && settings.agentEnabled !== false
+    && (project?.path || settings.memoryEnabled !== false);
+  if (intendedAgent && binding.compatibility.toolMode === 'native' && binding.capabilities.nativeTools.state !== 'supported') {
+    const state = binding.capabilities.nativeTools.state;
+    const error = new (require('./ai/model-adapters/common').ModelError)('MODEL_CAPABILITY_REQUIRED', '原生工具能力尚未验证或不受支持；请先诊断或显式选择文本兼容模式。');
+    error.capabilityState = state;
+    error.publicCode = state === 'unsupported' ? 'MODEL_CAPABILITY_UNSUPPORTED' : 'MODEL_CAPABILITY_UNKNOWN';
+    throw error;
+  }
+  preflightModelRequest({ binding, messages });
+}
+
+async function startForegroundModelRun(event, payload = {}, opts = {}, kind = 'chat') {
+  if (worktreeMutation || foregroundModels.current) return busyRunResult();
+  let lease;
+  try {
+    payload = structuredClone(payload);
+    const runId = makeRunId();
+    const sessionId = String(payload.sessionId || '');
+    const clientRequestId = String(payload.clientRequestId || '');
+    const { binding, project, contextPolicy } = resolveModelContext(event, payload, { runId, clientRequestId, kind });
+    const settings = modelSettings();
+    const agentMode = normalizeAgentMode(payload.agentMode);
+    preflightAcceptedRun(binding, settings, contextPolicy, project, payload, kind);
+    const planBinding = kind === 'chat' && agentMode === 'plan' ? resolvePlanBinding(event, payload, binding) : null;
+    lease = foregroundModels.acquire({ senderId: event.sender.id, sessionId, clientRequestId, runId, kind, binding,
+      sender: event.sender, settings, project, contextPolicy, agentMode, planBinding });
+    lease.modelSource = publicModelSource(binding, { kind: settings.mode === 'api' ? 'api' : 'local-demo' });
+    lease.task = new TaskHandle({ taskId: runId, kind: kind === 'chat' ? TASK_KINDS.CHAT_RUN : TASK_KINDS.SESSION_COMPACT,
+      sessionId, projectId: project?.id, ownerId: event.sender.id, abortController: lease.abort,
+      onStatusChange: (status) => safeSend(event.sender, 'chat:event', { type: 'task-status', ...acceptedRunMetadata(lease),
+        data: createTaskEventEnvelope({ ...status, sessionId, projectId: project?.id, type: 'status', data: status }) }),
+    });
+    lease.emit = (entry) => emitAcceptedRun(lease, entry);
+    activeRun = lease;
+    // Spend Plan authority synchronously before any accepted execution can run.
+    opts.onExecutionStarted?.(runId);
+    lease.completion = (async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+      let result; let failure;
+      try {
+        lease.task.start();
+        lease.emit({ type: kind === 'chat' ? AGENT_EVENTS.RUN_START : 'compact-start',
+          ...(opts.userMessage ? { userMessage: opts.userMessage } : {}) });
+        result = kind === 'chat' ? await executeAcceptedChat(event, payload, opts, lease) : await executeAcceptedCompact(payload, lease);
+        if (!lease.terminalEmitted) lease.emit({ type: kind === 'chat' ? AGENT_EVENTS.DONE : 'compact-done', ...result });
+      } catch (error) {
+        failure = error;
+        const aborted = isAbortError(error, lease.abort.signal);
+        const projected = publicRunError(error, lease.modelSource);
+        const message = projected.safeMessage;
+        result = { ...projected, ok: false, error: message, aborted };
+        lease.emit({ type: kind === 'chat' ? (aborted ? AGENT_EVENTS.ABORTED : AGENT_EVENTS.ERROR)
+          : (aborted ? 'compact-cancelled' : 'compact-error'), message, ...result });
+      } finally {
+        try { lease.gate?.cancelPending('运行已结束'); } catch { /* no authority remains */ }
+        try { await lease.cleanup?.(); } catch { /* cleanup cannot turn a failed attempt into success */ }
+        result = redactSecrets({ ok: true, ...result, accepted: true, mode: result?.mode || settings.mode, ...acceptedRunMetadata(lease) });
+        try { await opts.onSettled?.(result, failure); } catch { /* completion cannot revive spent authority */ }
+        foregroundModels.release(lease);
+        if (activeRun === lease) activeRun = null;
+      }
+      return result;
+    })();
+    // Acceptance is carried by run-start/compact-start; invoke keeps its final-result contract.
+    return await lease.completion;
+  } catch (error) {
+    if (lease) { foregroundModels.release(lease); if (activeRun === lease) activeRun = null; }
+    const projected = publicRunError(error);
+    return { ...projected, ok: false, error: projected.safeMessage };
+  }
+}
+
+async function startChatRun(event, payload = {}, opts = {}) {
+  return startForegroundModelRun(event, payload, opts, 'chat');
+}
+
+async function executeAcceptedChat(event, payload, opts, lease) {
+  const { runId, abort, sender, agentMode, sessionId, clientRequestId, settings, project, contextPolicy, binding: modelBinding, planBinding, modelSource } = lease;
   const signal = abort.signal;
-  const sender = event.sender;
-  const agentMode = normalizeAgentMode(payload.agentMode);
-  const sessionId = payload.sessionId || '';
-
-  const settings = loadSettings(userDataPath());
-  const planBinding = agentMode === 'plan' ? resolvePlanBinding(event, payload) : null;
   const gate = createPermissionGate({
-    projectRoot: payload.project?.path,
-    projectId: JSON.stringify([sender.id, payload.projectBindingId || '', payload.project?.id || '']),
+    projectRoot: project?.path,
+    projectId: JSON.stringify([sender.id, modelBinding.projectBindingId || '', project?.id || '']),
     policyLevel: settings.executionPolicy,
     requestHostExecution: (request) => requestHostExecution(sender, request),
     permissionMode: PERMISSION_MODES.has(settings.permissionMode)
@@ -1798,8 +2233,8 @@ async function startChatRun(event, payload = {}, opts = {}) {
     onApprovalNeeded: async (approvalPayload) => {
       const approvalEvent = {
         type: AGENT_EVENTS.APPROVAL_NEEDED,
-        runId,
         ...approvalPayload,
+        runId, sessionId, clientRequestId, modelSource, task: lease.task.toSummary(),
       };
       // Engineering callers can explicitly route approvals (for example,
       // repair validation); ordinary verification still uses its own panel.
@@ -1810,48 +2245,39 @@ async function startChatRun(event, payload = {}, opts = {}) {
     },
   });
 
-  const task = new TaskHandle({ taskId: runId, kind: TASK_KINDS.CHAT_RUN, sessionId, projectId: payload.project?.id, ownerId: sender.id, abortController: abort,
-    onStatusChange: (status) => safeSend(sender, 'chat:event', { runId, sessionId, type: 'task-status', task: createTaskEventEnvelope({ ...status, sessionId, projectId: payload.project?.id, type: 'status', data: status }) }),
-  });
-  // Once a run is accepted, side effects are possible even if no tool-end
-  // event arrives. Spend its Plan authority before any asynchronous work.
-  opts.onExecutionStarted?.(runId);
-  activeRun = { abort, gate, runId, sender, task };
-  task.start();
-
-  const emit = (e) => {
-    if (e && e.type === AGENT_EVENTS.PLAN_READY && sessionId) {
-      const binding = planBinding || resolvePlanBinding(event, payload);
-      // Revalidate opaque binding after asynchronous model work.
-      resolvePlanBinding(event, payload);
-      const prev = planState.getPending(sessionId, binding);
-      const plan = planState.propose({ ...e, ...binding });
-      if (prev && prev.planId !== plan.planId) safeSend(sender, 'chat:event', {
-        runId, sessionId, type: 'plan-superseded', planId: prev.planId, newPlanId: plan.planId,
-      });
+  const task = lease.task;
+  lease.gate = gate;
+  const emit = (entry) => {
+    if (!entry || lease.terminalEmitted) return;
+    if (entry.type === AGENT_EVENTS.PLAN_READY && sessionId) {
+      const accepted = planBinding || resolvePlanBinding(event, payload, modelBinding);
+      // The optimistic registry revision was checked at acceptance. Evidence may
+      // advance it within this same run; only actual binding/policy changes revoke Plan rights.
+      const current = resolvePlanBinding(event, { ...payload, expectedRegistryRevision: undefined });
+      if (Object.keys(accepted).some((key) => String(accepted[key]) !== String(current[key]))) {
+        throw Object.assign(new Error('模型、助手、权限或项目绑定已改变，请重新生成计划。'), { code: 'PLAN_BINDING_CHANGED' });
+      }
+      const previous = planState.getPending(sessionId, accepted);
+      const plan = planState.propose({ ...entry, ...accepted });
+      if (previous && previous.planId !== plan.planId) lease.emit({ type: 'plan-superseded', planId: previous.planId, newPlanId: plan.planId });
     }
-    if (e && e.type === AGENT_EVENTS.USAGE) {
-      persistUsageEvent(settings, sessionId, e);
-    }
-    if (!task.isTerminal()) {
-      if (e?.type === AGENT_EVENTS.DONE) task.complete();
-      else if (e?.type === AGENT_EVENTS.ABORTED) task.cancel();
-      else if (e?.type === AGENT_EVENTS.ERROR) task.fail(e.message);
-    }
-    safeSend(sender, 'chat:event', { runId, sessionId, ...e, task: createTaskEventEnvelope({ taskId: runId, kind: TASK_KINDS.CHAT_RUN, sessionId, projectId: payload.project?.id, type: e?.type, data: { state: task.state } }) });
+    lease.emit(entry);
   };
 
   try {
     if (signal.aborted) throwAborted();
 
-    emit({ type: AGENT_EVENTS.RUN_START });
-
-    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    let messages = Array.isArray(payload.messages) ? payload.messages : [];
+    if (settings.autoCompact === true && messages.at(-1)?.role === 'user') {
+      const history = messages.slice(0, -1);
+      const compacted = await compactAcceptedHistory(history, payload, lease, false);
+      if (compacted.needed) {
+        emit({ type: 'session-compacted', ...compacted });
+        messages = [...compacted.messages, messages.at(-1)];
+      }
+    }
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     const userText = lastUser?.content || '';
-    const project = payload.project && payload.project.path
-      ? { name: payload.project.name || path.basename(payload.project.path), path: payload.project.path }
-      : null;
     const senderBinding = payload.projectBindingId
       ? worktreeIpc.resolveBinding(event, { projectBindingId: String(payload.projectBindingId) })
       : null;
@@ -1865,7 +2291,9 @@ async function startChatRun(event, payload = {}, opts = {}) {
     // sampling requests through them.
     await getMcpSessionManager().invalidateOtherProjects(project?.path || '', 'project-changed');
     const samplingController = createMcpSamplingController({
-      settings,
+      settings: { ...settings, model: modelBinding.model, baseUrl: modelBinding.baseUrl },
+      modelBinding,
+      chatFn: boundModelChat(modelBinding, settings, { kind: 'mcp-sampling' }),
       gate,
       sessionKey: sessionId,
       signal,
@@ -1937,6 +2365,9 @@ async function startChatRun(event, payload = {}, opts = {}) {
       return response;
     };
     const runExtensions = {
+      modelBinding,
+      contextPolicy,
+      createBoundChat: (kind, callOptions = {}) => boundModelChat(modelBinding, settings, { kind, signal: callOptions.signal || signal, onUsage: callOptions.onUsage || emit }),
       userDataPath: userDataPath(),
       worktreeManager,
       mcpOAuthManager: getMcpOAuthManager(),
@@ -2009,10 +2440,17 @@ async function startChatRun(event, payload = {}, opts = {}) {
       },
     };
     // Expand @refs only on the copy fed to the model (history keeps original).
-    const modelMessages = messagesForModel(messages, project?.path || null);
+    const modelMessages = messagesForModel(messages, contextPolicy.projectContext ? project?.path : null);
 
-    // Fast path: host list/structure (always real scan) — skip in plan mode for structure-save writes
-    if (project?.path && (isListIntent(userText) || isStructureIntent(userText))) {
+    // Host shortcuts are tools too; never substitute them for a denied role tool.
+    const shortcutToolAllowed = (name) => { try { assertAssistantToolAllowed(name, modelBinding); return true; } catch { return false; } };
+    const shortcutWantsSave = isStructureIntent(userText) || /保存|写入|生成\s*\.md|PROJECT_STRUCTURE/i.test(userText);
+    if (project?.path && contextPolicy.toolsAllowed && shortcutToolAllowed('list_dir')
+      && (!shortcutWantsSave || shortcutToolAllowed('write_file')) && (isListIntent(userText) || isStructureIntent(userText))) {
+      const authorization = await gate.authorize({ tool: 'list_dir', risk: 'read', summary: '读取项目目录结构',
+        path: '.', sessionKey: sessionId, signal, agentMode });
+      if (!authorization.allowed) throw Object.assign(new Error(authorization.reason || '项目读取未获授权。'), { code: 'TOOL_PERMISSION_DENIED' });
+      if (signal.aborted) throwAborted();
       emit({
         type: AGENT_EVENTS.TOOL_START,
         tool: 'host:listTree',
@@ -2026,6 +2464,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
         const fileChanges = [];
         const wantSave = isStructureIntent(userText) || /保存|写入|生成\s*\.md|PROJECT_STRUCTURE/i.test(userText);
         if (wantSave && reply.structureMarkdown) {
+          assertAssistantToolAllowed('write_file', modelBinding);
           const outName = /保存为\s*([^\s]+)/i.test(userText)
             ? userText.match(/保存为\s*([^\s]+)/i)[1].replace(/[\\/]/g, '')
             : 'PROJECT_STRUCTURE.md';
@@ -2066,6 +2505,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
               diff: diffPayload,
               agentMode,
             });
+            if (signal.aborted) throwAborted();
             if (!auth.allowed) {
               const reason = auth.reason || '用户拒绝';
               applied.push({ path: outName, ok: false, error: reason });
@@ -2121,12 +2561,14 @@ async function startChatRun(event, payload = {}, opts = {}) {
     }
 
     // Multi-turn Agent (API + project + agentEnabled)
-    const useAgent = shouldUseAgent({ settings, project });
+    const useAgent = contextPolicy.toolsAllowed && shouldUseAgent({ settings, project, modelBinding });
 
     if (useAgent) {
       const result = await runAgentLoop({
         project,
         settings,
+        modelBinding,
+        chatFn: boundModelChat(modelBinding, settings, { signal, onUsage: emit }),
         messages: modelMessages,
         gate,
         onEvent: emit,
@@ -2151,34 +2593,27 @@ async function startChatRun(event, payload = {}, opts = {}) {
     }
 
     // Fallback single-shot
-    const systemParts = [
-      '你是 Codex 编程助手，回答简洁、可执行，必要时给出命令与代码块。使用简体中文。',
-      '涉及目录结构时，必须以系统提供的真实扫描结果为准，禁止编造路径。',
-    ];
-    if (project) systemParts.push(buildProjectSystemPrompt(project));
+    const systemParts = [modelBinding.assistant.systemPrompt || '你是一位 AI 助手。回答清楚、准确，不编造外部操作的结果。'];
+    if (contextPolicy.projectContext && project) systemParts.push(buildProjectSystemPrompt(project));
 
     let content;
+    let streamedText = false;
     if (settings.mode === 'api') {
-      if (!settings.apiKey) {
-        throw new Error('未配置 API Key，请先在设置中填写，或切换到本地模拟模式');
-      }
-      const sentMessages = [
-        { role: 'system', content: systemParts.join('\n\n') },
-        ...modelMessages,
-      ];
-      const msg = await chatCompletionMessage({
-        baseUrl: settings.baseUrl,
-        apiKey: settings.apiKey,
-        model: settings.model,
+      const sentMessages = [{ role: 'system', content: systemParts.join('\n\n') }, ...modelMessages];
+      const msg = await boundModelChat(modelBinding, settings, { signal, onUsage: emit })({
+        modelBinding,
         messages: sentMessages,
         signal,
+        onDelta: (delta) => {
+          if (!delta?.text || signal.aborted) return;
+          streamedText = true;
+          emit({ type: AGENT_EVENTS.TEXT_DELTA, text: String(delta.text) });
+        },
       });
       content = String(msg?.content || '');
-      const usageEvent = buildUsageEvent({ settings, messages: sentMessages, msg });
-      if (usageEvent) emit(usageEvent);
-      if (!content) throw new Error('API 返回空内容');
+      if (!content) throw Object.assign(new Error('模型返回空内容。'), { code: 'MODEL_EMPTY_RESPONSE' });
     } else {
-      content = generateLocalReply(userText, { project });
+      content = generateLocalReply(userText, { project: contextPolicy.projectContext ? project : null });
     }
 
     if (signal.aborted) throwAborted();
@@ -2187,8 +2622,9 @@ async function startChatRun(event, payload = {}, opts = {}) {
     const fileChanges = [];
     let displayContent = content;
     // Single-shot write fences must go through the same PermissionGate
-    if (project?.path) {
+    if (project?.path && contextPolicy.toolsAllowed && modelBinding.compatibility.toolMode === 'text-compat') {
       const result = await applyWriteFencesWithGate(project.path, content, {
+        modelBinding,
         gate,
         settings,
         sessionKey: sessionId,
@@ -2211,7 +2647,7 @@ async function startChatRun(event, payload = {}, opts = {}) {
       }
     }
 
-    emit({ type: AGENT_EVENTS.TEXT_DELTA, text: displayContent });
+    if (!streamedText) emit({ type: AGENT_EVENTS.TEXT_DELTA, text: displayContent });
     const out = {
       content: displayContent,
       applied,
@@ -2223,23 +2659,12 @@ async function startChatRun(event, payload = {}, opts = {}) {
     emit({ type: AGENT_EVENTS.DONE, ...out });
     return out;
   } catch (err) {
-    if (isAbortError(err, signal)) {
-      emit({ type: AGENT_EVENTS.ABORTED });
-      throwAborted();
-    }
-    emit({
-      type: AGENT_EVENTS.ERROR,
-      message: err instanceof Error ? err.message : String(err),
-    });
-    const publicError = err instanceof Error ? err : new Error(String(err));
-    publicError.message = redactSecrets(publicError.message);
-    if (publicError.stack) publicError.stack = redactSecrets(publicError.stack);
-    throw publicError;
+    const projected = publicRunError(err, modelSource);
+    emit({ type: isAbortError(err, signal) ? AGENT_EVENTS.ABORTED : AGENT_EVENTS.ERROR, ...projected });
+    throw err;
   } finally {
     if (!task.isTerminal()) { if (signal.aborted) task.cancel(); else task.complete(); }
-    if (activeRun && activeRun.runId === runId) {
-      activeRun = null;
-    }
+    // The accepting entry owns release, after this task's cleanup has settled.
   }
 }
 
@@ -2247,39 +2672,59 @@ ipcMain.handle('chat:send', async (event, payload = {}) => startChatRun(event, p
 
 ipcMain.handle('chat:approvePlan', async (event, payload = {}) => {
   const { sessionId, planId } = payload;
-  if (worktreeMutation || activeRun) return { ok: false, code: 'BUSY', error: '请先停止当前执行再批准计划' };
-  let claim;
-  let userMessage;
-  let executionStarted = false;
-  try {
-    claim = planState.claimApprove(planId, resolvePlanBinding(event, payload));
-    userMessage = createMessageV2({ sessionId, role: 'user', content: buildApproveExecutionMessage(claim.plan), createdAt: Date.now() });
-    safeSend(event.sender, 'chat:event', { type: 'plan-approving', planId, sessionId });
-    const result = await startChatRun(event, {
-      ...payload, agentMode: 'agent', sessionId,
-      messages: [...(Array.isArray(payload.messages) ? payload.messages : []), userMessage],
-    }, { stopPrevious: false, onExecutionStarted: () => {
-      planState.markStarted(planId, claim.claimId);
-      executionStarted = true;
-    } });
-    if (result?.ok === false || result?.aborted) throw Object.assign(new Error(result.error || '执行未完成'), { code: result.code });
-    planState.complete(planId, claim.claimId);
-    safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.PLAN_APPROVED, planId, sessionId });
-    return { ok: true, agentMode: 'agent', userMessage, result };
-  } catch (err) {
+  if (worktreeMutation || foregroundModels.current) return busyRunResult();
+  let claim; let userMessage; let executionStarted = false; let approvalFailure;
+  const failApproval = (error, result) => {
+    if (approvalFailure) return approvalFailure;
+    const projected = publicRunError(error, result?.modelSource);
+    const message = projected.safeMessage;
+    const publicError = message + (executionStarted
+      ? '\n执行已开始，可能已经产生变更；请先检查现场并生成新计划，不能直接重试旧计划。' : '');
     let isRetryable = false;
     if (claim) {
       try {
-        const settled = executionStarted
-          ? planState.fail(planId, claim.claimId, err.message)
-          : planState.rollback(planId, claim.claimId, err.message);
+        const settled = executionStarted ? planState.fail(planId, claim.claimId, publicError)
+          : planState.rollback(planId, claim.claimId, publicError);
         isRetryable = settled.status === 'proposed';
-      } catch { /* binding expired during run: never restore authority */ }
-      safeSend(event.sender, 'chat:event', { type: 'plan-approval-failed', planId, sessionId, reason: redactSecrets(err.message), isRetryable, status: isRetryable ? 'proposed' : 'expired' });
+      } catch { /* expired or spent authority must never be restored */ }
+      safeSend(event.sender, 'chat:event', { type: 'plan-approval-failed', ...projected, planId, sessionId,
+        ...(result?.runId ? { runId: result.runId, sessionId: result.sessionId, clientRequestId: result.clientRequestId,
+          modelSource: result.modelSource, task: result.task } : { clientRequestId: payload.clientRequestId }),
+        reason: publicError, error: publicError, isRetryable, status: isRetryable ? 'proposed' : 'expired' });
     }
-    const error = redactSecrets(err.message) + (executionStarted ? '\n执行已开始，可能已经产生变更；请先检查现场并生成新计划，不能直接重试旧计划。' : '');
-    return { ok: false, code: err.code || (executionStarted ? 'PLAN_EXECUTION_FAILED' : undefined), aborted: isAbortError(err), isRetryable, error, agentMode: 'agent', userMessage };
-  }
+    approvalFailure = { ...result, ...projected, ok: false,
+      ...(result?.modelSource ? { modelSource: result.modelSource } : {}),
+      aborted: result?.aborted === true || isAbortError(error), isRetryable, error: publicError, agentMode: 'agent', userMessage };
+    return approvalFailure;
+  };
+  try {
+    claim = planState.claimApprove(planId, resolvePlanBinding(event, payload));
+    userMessage = createMessageV2({ sessionId, role: 'user', content: buildApproveExecutionMessage(claim.plan), createdAt: Date.now() });
+    const accepted = await startChatRun(event, { ...payload, agentMode: 'agent', sessionId,
+      messages: [...(Array.isArray(payload.messages) ? payload.messages : []), userMessage],
+    }, {
+      userMessage,
+      onExecutionStarted: () => {
+        planState.markStarted(planId, claim.claimId); executionStarted = true;
+        safeSend(event.sender, 'chat:event', { type: 'plan-approving', planId, sessionId, ...acceptedRunMetadata(foregroundModels.current) });
+      },
+      onSettled: (result, error) => {
+        if (error || result?.ok === false || result?.aborted) {
+          failApproval(error || Object.assign(new Error(result?.error || '计划执行未完成。'), { code: result?.code }), result);
+          return;
+        }
+        try {
+          planState.complete(planId, claim.claimId);
+          safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.PLAN_APPROVED, planId, sessionId,
+            ...acceptedRunMetadata(foregroundModels.current) });
+        } catch (failure) { failApproval(failure, result); }
+      },
+    });
+    if (approvalFailure) return approvalFailure;
+    if (accepted?.ok === false) return failApproval(Object.assign(new Error(accepted.error || '无法接受计划执行。'), { code: accepted.code }), accepted);
+    // invoke resolves after execution and cleanup; run-start alone carries acceptance.
+    return { ...accepted, agentMode: 'agent', userMessage, result: accepted };
+  } catch (error) { return failApproval(error); }
 });
 
 ipcMain.handle('chat:rejectPlan', async (event, payload = {}) => {
@@ -2287,16 +2732,16 @@ ipcMain.handle('chat:rejectPlan', async (event, payload = {}) => {
     const plan = planState.reject(payload.planId, resolvePlanBinding(event, payload));
     safeSend(event.sender, 'chat:event', { type: AGENT_EVENTS.PLAN_REJECTED, planId: plan.planId, sessionId: plan.sessionId, reason: String(payload.reason || '').slice(0, 1000) });
     return { ok: true };
-  } catch (err) { return { ok: false, code: err.code, error: err.message }; }
+  } catch (err) { const projected = publicRunError(err); return { ...projected, ok: false, error: projected.safeMessage }; }
 });
 
 ipcMain.handle('chat:getPendingPlan', async (event, payload = {}) => {
   try { return { ok: true, plan: planState.getPending(payload.sessionId, resolvePlanBinding(event, payload)) }; }
-  catch (err) { return { ok: false, code: err.code, error: err.message }; }
+  catch (err) { const projected = publicRunError(err); return { ...projected, ok: false, error: projected.safeMessage }; }
 });
 
 ipcMain.handle('web:fetch', async (_event, payload = {}) => {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   if (settings.webEnabled !== true) {
     return { ok: false, error: '网页访问未启用' };
   }
@@ -2314,7 +2759,7 @@ ipcMain.handle('web:fetch', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('usage:summary', async (_event, payload = {}) => {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   if (settings.usageEnabled === false) {
     return { ok: false, error: '用量统计未启用' };
   }
@@ -2342,7 +2787,7 @@ ipcMain.handle('usage:summary', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('usage:clear', async () => {
-  const settings = loadSettings(userDataPath());
+  const settings = modelSettings();
   if (settings.usageEnabled === false) {
     return { ok: false, error: '用量统计未启用' };
   }

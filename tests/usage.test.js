@@ -129,18 +129,38 @@ describe('aggregate', () => {
 });
 
 describe('D.4 compact usage wiring', () => {
-  it('routes both compact artifact calls through one compact-kind write callback', () => {
-    const mainSource = require('node:fs').readFileSync(
-      require('node:path').join(__dirname, '..', 'src', 'main.js'),
-      'utf8'
-    );
-    const start = mainSource.indexOf("ipcMain.handle('session:compact'");
-    const end = mainSource.indexOf("ipcMain.handle('session:export'", start);
-    const handler = mainSource.slice(start, end);
-    assert.ok(start >= 0 && end > start);
-    assert.match(handler, /const onUsage =/);
-    assert.match(handler, /kind:\s*'compact'/);
-    assert.match(handler, /clampInt\(payload\.candidateLimit,\s*0,\s*5,\s*0\)/);
-    assert.match(handler, /generateCompactArtifacts\(\{[\s\S]*?onUsage,/);
+  it('meters summary and role-authorized memory extraction once each on the accepted binding', async t => {
+    const fs = require('node:fs'); const path = require('node:path');
+    const { loadMainFixture, jsonResponse } = require('./helpers/e4-main-fixture');
+    const { usageFilePath, readRecords } = require('../src/ai/usage-store');
+    let attempts = 0;
+    const f = loadMainFixture(t, { settings: { memoryEnabled: true, memoryCandidateEnabled: true }, fetchFn: async () => {
+      attempts++;
+      return attempts === 1 ? jsonResponse('Bound compact summary', { prompt_tokens: 20, completion_tokens: 5 })
+        : jsonResponse(JSON.stringify({ candidates: [{ text: 'Prefer isolated deterministic tests', tags: ['testing'], evidence: 'Use isolated fixtures only.' }] }), { prompt_tokens: 3, completion_tokens: 2 });
+    } });
+    const projectPath = path.join(f.root, 'project'); fs.mkdirSync(projectPath);
+    const project = { id: 'compact-project', path: projectPath };
+    const bound = await f.invoke('worktree:bind', { projectId: project.id, projectPath });
+    assert.equal(bound.ok, true);
+    const accepted = await f.invoke('session:compact', f.payload({ assistantId: 'assistant_codex', sessionId: 'candidate-session',
+      clientRequestId: 'summary-and-memory', project, projectBindingId: bound.projectBindingId, force: true, candidateLimit: 2,
+      messages: Array.from({ length: 25 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `Historical message ${index}. Use isolated fixtures only.` })) }));
+    assert.equal(accepted.accepted, true);
+    const result = await f.settle(accepted);
+    assert.equal(result.ok, true); assert.equal(result.candidates.length, 1);
+    const records = readRecords(usageFilePath(f.root)).records;
+    assert.equal(records.length, 2); assert.equal(attempts, 2);
+    assert.deepEqual(records.map(record => record.kind), ['compact', 'memory-candidate']);
+    assert.deepEqual(records.map(record => [record.in, record.out]), [[20, 5], [3, 2]]);
+    assert.equal(new Set(records.map(record => record.attemptId)).size, 2);
+    for (const record of records) {
+      assert.equal(record.session, accepted.sessionId); assert.equal(record.runId, accepted.runId);
+      assert.equal(record.modelProfileId, accepted.modelSource.modelProfileId);
+      assert.equal(record.assistantId, 'assistant_codex'); assert.equal(record.modelSource.kind, 'api');
+    }
+    assert.equal(f.requests[0].url, f.requests[1].url);
+    assert.equal(f.requests[0].body.model, f.requests[1].body.model);
+    assert.equal(f.credentialReads.length, 0);
   });
 });

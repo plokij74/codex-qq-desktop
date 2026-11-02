@@ -23,7 +23,11 @@ function fail(code = 'INVALID') {
   const suffix = String(code).replace(/^PR_AUDIT_/, '');
   const error = new Error(`PR_AUDIT_${CODES.has(suffix) ? suffix : 'UNAVAILABLE'}`); error.code = error.message; return error;
 }
-const error = (cause) => ({ ok: false, code: fail(cause?.code).code, error: fail(cause?.code).message });
+const error = (cause) => {
+  // Model errors have public codes; never forward provider bodies or callback messages.
+  const code = typeof cause?.code === 'string' && /^MODEL_[A-Z_]{1,64}$/.test(cause.code) ? cause.code : fail(cause?.code).code;
+  return { ok: false, code, error: code };
+};
 function assertCurrent(context = {}) {
   if (context.signal?.aborted) throw fail(context.signal.reason?.code === 'PR_AUDIT_TIMEOUT' ? 'TIMEOUT' : 'CANCELLED');
   if (context.isCurrent?.() === false) throw fail('BINDING');
@@ -124,6 +128,40 @@ function publicationHashes(payload) {
   return { bodyHash: hash(payload.body), comments: (payload.comments || []).map((c) => ({ path: c.path, side: c.side,
     line: c.line, startLine: c.start_line || c.line, bodyHash: hash(c.body) })) };
 }
+function normalizeModelSource(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw fail();
+  const row = {};
+  for (const key of ['providerId', 'providerName', 'modelProfileId', 'modelProfileName', 'model', 'protocol', 'endpoint',
+    'assistantId', 'assistantName', 'bindingRevision', 'runId', 'clientRequestId', 'kind']) {
+    if (raw[key] !== undefined) { text(raw[key], key === 'endpoint' ? 2048 : 256); row[key] = raw[key]; }
+  }
+  for (const key of ['providerRevision', 'modelRevision', 'assistantRevision']) {
+    if (raw[key] != null) {
+      if (!Number.isSafeInteger(raw[key]) || raw[key] <= 0) throw fail();
+      row[key] = raw[key];
+    }
+  }
+  if (!row.model || !['openai-chat-completions', 'openai-responses', 'anthropic-messages'].includes(row.protocol)
+    || !row.endpoint || !row.bindingRevision) throw fail();
+  let url; try { url = new URL(row.endpoint); } catch { throw fail(); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw fail();
+  row.endpoint = `${url.origin}${url.pathname}`; // Public provenance must never contain query, hash or credentials.
+  return Object.freeze(row);
+}
+function summarizeUsage(value = {}) {
+  const count = (v) => Number.isSafeInteger(v) && v >= 0 ? v : null;
+  const inputTokens = count(value?.inputTokens); const outputTokens = count(value?.outputTokens);
+  const source = inputTokens === null || outputTokens === null || value?.source === 'unavailable' ? 'unavailable'
+    : value?.source === 'estimated' || value?.estimated === true ? 'estimated' : 'actual';
+  return { inputTokens, outputTokens, estimated: value?.estimated === true || source === 'estimated', source };
+}
+function validateUsage(value) {
+  keys(value, ['inputTokens', 'outputTokens', 'estimated', 'source']);
+  if (!['inputTokens', 'outputTokens'].every((k) => value[k] === null || Number.isSafeInteger(value[k]) && value[k] >= 0)
+    || typeof value.estimated !== 'boolean' || (value.source !== undefined && !['actual', 'estimated', 'unavailable'].includes(value.source))) throw fail();
+  if (value.source === 'actual' && (value.inputTokens === null || value.outputTokens === null)) throw fail();
+  return structuredClone(value);
+}
 function normalizeRecord(row) {
   if (!row || !isRef(row.auditRef) || !normalizeProjectKey(row.projectKey) || !STATES.has(row.status) || typeof row.createdAt !== 'string'
     || !Number.isFinite(Date.parse(row.createdAt)) || !number(row.prNumber) || Buffer.byteLength(JSON.stringify(row)) > 1024 * 1024) throw fail();
@@ -153,7 +191,11 @@ function normalizeRecord(row) {
     || row.coverage.reviewed + row.coverage.skipped.length !== row.coverage.scoped)) throw fail();
   for (const skipped of row.coverage?.skipped || []) { if (!validPath(skipped.path)) throw fail(); text(skipped.reason, 100); }
   if (row.status === 'completed' && (!row.source || !row.report || !row.coverage)) throw fail();
-  return structuredClone(row);
+  const normalized = structuredClone(row);
+  if (normalized.modelSource !== undefined) normalized.modelSource = normalizeModelSource(normalized.modelSource);
+  if (normalized.usage !== undefined) normalized.usage = validateUsage(normalized.usage);
+  return normalized;
 }
 module.exports = { LIMITS, ACTIVE, STATES, CODES, ref, isRef, hash, digest, number, remoteId, fail, error, assertCurrent, text, keys,
-  scopePath, normalizePr, sourceKey, parsePatch, validLocation, normalizeReport, revision, repairRevision, publicationHashes, normalizeRecord };
+  scopePath, normalizePr, sourceKey, parsePatch, validLocation, normalizeReport, revision, repairRevision, publicationHashes, normalizeRecord,
+  normalizeModelSource, summarizeUsage, validateUsage };
