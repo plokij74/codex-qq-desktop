@@ -132,6 +132,8 @@ PTY、OS 隔离、语义索引、子 Agent 续跑、会话导入、回滚、运�
 
 ## E5：文本附件与受控附件存储
 
+设计规格见 [E5 spec](<../specs/2026-11-03-phase-e5-text-attachments-controlled-storage-design.md>)。实施计划见 [E5 plan](<2026-11-03-phase-e5-text-attachments-controlled-storage.md>)。业务实现已落地，离线/Windows/native/实际 Electron 证据见 [E5 实现与验证记录](<2026-11-03-e5-implementation-verification.md>)；正式真实端点与 OS 用户手势验收未执行。
+
 前置：E2、E3、E4。
 
 - 从普通文件名/大小展示升级为真实内容导入。先覆盖 UTF-8/BOM 文本、代码、Markdown、JSON、CSV 等，验证编码和实际内容类型。

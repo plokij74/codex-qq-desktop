@@ -160,6 +160,7 @@ function setSessionAgentMode(mode) {
   }
   const s = activeSession();
   if (!s) return;
+  if (typeof invalidateAttachmentPreview === 'function') invalidateAttachmentPreview(s.id, '会话模式已切换，原附件预览失效');
   s.agentMode = normalizeSessionAgentMode(mode);
   saveState();
   updateAgentModeToggle();
@@ -972,11 +973,13 @@ function renderOutboxRecovery() {
       if (!original) return toast('原会话不可用；快照仍保留');
       const recovered = { ...original, id: uid(), title: `${original.title || 'AI'} · 未发送草稿`, messages: [],
         pendingMemoryCandidates: [], pendingWorktreeResults: [], updatedAt: Date.now() };
+      // A separate logical draft does not inherit the origin namespace/grant.
+      delete recovered.namespaceRef;
       sessions.unshift(recovered); chatState.sessions = sessions; ensureDraftSlot(recovered);
       window.E4ChatState.updateDraft(chatState, recovered.id, { text: record.outbox.draftText, attachmentRefs: record.outbox.attachmentRefs });
-      const attachments = pendingAttachmentsBySession.get(original.id) || [];
-      const refs = new Set(record.outbox.attachmentRefs.map((ref) => ref.attachmentId));
-      pendingAttachmentsBySession.set(recovered.id, attachments.filter((item, index) => refs.has(String(item.id || item.attachmentId || `${original.id}_${index}_${item.name || 'file'}`))));
+      pendingAttachmentsBySession.set(recovered.id, record.outbox.attachmentRefs.map(ref => window.E5Attachments
+        ? window.E5Attachments.pendingRef({ ...ref, status: 'legacy_unavailable' }, true)
+        : { id: ref.attachmentId, name: ref.name, type: ref.mimeType, size: ref.size, unavailableAfterRestart: true }));
       chatOutboxStore.remove(record.outbox.clientRequestId); switchSession(recovered.id); saveState(); renderLeftDynamic();
     });
     const discard = document.createElement('button'); discard.type = 'button'; discard.className = 'btn-small'; discard.textContent = '丢弃快照';
@@ -993,11 +996,14 @@ function ensureDraftSlot(session) {
   if (!chatState.draftsBySession[session.id]) chatState.draftsBySession[session.id] = { text: '', attachmentRefs: [], revision: 0, updatedAt: 0 };
 }
 function currentAttachmentRefs(session = activeSession()) {
-  return pendingAttaches.map((item, index) => ({
-    attachmentId: String(item.id || item.attachmentId || `${session?.id || 'draft'}_${index}_${item.name || 'file'}`),
-    name: String(item.name || 'attachment'),
-    mimeType: String(item.type || item.mimeType || 'application/octet-stream'),
-    size: Number.isFinite(item.size) ? item.size : (item.dataUrl ? Math.floor(item.dataUrl.length * 0.75) : 0),
+  const items = session?.id === activeSessionId ? pendingAttaches
+    : pendingAttachmentsBySession.get(session?.id) || chatState.draftsBySession?.[session?.id]?.attachmentRefs || [];
+  if (window.E5Attachments) return window.E5Attachments.publicRefs(items);
+  // Legacy/offline E4 host projection: never derive a body or size from dataUrl.
+  return items.map((item, index) => ({
+    attachmentId: String(item.attachmentId || item.id || `${session?.id || 'draft'}_${index}_${item.name || 'file'}`),
+    name: String(item.name || 'attachment'), mimeType: String(item.mimeType || item.type || 'application/octet-stream'),
+    size: Number.isFinite(item.size) ? item.size : 0,
   }));
 }
 function persistActiveDraft() {
@@ -1005,7 +1011,9 @@ function persistActiveDraft() {
   if (!session || session.identityType === 'demo-contact') return { ok: true };
   ensureDraftSlot(session);
   pendingAttachmentsBySession.set(session.id, pendingAttaches);
+  const previousRevision = chatState.draftsBySession[session.id]?.revision;
   const result = window.E4ChatState.updateDraft(chatState, session.id, { text: input?.value || '', attachmentRefs: currentAttachmentRefs(session) });
+  if (result.draft?.revision !== previousRevision && typeof invalidateAttachmentPreview === 'function') invalidateAttachmentPreview(session.id, '草稿已编辑，原附件预览失效');
   if (!result.ok) {
     draftPersistenceError = result.error;
     const status = document.getElementById('draft-persistence-status');
@@ -1024,6 +1032,7 @@ function persistActiveDraft() {
 function persistBeforeSessionChange() {
   const result = persistActiveDraft();
   if (!result.ok && !result.inMemorySaved) { toast(result.error || '当前草稿无法保存，请先修正后再切换会话'); return false; }
+  if (typeof invalidateAttachmentPreview === 'function') invalidateAttachmentPreview(activeSessionId, '即将切换会话，原附件预览失效');
   return true;
 }
 function restoreSessionDraft(session) {
@@ -1033,7 +1042,8 @@ function restoreSessionDraft(session) {
   const draft = chatState.draftsBySession[session.id];
   input.value = draft?.text || '';
   pendingAttaches = pendingAttachmentsBySession.get(session.id)
-    || (draft?.attachmentRefs || []).map((ref) => ({ id: ref.attachmentId, name: ref.name, type: ref.mimeType, size: ref.size, unavailableAfterRestart: true }));
+    || (draft?.attachmentRefs || []).map(ref => window.E5Attachments ? window.E5Attachments.pendingRef(ref, true)
+      : { id: ref.attachmentId, name: ref.name, type: ref.mimeType, size: ref.size, unavailableAfterRestart: true });
   renderAttachPreview();
 }
 function getAssistantForSession(session) {
@@ -1796,15 +1806,34 @@ function bindFileChangesToggles(root) {
   });
 }
 
-function renderAttachmentsHtml(parts) {
+function renderAttachmentsHtml(parts, sessionId = activeSessionId) {
   if (!Array.isArray(parts)) return '';
-  const atts = parts.filter((p) => p && p.type === 'attachment_ref');
-  if (!atts.length) return '';
-  const items = atts.map((a) => {
-    const sz = a.size ? ` (${Math.round(a.size / 1024)} KB)` : '';
-    return `<span class="msg-attachment-badge">📎 ${escapeHtml(a.name || '附件')}${sz}</span>`;
+  const attachments = parts.filter(part => part?.type === 'attachment_ref'); if (!attachments.length) return '';
+  const session = sessions.find(item => item.id === sessionId);
+  const context = window.E5Attachments && attachmentContext.sessions?.get(sessionId);
+  const items = attachments.map(raw => {
+    const ref = window.E5Attachments ? window.E5Attachments.safeRef(context?.refStates?.get(raw.attachmentId)
+      || (context?.inventoryLoaded && raw.status === 'ready' ? { ...raw, status: 'missing' } : raw)) : raw;
+    const status = window.E5Attachments ? window.E5Attachments.statusLabel(window.E5Attachments.pendingRef(ref, !context?.bindingId)) : '旧引用不可用';
+    const size = ref.size ? ` (${Math.round(ref.size / 1024)} KB)` : '';
+    const attrs = `data-session-id="${escapeHtml(sessionId)}" data-attachment-id="${escapeHtml(ref.attachmentId || '')}"`;
+    const actions = window.E5Attachments ? `<button type="button" class="attachment-history-action" ${attrs} data-action="reuse"${ref.status !== 'ready' || !context?.bindingId ? ' disabled' : ''}>加入草稿（新预览）</button>`
+      + `<button type="button" class="attachment-history-action" ${attrs} data-action="reselect">重新选择文本</button>`
+      + (session?.namespaceRef && !context?.bindingId ? `<button type="button" class="attachment-history-action" ${attrs} data-action="restore">原生确认恢复</button>` : '')
+      + `<button type="button" class="attachment-history-action" ${attrs} data-action="deleteCopy"${!context?.bindingId || ref.refVersion !== 1 ? ' disabled' : ''}>仅删应用副本</button>` : '';
+    return `<span class="attachment-history-item"><span class="msg-attachment-badge">📎 ${escapeHtml(ref.name || '附件')}${size} · ${escapeHtml(status)}</span>${actions}</span>`;
   }).join(' ');
   return `<div class="msg-attachments">${items}</div>`;
+}
+function bindAttachmentHistoryActions(root) {
+  root?.querySelectorAll('.attachment-history-action').forEach(button => {
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      const session = sessions.find(item => item.id === button.dataset.sessionId);
+      if (button.dataset.action === 'restore') return restoreAttachmentSession(session);
+      return attachmentHistoryAction(button.dataset.sessionId, button.dataset.attachmentId, button.dataset.action);
+    });
+  });
 }
 
 function renderPlanCardHtml(plan, sessionId) {
@@ -1918,6 +1947,7 @@ function renderMessages() {
   renderWorktreeCards(list, session);
   bindFileChangesToggles(list);
   bindPlanCardActions(list);
+  if (typeof bindAttachmentHistoryActions === 'function') bindAttachmentHistoryActions(list);
   if (liveRun && chatRun.el) {
     list.appendChild(chatRun.el);
   }
@@ -2062,28 +2092,40 @@ async function approvePlanFromCard(card, planEv) {
   if (sending) return toast('已有前台任务运行；批准未发送，也不会停止原任务');
   const planId = card?.dataset.planId || planEv?.planId;
   const sessionId = card?.dataset.sessionId || planEv?.sessionId || activeSessionId;
-  const session = sessions.find((s) => s.id === sessionId);
+  const session = sessions.find(item => item.id === sessionId);
   if (!session || !planId || !window.codex?.approvePlan || !modelManager) return;
+  if (activeSessionId !== sessionId) return toast('请回到计划所属会话后批准；当前草稿不会被替换');
+  const draft = persistActiveDraft(); if (!draft.ok) return toast(draft.error || '草稿暂不可保存，批准未发送');
   const project = sessionProject(session);
-  const outbox = window.E4ChatState.createOutbox({ state: chatState, sessionId,
+  const attachmentRefs = currentAttachmentRefs(session);
+  const revision = Number(card?.dataset.planRevision ?? planEv?.planRevision);
+  const planRevision = Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+  let outbox = window.E4ChatState.createOutbox({ state: chatState, sessionId,
     assistantId: session.assistantId, modelProfileId: session.modelProfileId || null,
     expectedRegistryRevision: modelManager.getState().revision, projectBindingId: '',
-    messages: session.messages.filter((message) => !message.error), text: '' });
-  const entry = { outbox, session, userMessage: null, consumeDraft: false, planId,
+    messages: session.messages.filter(message => !message.error), text: '' });
+  const entry = { outbox, session, userMessage: null, attachmentRefs, consumeDraft: false, planId,
+    agentMode: sessionAgentMode(session), projectPath: project?.path || '',
     ledger: window.E4ChatState.createRunLedger({ sessionId, clientRequestId: outbox.clientRequestId }), accepted: false, ack: null };
   pendingChatRequests.set(outbox.clientRequestId, entry); setSending(true);
   try {
     const projectBindingId = project?.path ? await bindWorktreeProject(project) : '';
     if (project?.path && !projectBindingId) return rejectChatEntry(entry, 'PROJECT_BINDING_STALE', '项目绑定已失效');
+    outbox = Object.freeze({ ...outbox, projectBindingId }); entry.outbox = outbox;
     await syncModelSessionReferences();
-    const res = await window.codex.approvePlan({ sessionId, planId,
+    const snapshot = { sessionId, planId, ...(planRevision == null ? {} : { planRevision }),
       assistantId: outbox.assistantId, modelProfileId: outbox.modelProfileId,
       clientRequestId: outbox.clientRequestId, expectedRegistryRevision: outbox.expectedRegistryRevision,
       messages: cloneForIpc(outbox.messages), project: project?.path ? { id: project.id, name: project.name, path: project.path } : null,
-      projectBindingId });
+      projectBindingId, draftRevision: outbox.draftRevision, attachmentIds: attachmentRefs.map(ref => ref.attachmentId) };
+    const payload = await prepareAttachmentRequest(entry, snapshot, 'approvePlan');
+    const res = await window.codex.approvePlan(payload);
     if (res?.ok === false) {
-      if (res.isRetryable === true) setPersistedPlanStatus(sessionId, planId, 'proposed');
-      else if (res.isRetryable === false) setPersistedPlanStatus(sessionId, planId, 'expired');
+      // Pre-accept E5 rejection never consumes/invalidates existing Plan rights.
+      if (!String(res.code || '').startsWith('ATTACHMENT_')) {
+        if (res.isRetryable === true) setPersistedPlanStatus(sessionId, planId, 'proposed');
+        else if (res.isRetryable === false) setPersistedPlanStatus(sessionId, planId, 'expired');
+      }
     }
     settleChatInvoke(entry, res);
   } catch (error) { rejectChatEntry(entry, error?.code, error?.message || String(error)); }
@@ -2960,6 +3002,10 @@ function rememberCompletedRun(ledger) {
 function appendAcceptedUserMessage(entry) {
   if (!entry.accepted || entry.userInserted || !entry.userMessage) return;
   entry.session.messages.push(window.codex.messageSchema.projectToStorageJson(entry.userMessage));
+  if (window.E5Attachments && typeof attachmentContext === 'function') {
+    const context = attachmentContext(entry.session); context.refStates ||= new Map();
+    for (const ref of window.E5Attachments.publicRefs(entry.userMessage.parts?.filter(part => part?.type === 'attachment_ref'))) context.refStates.set(ref.attachmentId, ref);
+  }
   entry.userInserted = true; entry.session.updatedAt = Date.now();
   saveState(); if (activeSessionId === entry.session.id) renderMessages();
 }
@@ -3010,7 +3056,8 @@ function handleChatEvent(ev) {
     run.el.dataset.runId = run.runId;
     activeForegroundTask = { ...ev.task, sessionId: session.id, runId: run.runId,
       clientRequestId: run.clientRequestId, kind: ev.task?.kind || 'chat_agent', stopping: false };
-    if (ev.userMessage && !entry.consumeDraft) entry.userMessage = ev.userMessage;
+    if (ev.userMessage) entry.userMessage = ev.userMessage;
+    if (typeof finishAttachmentRequest === 'function') finishAttachmentRequest(entry);
     appendAcceptedUserMessage(entry);
     if (!entry.consumeDraft) { session.agentMode = 'agent'; updateAgentModeToggle(); }
     if (entry.consumeDraft) {
@@ -3333,6 +3380,7 @@ async function deleteSession(id) {
   if (!(await appConfirm('确定删除「' + s.title + '」？'))) return;
   if (sessionHasForegroundWork(id)) return toast('任务执行或等待接受中，无法删除该会话，请先停止并等待清理');
   const wasActive = activeSessionId === id;
+  forgetAttachmentSession(id);
   sessions = sessions.filter((x) => x.id !== id);
   delete chatState.draftsBySession[id]; pendingAttachmentsBySession.delete(id);
   if (wasActive) activeSessionId = sessions[0].id;
@@ -3360,6 +3408,7 @@ async function deleteProject(id) {
   const removedSessionIds = sessions.filter((session) => session.projectId === id).map((session) => session.id);
   const wasActive = removedSessionIds.includes(activeSessionId);
   for (const sessionId of removedSessionIds) {
+    forgetAttachmentSession(sessionId);
     delete chatState.draftsBySession[sessionId]; pendingAttachmentsBySession.delete(sessionId);
   }
   projects = projects.filter((x) => x.id !== id);
@@ -3886,6 +3935,7 @@ function showChatView() {
 function switchSession(id) {
   if (!sessions.some((s) => s.id === id)) return;
   persistActiveDraft();
+  if (id !== activeSessionId && typeof invalidateAttachmentPreview === 'function') invalidateAttachmentPreview(activeSessionId, '会话已切换，原附件预览失效');
   activeSessionId = id;
   restoreSessionDraft(activeSession());
   saveState(); updateHeader(); renderMessages(); renderLeftDynamic(); renderFriends(); updateStatusBar(); updateAgentModeToggle();
@@ -4637,11 +4687,15 @@ async function refreshAtComplete() {
   atCompleteState.tokenEnd = token.end;
   atCompleteState.prefix = token.prefix;
   try {
+    const projectBindingId = worktreeBindings.get(proj.id) || '';
+    if (!projectBindingId) { hideAtComplete(); return; }
     const res = await window.codex.atRefComplete({
-      projectPath: proj.path,
+      projectBindingId, sessionId: session.id, assistantId: session.assistantId,
+      modelProfileId: session.modelProfileId || null, expectedRegistryRevision: modelManager?.getState?.().revision,
       prefix: token.prefix,
     });
-    if (reqId !== atCompleteState.reqId) return;
+    if (reqId !== atCompleteState.reqId || activeSessionId !== session.id
+      || worktreeBindings.get(proj.id) !== projectBindingId || input.value !== text) return;
     const items = Array.isArray(res?.items) ? res.items : [];
     if (!items.length) {
       hideAtComplete();
@@ -4706,42 +4760,360 @@ function bindAtComplete() {
     }
   });
 }
-function renderAttachPreview() {
-  const box = document.getElementById('attach-preview');
-  if (!pendingAttaches.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
-  box.classList.remove('hidden');
-  box.innerHTML = pendingAttaches.map((a, i) => '<div class="attach-chip">' + (a.type.startsWith('image/') && a.dataUrl ? '<img src="' + a.dataUrl + '" alt="" />' : '📎') + '<span>' + escapeHtml(a.name) + '</span><button type="button" data-rm="' + i + '">×</button></div>').join('');
-  box.querySelectorAll('[data-rm]').forEach((btn) => btn.addEventListener('click', () => { pendingAttaches.splice(Number(btn.dataset.rm), 1); renderAttachPreview(); }));
+function attachmentApi() { return window.codex?.attachments || null; }
+function attachmentContext(session = activeSession()) {
+  if (!session) return null;
+  const contexts = attachmentContext.sessions ||= new Map();
+  if (!contexts.has(session.id)) contexts.set(session.id, { sessionId: session.id, bindingId: '', storageMode: '',
+    registration: null, requests: new Map(), generation: 0, closed: false });
+  return contexts.get(session.id);
 }
-function readFileAsDataUrl(file) {
-  return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(file); });
+function attachmentEnvelope(context, clientRequestId = uid('attachment')) {
+  return { sessionId: context.sessionId, attachmentSessionBindingId: context.bindingId, clientRequestId };
+}
+function attachmentError(result, fallback = '附件操作未完成；草稿保留') {
+  const error = new Error(result?.error || fallback); error.code = result?.code || 'ATTACHMENT_NOT_READY'; return error;
+}
+function owningAttachmentRefs(session) {
+  const items = session.id === activeSessionId ? pendingAttaches
+    : pendingAttachmentsBySession.get(session.id) || chatState.draftsBySession?.[session.id]?.attachmentRefs || [];
+  return window.E5Attachments.publicRefs(items);
+}
+function writeOwningAttachmentRefs(session, refs) {
+  if (!sessions.includes(session) || storageWriteBlocked) return false;
+  const safe = window.E5Attachments.publicRefs(refs);
+  const items = safe.map(ref => window.E5Attachments.pendingRef(ref));
+  const draft = chatState.draftsBySession[session.id]; if (!draft) return false;
+  const text = session.id === activeSessionId ? document.getElementById('chat-input')?.value || '' : draft.text;
+  const result = window.E4ChatState.updateDraft(chatState, session.id, { text, attachmentRefs: safe });
+  pendingAttachmentsBySession.set(session.id, items);
+  if (session.id === activeSessionId) pendingAttaches = items;
+  invalidateAttachmentPreview(session.id, '附件选择或状态已变化');
+  saveState(); if (session.id === activeSessionId) renderAttachPreview();
+  if (!result.ok) toast(result.error); return result.ok;
+}
+function applyAttachmentInventory(session, result) {
+  if (!sessions.includes(session)) return;
+  const byId = new Map(window.E5Attachments.publicRefs(result?.refs).map(ref => [ref.attachmentId, ref]));
+  const context = attachmentContext(session); context.refStates = byId; context.inventoryLoaded = true;
+  const refs = owningAttachmentRefs(session).map(ref => byId.get(ref.attachmentId) || { ...ref,
+    status: ref.status === 'legacy_unavailable' || ref.status === 'unsupported' ? ref.status : 'missing' });
+  writeOwningAttachmentRefs(session, refs);
+}
+async function ensureAttachmentSession(session) {
+  const api = attachmentApi(); if (!api || !window.E5Attachments) throw attachmentError(null, 'E5 文本附件服务尚未就绪');
+  const context = attachmentContext(session);
+  if (context.bindingId) return context;
+  if (session.namespaceRef) throw attachmentError({ code: 'ATTACHMENT_RESTORE_REQUIRED' }, '历史附件需先点击“恢复附件缓存”，由主进程原生确认；不会自动读取来源');
+  if (context.registration) return context.registration;
+  context.registration = (async () => {
+    const result = await api.registerSession({ sessionId: session.id, clientRequestId: uid('attachment-register') });
+    if (!result?.ok || !result.attachmentSessionBindingId || !/^[A-Za-z0-9_-]{1,160}$/.test(result.namespaceRef || '')) throw attachmentError(result);
+    if (context.closed || !sessions.includes(session)) {
+      await api.cancel({ sessionId: session.id, attachmentSessionBindingId: result.attachmentSessionBindingId, clientRequestId: uid('attachment-cancel') });
+      throw attachmentError(null, '原会话已删除，附件结果未写入其他草稿');
+    }
+    context.bindingId = result.attachmentSessionBindingId; context.storageMode = result.storageMode;
+    session.namespaceRef = result.namespaceRef; saveState();
+    if (session.id === activeSessionId) renderAttachmentControls();
+    return context;
+  })();
+  try { return await context.registration; } finally { context.registration = null; }
+}
+async function restoreAttachmentSession(session = activeSession()) {
+  if (!session?.namespaceRef || storageWriteBlocked) return;
+  const api = attachmentApi(); if (!api) return toast('E5 文本附件服务尚未就绪');
+  const context = attachmentContext(session); if (context.registration) return;
+  // Only this explicit user action calls restore. Main still owns the native
+  // confirmation; a renderer button or namespace locator is not permission.
+  context.registration = (async () => {
+    const result = await api.restoreSession({ sessionId: session.id, namespaceRef: session.namespaceRef, clientRequestId: uid('attachment-restore') });
+    if (!result?.ok) throw attachmentError(result);
+    if (context.closed || !sessions.includes(session)) {
+      if (result.attachmentSessionBindingId) await api.cancel({ sessionId: session.id, attachmentSessionBindingId: result.attachmentSessionBindingId, clientRequestId: uid('attachment-cancel') });
+      return;
+    }
+    if (!result.attachmentSessionBindingId || result.namespaceRef !== session.namespaceRef) throw attachmentError(null, '恢复返回的附件空间不匹配');
+    context.bindingId = result.attachmentSessionBindingId; context.storageMode = result.storageMode;
+    applyAttachmentInventory(session, result); toast(result.storageMode === 'memory' ? '当前仅内存模式；重启后需重新选择' : '附件缓存已原生确认；历史引用仍不会自动进入发送');
+  })();
+  renderAttachmentControls();
+  try { await context.registration; } catch (error) { toast(error.message); }
+  finally { context.registration = null; if (session.id === activeSessionId) { renderAttachmentControls(); renderMessages(); } }
+}
+async function importTextAttachments(session, files = null) {
+  if (!session || session.identityType === 'demo-contact' || storageWriteBlocked) return toast('当前会话或受保护草稿不能添加附件');
+  let context, requestId;
+  try {
+    context = await ensureAttachmentSession(session); requestId = uid('attachment-import');
+    const generation = context.generation;
+    context.requests.set(requestId, { kind: 'import' }); renderAttachmentControls();
+    const result = files ? await attachmentApi().proposeDrop({ ...attachmentEnvelope(context, requestId), files })
+      : await attachmentApi().chooseExternal(attachmentEnvelope(context, requestId));
+    if (!result?.ok) throw attachmentError(result);
+    const imported = window.E5Attachments.publicRefs(result.refs);
+    if (context.closed || generation !== context.generation || !sessions.includes(session)) {
+      await attachmentApi().cancel({ ...attachmentEnvelope(context), targetClientRequestId: requestId }); return;
+    }
+    if (!imported.length) return;
+    context.storageMode = result.storageMode || context.storageMode;
+    context.refStates ||= new Map();
+    for (const ref of imported) context.refStates.set(ref.attachmentId, ref);
+    const ids = new Set(imported.map(ref => ref.attachmentId));
+    writeOwningAttachmentRefs(session, [...owningAttachmentRefs(session).filter(ref => !ids.has(ref.attachmentId)), ...imported]);
+    toast(session.id === activeSessionId ? `已添加 ${imported.length} 个受控文本附件；发送前仍需预览确认` : '附件已加入原会话草稿，未切换当前窗口');
+  } catch (error) { toast(error.message); }
+  finally { if (context && requestId) context.requests.delete(requestId); if (session?.id === activeSessionId) renderAttachmentControls(); }
 }
 async function handleFiles(fileList, asImage) {
   const files = Array.from(fileList || []);
-  let hasNonImage = false;
-  for (const file of files) {
-    if (asImage || file.type.startsWith('image/')) {
-      if (file.size > 2 * 1024 * 1024) { toast('图片过大（>2MB）：' + file.name); continue; }
-      pendingAttaches.push({ name: file.name, type: file.type || 'image/*', dataUrl: await readFileAsDataUrl(file) });
-    } else {
-      hasNonImage = true;
-      pendingAttaches.push({ name: file.name, type: file.type || 'file', size: file.size });
-    }
+  if (asImage || files.some(file => String(file.type || '').startsWith('image/'))) {
+    toast('E6 图片附件尚未支持：不会读取、上传或持久化图片/base64'); return;
   }
-  renderAttachPreview();
-  if (hasNonImage) {
-    toast('已添加附件。注意：当前版本仅记录元数据，模型暂无法直接读取非图片文件内容（待 E5/E7 实现完整解析）', 5000);
-  } else {
-    toast('已添加 ' + files.length + ' 个附件');
-  }
+  if (files.length) await importTextAttachments(activeSession(), files);
 }
-function buildOutgoingText(raw) {
-  let text = raw.trim();
-  if (pendingAttaches.length) {
-    const parts = pendingAttaches.map((a) => a.dataUrl ? ('![' + a.name + '](' + a.dataUrl + ')') : ('📎 附件：' + a.name + (a.size ? (' (' + Math.round(a.size / 1024) + ' KB)') : '')));
-    text = [text, ...parts].filter(Boolean).join('\n\n');
+async function cancelAttachmentImports(session = activeSession()) {
+  const context = session && attachmentContext(session); if (!context) return;
+  context.generation++;
+  const requests = [...context.requests].filter(([, request]) => request.kind === 'import');
+  await Promise.all(requests.map(async ([id]) => {
+    try { await attachmentApi()?.cancel({ ...attachmentEnvelope(context), targetClientRequestId: id }); } catch { /* no source/body logging */ }
+    context.requests.delete(id);
+  }));
+  if (session.id === activeSessionId) renderAttachmentControls();
+}
+async function removeDraftAttachment(session, attachmentId) {
+  if (!session || storageWriteBlocked) return;
+  const context = attachmentContext(session);
+  invalidateAttachmentPreview(session.id, '附件已移除'); context.generation++;
+  try {
+    if (context.bindingId) {
+      const result = await attachmentApi().remove({ ...attachmentEnvelope(context), attachmentId });
+      if (!result?.ok) throw attachmentError(result);
+    } else {
+      // Cold/legacy metadata has no live grant to revoke. Never manufacture one
+      // to remove a draft reference, and never delete any source/app copy here.
+      await attachmentApi()?.cancel(attachmentEnvelope(context)).catch(() => {});
+    }
+    writeOwningAttachmentRefs(session, owningAttachmentRefs(session).filter(ref => ref.attachmentId !== attachmentId));
+  } catch (error) { toast(error.message); }
+}
+async function attachmentHistoryAction(sessionId, attachmentId, action) {
+  const session = sessions.find(item => item.id === sessionId); if (!session) return;
+  if (action === 'reselect') return importTextAttachments(session);
+  try {
+    const context = await ensureAttachmentSession(session);
+    if (action === 'deleteCopy') {
+      invalidateAttachmentPreview(session.id, '删除应用副本');
+      const result = await attachmentApi().deleteCopy({ ...attachmentEnvelope(context), attachmentId });
+      if (!result?.ok) throw attachmentError(result);
+      toast('仅删除应用管理的副本，未触碰原文件');
+    }
+    const result = await attachmentApi().list(attachmentEnvelope(context)); if (!result?.ok) throw attachmentError(result);
+    context.storageMode = result.storageMode || context.storageMode;
+    applyAttachmentInventory(session, result);
+    if (action === 'reuse') {
+      const ref = window.E5Attachments.publicRefs(result.refs).find(item => item.attachmentId === attachmentId);
+      if (!ref || ref.status !== 'ready') throw attachmentError(null, '引用缺失、损坏或过期；请重新选择文本文件');
+      writeOwningAttachmentRefs(session, [...owningAttachmentRefs(session).filter(item => item.attachmentId !== attachmentId), ref]);
+      toast('已显式加入原会话草稿；下一次发送将重新准备预览');
+    }
+    if (session.id === activeSessionId) renderMessages();
+  } catch (error) { toast(error.message); }
+}
+async function showAttachmentCache(session = activeSession(), clear = false) {
+  if (!session) return;
+  try {
+    const context = await ensureAttachmentSession(session);
+    const result = await attachmentApi()[clear ? 'clearCache' : 'cacheStatus'](attachmentEnvelope(context));
+    if (!result?.ok) throw attachmentError(result);
+    if (clear) {
+      invalidateAttachmentPreview(session.id, '缓存已清理');
+      const list = await attachmentApi().list(attachmentEnvelope(context)); if (list?.ok) applyAttachmentInventory(session, list);
+      const protectedCount = Array.isArray(result.protectedRefs) ? result.protectedRefs.length : result.protectedCount || 0;
+      toast(`仅清理应用副本，原文件未动${protectedCount ? `；${protectedCount} 项受保护未删除` : ''}`);
+    } else {
+      toast(`附件缓存：${result.storageMode === 'memory' ? '仅内存（不会落盘）' : '加密模式'} · ${result.records ?? result.recordCount ?? 0} 项 · ${result.bytes ?? result.totalBytes ?? 0} 字节；原文件不受清理影响`, 6000);
+    }
+    if (session.id === activeSessionId) { renderAttachmentControls(); renderMessages(); }
+  } catch (error) { toast(error.message); }
+}
+function renderAttachmentControls() {
+  if (!window.E5Attachments) return;
+  const session = activeSession(); const context = session && attachmentContext(session);
+  const status = document.getElementById('attachment-storage-status');
+  const imports = context ? [...context.requests.values()].filter(request => request.kind === 'import').length : 0;
+  if (status) status.textContent = imports ? '正在主进程确认/读取文本；结果只加入原会话草稿…'
+    : context?.storageMode === 'memory' ? '仅内存模式：不会伪称加密；重启后需重选。'
+      : session?.namespaceRef && !context?.bindingId ? '历史引用待恢复：仅保留元数据，不会自动读取。' : 'E5 仅文本：原生选择/确认，发送前预览；图片 E6 未支持。';
+  const restore = document.getElementById('btn-attachment-restore');
+  if (restore) { restore.hidden = !session?.namespaceRef || !!context?.bindingId; restore.disabled = !!context?.registration || storageWriteBlocked; }
+  const cancel = document.getElementById('btn-attachment-cancel-import'); if (cancel) { cancel.hidden = !imports; cancel.disabled = !imports; }
+  const choose = document.getElementById('btn-attach'); if (choose) choose.disabled = !!imports || !!context?.registration || storageWriteBlocked;
+}
+function renderAttachPreview() {
+  const box = document.getElementById('attach-preview'); if (!box) return;
+  box.innerHTML = '';
+  if (!pendingAttaches.length) { box.classList.add('hidden'); renderAttachmentControls(); return; }
+  box.classList.remove('hidden');
+  const session = activeSession();
+  for (const item of pendingAttaches) {
+    const chip = document.createElement('div'); chip.className = 'attach-chip';
+    const label = document.createElement('span');
+    label.textContent = `📎 ${item.name || '附件'} · ${window.E5Attachments?.statusLabel(item) || '旧引用不可用'}`;
+    const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = '×'; remove.title = '从草稿移除（不删除原文件）';
+    remove.addEventListener('click', () => removeDraftAttachment(session, item.attachmentId || item.id));
+    chip.append(label, remove); box.appendChild(chip);
   }
-  return text;
+  renderAttachmentControls();
+}
+function buildOutgoingText(raw) { return String(raw || '').trim(); }
+function attachmentRequestCurrent(entry) {
+  const session = sessions.find(item => item.id === entry.outbox.sessionId);
+  if (!session || session !== entry.session || activeSessionId !== session.id || entry.attachmentPreparation?.invalidated) return false;
+  if (chatState.draftsBySession?.[session.id]?.revision !== entry.outbox.draftRevision
+    || session.assistantId !== entry.outbox.assistantId || (session.modelProfileId || null) !== entry.outbox.modelProfileId
+    || modelManager?.getState?.().revision !== entry.outbox.expectedRegistryRevision) return false;
+  const project = sessionProject(session);
+  return (entry.agentMode == null || sessionAgentMode(session) === entry.agentMode)
+    && (project?.path || '') === (entry.projectPath || '')
+    && (!entry.outbox.projectBindingId || worktreeBindings.get(project?.id) === entry.outbox.projectBindingId);
+}
+function finishAttachmentRequest(entry) {
+  const context = attachmentContext.sessions?.get(entry.outbox.sessionId);
+  context?.requests.delete(entry.outbox.clientRequestId);
+  if (attachmentSendPreview.current?.entry === entry) closeAttachmentSendPreview({ confirmed: false });
+  entry.attachmentPreparation = null;
+}
+function cancelAttachmentPreparation(entry, previewId = '') {
+  const record = entry?.attachmentPreparation; if (!record || entry.accepted) return Promise.resolve();
+  return attachmentApi()?.cancel({ ...attachmentEnvelope(record.context),
+    targetClientRequestId: entry.outbox.clientRequestId, ...(previewId || record.previewId ? { previewId: previewId || record.previewId } : {}) }).catch(() => {});
+}
+function invalidateAttachmentPreview(sessionId, reason = '预览已失效，请重新发送并确认') {
+  const context = attachmentContext.sessions?.get(sessionId); if (!context) return;
+  for (const request of context.requests.values()) if (request.kind === 'prepare' && !request.entry.accepted) {
+    request.entry.attachmentPreparation.invalidated = true;
+    cancelAttachmentPreparation(request.entry);
+  }
+  const current = attachmentSendPreview.current;
+  if (current?.entry.outbox.sessionId === sessionId) { closeAttachmentSendPreview({ confirmed: false }); if (reason) toast(reason); }
+}
+function forgetAttachmentSession(sessionId) {
+  const context = attachmentContext.sessions?.get(sessionId); if (!context) return;
+  invalidateAttachmentPreview(sessionId, '原会话已删除'); context.closed = true; context.generation++;
+  if (context.bindingId) attachmentApi()?.cancel(attachmentEnvelope(context)).catch(() => {});
+  attachmentContext.sessions.delete(sessionId);
+}
+function closeAttachmentSendPreview(result) {
+  const current = attachmentSendPreview.current; if (!current) return;
+  attachmentSendPreview.current = null; clearTimeout(current.timer); current.pageSequence++;
+  const modal = document.getElementById('attachment-send-preview'); modal?.classList.add('hidden');
+  for (const id of ['attachment-preview-text', 'attachment-preview-status', 'attachment-preview-target', 'attachment-preview-budget', 'attachment-preview-storage']) {
+    const element = document.getElementById(id); if (element) element.textContent = '';
+  }
+  const list = document.getElementById('attachment-preview-list'); if (list) list.innerHTML = '';
+  const select = document.getElementById('attachment-preview-file'); if (select) select.innerHTML = '';
+  if (!result.confirmed && !result.reprepare) cancelAttachmentPreparation(current.entry);
+  current.previousFocus?.focus?.(); current.resolve(result);
+}
+function updateAttachmentPreviewConfirm() {
+  const current = attachmentSendPreview.current; const confirm = document.getElementById('attachment-preview-confirm'); if (!confirm) return;
+  const ack = document.getElementById('attachment-preview-truncated');
+  confirm.disabled = !current || !current.pageLoaded || current.selectionDirty || !attachmentRequestCurrent(current.entry)
+    || current.response.expiresAt <= Date.now() || (current.truncated && !ack?.checked);
+}
+async function readAttachmentPreviewPage(offset = 0) {
+  const current = attachmentSendPreview.current; if (!current) return;
+  const selected = document.getElementById('attachment-preview-file')?.value || current.refs[0]?.attachmentId;
+  if (!selected) return;
+  const sequence = ++current.pageSequence; current.pageLoaded = false; current.lastOffset = offset;
+  const body = document.getElementById('attachment-preview-text'); if (body) body.textContent = '';
+  const status = document.getElementById('attachment-preview-status'); if (status) status.textContent = '正在读取有界预览页…';
+  const next = document.getElementById('attachment-preview-next'); if (next) next.disabled = true;
+  updateAttachmentPreviewConfirm();
+  try {
+    const result = await attachmentApi().previewPage({ ...attachmentEnvelope(current.entry.attachmentPreparation.context),
+      previewId: current.response.previewId, attachmentId: selected, offset, limit: 16384 });
+    if (attachmentSendPreview.current !== current || sequence !== current.pageSequence) return;
+    if (!result?.ok) throw attachmentError(result, '读取预览页失败');
+    if (typeof result.text !== 'string' || Array.from(result.text).length > 16384 || result.offset !== offset
+      || !Number.isSafeInteger(result.totalCodePoints) || result.totalCodePoints < 0
+      || (result.nextOffset != null && (!Number.isSafeInteger(result.nextOffset) || result.nextOffset <= offset || result.nextOffset > result.totalCodePoints))) throw attachmentError(null, '预览页格式或范围无效，未发送');
+    // The selected model text is inert: never Markdown/HTML, localStorage,
+    // history, export, logs or a reusable renderer-side source body.
+    if (body) body.textContent = result.text;
+    current.nextOffset = result.nextOffset; current.pageLoaded = true;
+    if (status) status.textContent = `选定文本：${offset}–${offset + Array.from(result.text).length} / ${result.totalCodePoints} Unicode 字符${result.nextOffset == null ? '（最后一页）' : '（可继续查看）'}`;
+    if (next) { next.disabled = result.nextOffset == null; next.textContent = '下一页（最多 16384 字符）'; }
+  } catch (error) {
+    if (attachmentSendPreview.current !== current || sequence !== current.pageSequence) return;
+    if (status) status.textContent = error.message;
+    if (next) { next.disabled = false; next.textContent = '重试本页'; }
+  }
+  updateAttachmentPreviewConfirm();
+}
+function attachmentSendPreview(entry, response) {
+  if (attachmentSendPreview.current) closeAttachmentSendPreview({ confirmed: false });
+  const modal = document.getElementById('attachment-send-preview'); if (!modal) throw attachmentError(null, '附件预览界面未就绪；未发送');
+  return new Promise(resolve => {
+    const refs = window.E5Attachments.publicRefs(response.attachments);
+    const current = { entry, response, refs, resolve, pageSequence: 0, pageLoaded: false, lastOffset: 0, nextOffset: null,
+      selectionDirty: false, inputs: [], truncated: refs.some(ref => ref.budget?.truncated), previousFocus: document.activeElement };
+    attachmentSendPreview.current = current;
+    const target = response.target || {};
+    document.getElementById('attachment-preview-target').textContent = `目标：${target.providerName || target.providerId || '未知服务'} · ${target.model || '未知模型'} · ${target.protocol || '未知协议'} · ${target.origin || '服务 origin 未知'} · ${target.assistantName || target.assistantId || 'AI'}`;
+    const budget = response.budget || {};
+    document.getElementById('attachment-preview-budget').textContent = `预计输入 ${budget.estimatedInputTokens ?? '?'} tokens / 上下文 ${budget.contextLimit ?? '?'} · 最大输出 ${budget.maxOutputTokens ?? '?'} tokens；上下文/附件均发送给上述目标。`;
+    document.getElementById('attachment-preview-storage').textContent = refs.some(ref => ref.storageMode === 'memory')
+      ? '仅内存降级模式：不会落盘，也不会伪称已加密；重启后需重新选择。' : '应用管理加密文本副本；清理只作用于应用副本，不删除原文件。';
+    const list = document.getElementById('attachment-preview-list'); list.innerHTML = '';
+    const select = document.getElementById('attachment-preview-file'); select.innerHTML = '';
+    for (const ref of refs) {
+      const row = document.createElement('div'); row.className = 'attachment-preview-ref';
+      const budget = ref.budget || {};
+      const label = document.createElement('span'); label.textContent = `${ref.name} · 选定 ${budget.selectedChars ?? '?'} 字符 / ${budget.selectedBytes ?? '?'} 字节${budget.truncated ? ' · 已截断（不是完整文件）' : ''}`;
+      const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = String(Math.min(65536, budget.selectedChars || 0)); input.step = '1'; input.value = input.max;
+      input.setAttribute('aria-label', `${ref.name} 缩小选定文本前缀字符数`);
+      input.addEventListener('input', () => { current.selectionDirty = true; updateAttachmentPreviewConfirm(); });
+      current.inputs.push({ attachmentId: ref.attachmentId, input }); row.append(label, input); list.appendChild(row);
+      const option = document.createElement('option'); option.value = ref.attachmentId; option.textContent = ref.name; select.appendChild(option);
+    }
+    select.value = refs[0]?.attachmentId || '';
+    const ack = document.getElementById('attachment-preview-truncated'); ack.checked = false;
+    document.getElementById('attachment-preview-truncation').hidden = !current.truncated;
+    modal.classList.remove('hidden');
+    current.timer = setTimeout(() => { if (attachmentSendPreview.current === current) { closeAttachmentSendPreview({ confirmed: false }); toast('附件预览已过期，请重新发送并确认'); } }, Math.max(0, Math.min(300000, response.expiresAt - Date.now())));
+    readAttachmentPreviewPage(0); updateAttachmentPreviewConfirm();
+  });
+}
+function bindAttachmentUi() {
+  document.getElementById('btn-attachment-restore')?.addEventListener('click', () => restoreAttachmentSession());
+  document.getElementById('btn-attachment-cancel-import')?.addEventListener('click', () => cancelAttachmentImports());
+  document.getElementById('btn-attachment-cache')?.addEventListener('click', () => showAttachmentCache());
+  document.getElementById('btn-attachment-clear-cache')?.addEventListener('click', () => showAttachmentCache(activeSession(), true));
+  document.getElementById('attachment-preview-cancel')?.addEventListener('click', () => closeAttachmentSendPreview({ confirmed: false }));
+  document.getElementById('attachment-preview-confirm')?.addEventListener('click', () => {
+    updateAttachmentPreviewConfirm();
+    if (!document.getElementById('attachment-preview-confirm')?.disabled) closeAttachmentSendPreview({ confirmed: true });
+  });
+  document.getElementById('attachment-preview-reprepare')?.addEventListener('click', () => {
+    const current = attachmentSendPreview.current; if (!current || !current.selectionDirty || !attachmentRequestCurrent(current.entry)) return;
+    if (current.inputs.some(({ input }) => !Number.isSafeInteger(Number(input.value)) || Number(input.value) < 0 || Number(input.value) > Number(input.max))) return toast('只能缩小当前选定前缀，不能增加主进程预算');
+    closeAttachmentSendPreview({ confirmed: false, reprepare: true,
+      selections: current.inputs.map(({ attachmentId, input }) => ({ attachmentId, prefixCodePoints: Number(input.value) })) });
+  });
+  document.getElementById('attachment-preview-file')?.addEventListener('change', () => readAttachmentPreviewPage(0));
+  document.getElementById('attachment-preview-truncated')?.addEventListener('change', updateAttachmentPreviewConfirm);
+  document.getElementById('attachment-preview-next')?.addEventListener('click', () => {
+    const current = attachmentSendPreview.current; if (current) return readAttachmentPreviewPage(current.pageLoaded ? current.nextOffset : current.lastOffset);
+  });
+  document.getElementById('attachment-send-preview')?.addEventListener('click', event => { if (event.target.id === 'attachment-send-preview') closeAttachmentSendPreview({ confirmed: false }); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape' && attachmentSendPreview.current) { event.preventDefault(); closeAttachmentSendPreview({ confirmed: false }); } });
+  const input = document.getElementById('chat-input');
+  input?.addEventListener('dragover', event => { if (event.dataTransfer?.types?.includes('Files')) event.preventDefault(); });
+  input?.addEventListener('drop', event => { if (event.dataTransfer?.files?.length) { event.preventDefault(); return handleFiles(event.dataTransfer.files, false); } });
+  renderAttachmentControls();
 }
 function activeProjectPathForMcp() {
   return sessionProject(activeSession())?.path || '';
@@ -6094,7 +6466,7 @@ async function sendMessage() {
   const input = document.getElementById('chat-input');
   const raw = input.value || '';
   const text = buildOutgoingText(raw);
-  if (!text.trim()) return;
+  if (!text.trim() && !pendingAttaches.length) return;
   if (handleSlashCommand(raw.trim())) return;
   const session = activeSession();
   if (session?.identityType === 'demo-contact') return toast('此历史演示联系人为只读，不能发送消息');
@@ -6102,24 +6474,24 @@ async function sendMessage() {
   const proj = sessionProject(session);
   if (session.kind === 'project' && !proj?.path) return toast('此项目还没有绑定真实目录，请先绑定目录');
   if (!window.codex?.sendChat || !modelManager) return toast('AI服务尚未就绪');
-  if (pendingAttaches.some((item) => item.unavailableAfterRestart)) return toast('历史附件内容不可用，请重新选择附件；草稿未发送');
+  if (pendingAttaches.some(item => item.unavailableAfterRestart)) return toast('附件内容尚不可用；请显式恢复缓存或重新选择，草稿未发送');
   const draftResult = persistActiveDraft();
   if (!draftResult.ok) return toast(draftResult.error || '草稿暂不可发送');
   const sessionId = String(session.id);
   const attachmentRefs = currentAttachmentRefs(session);
   const userMessage = { role: 'user', content: text, schemaVersion: 2,
-    parts: [{ type: 'text', text }, ...attachmentRefs.map((ref) => ({ type: 'attachment_ref', ...ref }))], createdAt: Date.now() };
+    parts: [{ type: 'text', text }, ...attachmentRefs.map(ref => ({ type: 'attachment_ref', ...ref }))], createdAt: Date.now() };
   let outbox;
   try {
     outbox = window.E4ChatState.createOutbox({ state: chatState, sessionId,
       assistantId: session.assistantId, modelProfileId: session.modelProfileId || null,
       expectedRegistryRevision: modelManager.getState().revision, projectBindingId: '',
-      messages: [...session.messages.filter((message) => !message.error), userMessage], text });
+      messages: [...session.messages.filter(message => !message.error), userMessage], text });
   } catch (error) { return toast(error?.message || '无法创建发送请求'); }
   const queued = chatOutboxStore.add(outbox);
   if (!queued.ok) return toast(queued.error);
   const entry = { outbox, session, userMessage, attachmentRefs, editorText: raw,
-    agentMode: sessionAgentMode(session), consumeDraft: true,
+    agentMode: sessionAgentMode(session), projectPath: proj?.path || '', consumeDraft: true,
     ledger: window.E4ChatState.createRunLedger({ sessionId, clientRequestId: outbox.clientRequestId }), accepted: false, ack: null };
   pendingChatRequests.set(outbox.clientRequestId, entry);
   setSending(true); renderOutboxRecovery(); hideAtComplete();
@@ -6132,17 +6504,61 @@ async function sendMessage() {
     if (!rebound.ok) return rejectChatEntry(entry, rebound.code, rebound.error);
     entry.outbox = outbox;
     await syncModelSessionReferences();
-    const ack = await window.codex.sendChat({ assistantId: outbox.assistantId,
+    const snapshot = { assistantId: outbox.assistantId,
       modelProfileId: outbox.modelProfileId, clientRequestId: outbox.clientRequestId,
       expectedRegistryRevision: outbox.expectedRegistryRevision, sessionId: outbox.sessionId,
       projectBindingId: outbox.projectBindingId, project: proj?.path ? { name: proj.name, path: proj.path } : null,
-      messages: cloneForIpc(outbox.messages), agentMode: entry.agentMode });
+      messages: cloneForIpc(outbox.messages), agentMode: entry.agentMode,
+      draftRevision: outbox.draftRevision, attachmentIds: attachmentRefs.map(ref => ref.attachmentId) };
+    const payload = await prepareAttachmentRequest(entry, snapshot, 'chat');
+    const ack = await window.codex.sendChat(payload);
     settleChatInvoke(entry, ack);
   } catch (error) { rejectChatEntry(entry, error?.code, error?.message || String(error)); }
 }
 
+async function prepareAttachmentRequest(entry, snapshot, requestKind) {
+  const api = window.codex?.attachments;
+  // Offline/older E4 hosts may still send ordinary text. Any possible E5
+  // content fails closed without its bridge; production preload always has it.
+  if (!api) {
+    if (snapshot.attachmentIds?.length || /@/.test(snapshot.messages?.filter(message => message.role === 'user').at(-1)?.content || '')) throw new Error('E5 文本附件服务尚未就绪；未发送');
+    return snapshot;
+  }
+  if (!window.E5Attachments) throw new Error('E5 附件界面未就绪；未发送');
+  const payload = window.E5Attachments.freezeSnapshot(snapshot);
+  const needsNamespace = payload.attachmentIds.length || window.E5Attachments.possibleProjectRef(payload.messages);
+  // A cold pure-text prepare is only main's describe path, never a restoration
+  // or a new grant for the persisted namespace. Main independently parses @.
+  const context = needsNamespace ? await ensureAttachmentSession(entry.session) : attachmentContext(entry.session);
+  const record = { context, previewId: '', invalidated: false };
+  entry.attachmentPreparation = record;
+  context.requests.set(entry.outbox.clientRequestId, { kind: 'prepare', entry });
+  let selections = null;
+  for (;;) {
+    if (!attachmentRequestCurrent(entry)) throw attachmentError(null, '草稿、目标或会话已变化；请重新发送并确认');
+    const prepared = await api.prepareSend({ ...payload, requestKind, ...attachmentEnvelope(context, payload.clientRequestId),
+      ...(selections ? { attachmentSelections: selections } : {}) });
+    if (prepared?.previewId) record.previewId = prepared.previewId;
+    if (!prepared?.ok) throw attachmentError(prepared, '附件准备失败；草稿与计划批准权均保留');
+    if (!attachmentRequestCurrent(entry)) { await cancelAttachmentPreparation(entry); throw attachmentError(null, '附件预览对应的草稿或目标已失效，未发送'); }
+    if (prepared.required === false) { finishAttachmentRequest(entry); return payload; }
+    if (prepared.required !== true || !prepared.previewId || !Number.isFinite(prepared.expiresAt) || prepared.expiresAt <= Date.now()
+      || !Array.isArray(prepared.attachments) || !prepared.attachments.length) throw attachmentError(null, '附件预览凭据无效；未发送');
+    const decision = await attachmentSendPreview(entry, prepared);
+    if (decision.reprepare) {
+      await cancelAttachmentPreparation(entry, prepared.previewId); record.previewId = '';
+      selections = window.E5Attachments.selections(decision.selections); continue;
+    }
+    if (!decision.confirmed || !attachmentRequestCurrent(entry) || prepared.expiresAt <= Date.now()) throw attachmentError({ code: 'ATTACHMENT_PREVIEW_CANCELLED' }, '未确认或预览已失效；没有外发，草稿与计划批准权保留');
+    record.phase = 'dispatch';
+    return window.E5Attachments.freezeSnapshot({ ...payload, attachmentPreviewId: prepared.previewId,
+      attachmentSessionBindingId: context.bindingId, ...(selections ? { attachmentSelections: selections } : {}) });
+  }
+}
+
 function rejectChatEntry(entry, code, message) {
   if (entry.accepted) return;
+  if (typeof cancelAttachmentPreparation === 'function') { cancelAttachmentPreparation(entry); finishAttachmentRequest(entry); }
   pendingChatRequests.delete(entry.outbox.clientRequestId);
   if (entry.consumeDraft) chatOutboxStore.fail(entry.outbox.clientRequestId, message);
   if (activeForegroundTask?.clientRequestId === entry.outbox.clientRequestId) activeForegroundTask = null;
@@ -6168,7 +6584,7 @@ function settleChatInvoke(entry, ack) {
     return rejectChatEntry(entry, 'REQUEST_ID_MISMATCH', '服务返回的请求标识不匹配');
   }
   entry.ack = ack; entry.runId = runId;
-  if (ack.userMessage && !entry.consumeDraft) entry.userMessage = ack.userMessage;
+  if (ack.userMessage) entry.userMessage = ack.userMessage;
   if (entry.accepted) appendAcceptedUserMessage(entry);
   if (!compatibleFinal || pendingChatRequests.get(entry.outbox.clientRequestId) !== entry) return;
   const aborted = result.aborted === true || ack.aborted === true;
@@ -6227,6 +6643,7 @@ function bindEvents() {
       if (request === targetChangeRequest && activeSession() === session) updateHeader();
       return;
     }
+    if (typeof invalidateAttachmentPreview === 'function') invalidateAttachmentPreview(session.id, '下一轮目标已切换，原附件预览失效');
     session[field] = value; saveState(); updateHeader();
   };
   document.getElementById('chat-assistant-select')?.addEventListener('change', async (event) => {
@@ -6352,15 +6769,14 @@ function bindEvents() {
   });
   document.getElementById('btn-bind-project').addEventListener('click', () => { const p = sessionProject(); if (p) bindProjectPath(p.id); });
   document.getElementById('btn-emoji').addEventListener('click', () => document.getElementById('emoji-panel').classList.toggle('hidden'));
-  document.getElementById('btn-image').addEventListener('click', () => document.getElementById('file-image').click());
-  document.getElementById('btn-attach').addEventListener('click', () => document.getElementById('file-attach').click());
-  document.getElementById('file-image').addEventListener('change', async (e) => { await handleFiles(e.target.files, true); e.target.value = ''; });
-  document.getElementById('file-attach').addEventListener('change', async (e) => { await handleFiles(e.target.files, false); e.target.value = ''; });
-  document.getElementById('chat-input').addEventListener('paste', async (e) => {
-    const items = e.clipboardData?.items; if (!items) return; const files = [];
-    for (const it of items) { if (it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) files.push(f); } }
-    if (files.length) { e.preventDefault(); await handleFiles(files, true); }
+  document.getElementById('btn-image').addEventListener('click', () => toast('E6 图片附件尚未支持：不会读取、上传或持久化图片/base64'));
+  document.getElementById('btn-attach').addEventListener('click', () => importTextAttachments(activeSession()));
+  document.getElementById('chat-input').addEventListener('paste', (event) => {
+    if (Array.from(event.clipboardData?.items || []).some(item => String(item.type || '').startsWith('image/'))) {
+      event.preventDefault(); toast('E6 图片粘贴尚未支持：不会读取、上传或持久化图片/base64');
+    }
   });
+  if (typeof bindAttachmentUi === 'function') bindAttachmentUi();
   document.addEventListener('click', (e) => { if (!e.target.closest('#ctx-menu')) hideContextMenu(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideContextMenu(); });
   document.addEventListener('keydown', (event) => {
@@ -6382,7 +6798,10 @@ function boot() {
   }) || null;
   modelManager = modelSettingsUi?.manager || null;
   syncModelSessionReferences().catch((error) => toast(error?.message || '会话引用同步失败；暂不可修改模型配置'));
-  modelManager?.subscribe(() => { updateHeader(); updateStatusBar(); });
+  modelManager?.subscribe(() => {
+    if (typeof invalidateAttachmentPreview === 'function') for (const session of sessions) invalidateAttachmentPreview(session.id, '模型或配置已变化，原附件预览失效');
+    updateHeader(); updateStatusBar();
+  });
   modelManager?.load().then(() => modelManager?.loadAssistants()).then(() => { updateHeader(); updateStatusBar(); }).catch((error) => toast(error?.message || '模型列表加载失败'));
   prReviewUi = window.PrReviewUi?.create({
     api: window.codex, document, getProject, getToken: (id) => worktreeBindings.get(id), getSessionId: () => activeSessionId,
@@ -6477,7 +6896,10 @@ function boot() {
     },
   });
   const ciWatchClock = setInterval(() => ciWatchUi?.tick(), 1000);
-  window.addEventListener('beforeunload', () => { clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); prAuditRecheckUi?.close(); prAuditTrackingUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null; }, { once: true });
+  window.addEventListener('beforeunload', () => {
+    if (window.E5Attachments) for (const session of sessions) forgetAttachmentSession(session.id);
+    clearInterval(ciWatchClock); ciWatchUi?.close(); prReviewUi?.close(); prAuditUi?.close(); prAuditRecheckUi?.close(); prAuditTrackingUi?.close(); pullRequestDrafts.clear(); pullRequestForm = null;
+  }, { once: true });
   renderEmojiPanel();
   bindEvents();
   bindTerminalPanel();

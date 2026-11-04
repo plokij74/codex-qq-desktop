@@ -64,6 +64,14 @@ function normalizeRecord(record) {
   };
 }
 
+function publicAttachmentUsageSummary(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(['count', 'rawBytes', 'selectedBytes', 'selectedChars', 'truncatedCount', 'contextLimit'].map(key => {
+    const number = Object.getOwnPropertyDescriptor(value, key)?.value;
+    return [key, Number.isSafeInteger(number) && number >= 0 ? number : key === 'contextLimit' ? null : 0];
+  }));
+}
+
 function normalizeModelRecord(record) {
   const ts = finiteNonNegative(record.ts);
   const inputValue = own(record, 'in', record.inputTokens);
@@ -100,6 +108,7 @@ function normalizeModelRecord(record) {
       ? raw.kind : field('providerId') ? 'api' : 'unknown',
   });
   const finishReason = text(record.finishReason, 128);
+  const attachmentSummary = publicAttachmentUsageSummary(record.attachmentSummary);
   return {
     schemaVersion: 2, ts, session, model: record.model, kind: record.kind,
     in: source === 'unavailable' || input === null ? null : Math.floor(input),
@@ -114,6 +123,7 @@ function normalizeModelRecord(record) {
     status: record.status ?? null,
     finishReason: finishReason && /^[A-Za-z0-9_.:-]+$/.test(finishReason) ? finishReason : null,
     modelSource,
+    ...(attachmentSummary ? { attachmentSummary } : {}),
   };
 }
 

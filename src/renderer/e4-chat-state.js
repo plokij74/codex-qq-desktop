@@ -58,6 +58,9 @@
 
   function normalizeSession(raw = {}) {
     const session = { ...raw };
+    const namespaceRef = typeof raw.namespaceRef === 'string' ? raw.namespaceRef : raw.attachmentNamespaceRef;
+    for (const key of ['namespaceRef', 'attachmentNamespaceRef', 'windowGrant', 'namespaceGrant', 'attachmentGrant', 'grant', 'grants', 'previewId', 'ticket', 'tickets', 'body', 'base64', 'dataUrl', 'storagePath', 'localAbsPath', 'hash']) delete session[key];
+    if (typeof namespaceRef === 'string' && namespaceRef.length <= 256 && /^[a-z][a-z0-9]*_[a-f0-9]{32}$/.test(namespaceRef)) session.namespaceRef = namespaceRef;
     const peer = String(raw.peer || 'codex');
     const wasDemoPeer = peer !== 'codex' && raw.identityType !== 'ai';
     const assistantId = boundedString(raw.assistantId, 128)
@@ -80,13 +83,29 @@
   }
 
   function safeAttachmentRef(raw) {
-    const ref = {};
-    for (const key of ['attachmentId', 'name', 'mimeType']) {
-      const value = boundedString(raw?.[key], key === 'name' ? 255 : 160);
-      if (value) ref[key] = value;
+    const own = key => Object.getOwnPropertyDescriptor(raw || {}, key)?.value;
+    if (own('refVersion') !== 1) {
+      const ref = {};
+      for (const key of ['attachmentId', 'name', 'mimeType']) {
+        const value = boundedString(own(key), key === 'name' ? 255 : 160);
+        if (value) ref[key] = value;
+      }
+      if (Number.isFinite(own('size')) && own('size') >= 0) ref.size = Math.floor(own('size'));
+      return ref;
     }
-    if (Number.isFinite(raw?.size) && raw.size >= 0) ref.size = Math.floor(raw.size);
-    return ref;
+    const id = typeof own('attachmentId') === 'string' && own('attachmentId').length <= 256 && !/[\u0000-\u001f\u007f]/.test(own('attachmentId')) ? own('attachmentId') : '';
+    const source = ['user_upload', 'at_project_ref'].includes(own('source')) ? own('source') : 'tool_output';
+    const valid = /^att_[a-f0-9]{32}$/.test(id) && source !== 'tool_output';
+    const statuses = ['ready', 'missing', 'corrupt', 'expired', 'deleted', 'revoked', 'legacy_unavailable', 'unsupported'];
+    const status = !valid ? (own('status') === 'unsupported' ? 'unsupported' : 'legacy_unavailable') : statuses.includes(own('status')) ? own('status') : 'legacy_unavailable';
+    const name = Array.from(String(own('name') || 'unnamed_file').replace(/\\/g, '/').split('/').pop().replace(/[\u0000-\u001f\u007f\p{Cf}]/gu, '')).slice(0, 255).join('') || 'unnamed_file';
+    const mime = typeof own('mimeType') === 'string' && /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(own('mimeType')) && own('mimeType').length <= 127 ? own('mimeType').toLowerCase() : 'application/octet-stream';
+    const number = (value, max) => Number.isFinite(value) && value >= 0 ? Math.min(max, Math.floor(value)) : 0;
+    const budget = own('budget') || {};
+    const counter = (key, max = 2097152) => number(Object.getOwnPropertyDescriptor(budget, key)?.value, max);
+    return { refVersion: 1, attachmentId: id, name, mimeType: mime, size: number(own('size'), 2097152), source, status,
+      storageMode: valid && ['encrypted', 'memory', 'unavailable'].includes(own('storageMode')) ? own('storageMode') : 'unavailable',
+      budget: { extractedChars: counter('extractedChars'), selectedChars: counter('selectedChars', 65536), selectedBytes: counter('selectedBytes'), estimatedTokens: counter('estimatedTokens'), truncated: Object.getOwnPropertyDescriptor(budget, 'truncated')?.value === true } };
   }
 
   function normalizeDraft(raw) {
@@ -123,6 +142,32 @@
     };
   }
 
+  function hasLegacyAttachmentPayload(data) {
+    const payload = ref => ref && typeof ref === 'object' && ['dataUrl', 'base64', 'body', 'content', 'text', 'bytes'].some(key => {
+      const value = Object.getOwnPropertyDescriptor(ref, key)?.value;
+      return typeof value === 'string' ? value.length > 0 : Array.isArray(value) && value.length > 0;
+    });
+    for (const draft of Object.values(data.draftsBySession || {})) {
+      if ((draft.attachmentRefs || []).some(payload)) return true;
+    }
+    for (const session of data.sessions || []) for (const message of session.messages || []) {
+      if ((message.attachments || []).some(payload) || (message.attachmentManifest || []).some(payload)
+        || (message.parts || []).some(part => part?.type === 'attachment_ref' && payload(part))) return true;
+      // Historical managed image paragraph: code examples remain ordinary text.
+      const texts = [message.content, ...(message.parts || []).filter(p => p?.type === 'text').map(p => p.text)];
+      for (const text of texts) {
+        if (typeof text !== 'string') continue;
+        let fence = '';
+        for (const line of text.split(/\r?\n/)) {
+          const match = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+          if (match) { if (!fence) fence = match[1][0]; else if (fence === match[1][0]) fence = ''; continue; }
+          if (!fence && /^\s{0,3}!\[[^\]\r\n]*\]\(data:image\/[^\s)]*;base64,[^\s)]*\)\s*$/.test(line)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function migrateState(data) {
     if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.sessions)
       || data.sessions.some((session) => !session || typeof session !== 'object' || Array.isArray(session) || !session.id
@@ -145,6 +190,19 @@
       }
     }
     const state = createState(data);
+    const expireMemoryRef = ref => ref?.refVersion === 1 && ref.storageMode === 'memory'
+      ? { ...safeAttachmentRef(ref), ...(ref.type === 'attachment_ref' ? { type: 'attachment_ref' } : {}), status: 'expired', storageMode: 'unavailable' } : ref;
+    for (const draft of Object.values(state.draftsBySession)) draft.attachmentRefs = draft.attachmentRefs.map(expireMemoryRef);
+    for (const session of state.sessions) session.messages = session.messages.map(message => {
+      if (!message || typeof message !== 'object') return message;
+      const next = { ...message };
+      if (Array.isArray(message.parts)) next.parts = message.parts.map(part => part?.type === 'attachment_ref' ? expireMemoryRef(part) : part);
+      for (const key of ['attachments', 'attachmentManifest']) if (Array.isArray(message[key])) next[key] = message[key].map(expireMemoryRef);
+      return next;
+    });
+    if (hasLegacyAttachmentPayload(data)) {
+      return { ok: false, code: 'ATTACHMENT_LEGACY_REQUIRES_MIGRATION', error: '历史附件需要显式迁移；原容器保留，未读取或覆盖原件', state };
+    }
     const checked = serializeState(state);
     if (!checked.ok) return { ...checked, state };
     return { ok: true, migrated: version < 3, state };

@@ -14,7 +14,7 @@ function positiveInteger(value) {
 }
 
 /** Build one public, legacy-compatible event per physical terminal attempt. Does not persist. */
-function buildModelUsageEvent({ binding, settings = {}, attempt, kind } = {}) {
+function buildModelUsageEvent({ binding, settings = {}, attempt, kind, attachmentSummary } = {}) {
   if (settings?.usageEnabled === false || !binding || !attempt || !boundedString(binding.model, 256)) return null;
   const attemptId = boundedString(attempt.attemptId);
   if (!attemptId || !TERMINAL_STATUSES.has(attempt.status)) return null;
@@ -56,6 +56,12 @@ function buildModelUsageEvent({ binding, settings = {}, attempt, kind } = {}) {
     assistantId: modelSource.assistantId, protocol: modelSource.protocol,
     bindingRevision: modelSource.bindingRevision, runId: modelSource.runId, clientRequestId: modelSource.clientRequestId,
     sessionId: boundedString(binding.sessionId), modelSource,
+    ...(attachmentSummary && typeof attachmentSummary === 'object' ? { attachmentSummary: Object.fromEntries(
+      ['count', 'rawBytes', 'selectedBytes', 'selectedChars', 'truncatedCount', 'contextLimit'].map(key => {
+        const value = Object.getOwnPropertyDescriptor(attachmentSummary, key)?.value;
+        return [key, Number.isSafeInteger(value) && value >= 0 ? value : key === 'contextLimit' ? null : 0];
+      })
+    ) } : {}),
   };
 }
 

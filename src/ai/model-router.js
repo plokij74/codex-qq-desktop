@@ -6,6 +6,7 @@ const { getModelAdapter } = require('./model-adapters');
 const { LIMITS, ModelError, requireValue, record, bytes, boundedInteger, unavailableUsage, normalizeUsage, normalizeMessages, normalizeTools, validateToolCalls, safeError } = require('./model-adapters/common');
 const { createRequestContext } = require('./model-adapters/transport');
 const { publicModelSource } = require('./model-runtime');
+const { createModelOperationBudget, assertModelOperationBudget, modelOperationContextLimit, measureModelJson } = require('./model-operation-budget');
 const capability = (binding, name) => binding.capabilities?.[name]?.state || 'unknown';
 
 function requireCapability(condition, binding, name, message, forcedState) {
@@ -77,8 +78,9 @@ function prepareRequest(binding, raw, purpose, diagnosticCheck) {
 }
 
 /** Pure acceptance checks: no credential resolution, network, callbacks or physical attempt. */
-function preflightModelRequest({ binding, messages: inputMessages, tools: inputTools = [], request: rawRequest = {}, purpose = 'workload', diagnosticCheck } = {}) {
+function preflightModelRequest({ binding, messages: inputMessages, tools: inputTools = [], request: rawRequest = {}, purpose = 'workload', diagnosticCheck, operationBudget } = {}) {
   requireValue(isResolvedModelBinding(binding), 'MODEL_BINDING_INVALID', 'A main-process resolved model binding is required.');
+  assertModelOperationBudget(operationBudget);
   const prepared = prepareRequest(binding, rawRequest, purpose, diagnosticCheck);
   const messages = normalizeMessages(inputMessages);
   const tools = normalizeTools(inputTools);
@@ -96,38 +98,53 @@ function preflightModelRequest({ binding, messages: inputMessages, tools: inputT
     requireValue(policy?.mode === 'allowlist' && tools.every((tool) => policy.allowedTools.includes('@host-authorized') || policy.allowedTools.includes(tool.name)), 'MODEL_TOOL_POLICY_DENIED', 'Tools are outside the accepted assistant policy.');
   }
   const wireTools = native || prepared.bypass('nativeTools') ? tools : [];
-  const projection = JSON.stringify({ messages, tools: wireTools });
-  requireValue(bytes(projection) <= prepared.limits.maxRequestBytes, 'MODEL_LIMIT_EXCEEDED', 'The model request exceeds its body limit.');
-  const window = binding.capabilities.contextWindow?.tokens;
-  if (window !== null && window !== undefined) requireValue(Math.ceil(projection.length / 4) + prepared.request.maxOutputTokens <= window, 'MODEL_CONTEXT_LIMIT', 'The request and reserved output exceed the configured context window.');
+  let operation;
+  if (operationBudget !== undefined) {
+    const contextLimit = modelOperationContextLimit(operationBudget, binding);
+    const measured = measureModelJson({ messages, tools: wireTools }, { maxRequestBytes: prepared.limits.maxRequestBytes, contextLimit, maxOutputTokens: prepared.request.maxOutputTokens });
+    operation = { contextLimit, requestBytes: measured.requestBytes, approxInputTokens: measured.approxInputTokens };
+  } else {
+    const projection = JSON.stringify({ messages, tools: wireTools });
+    requireValue(bytes(projection) <= prepared.limits.maxRequestBytes, 'MODEL_LIMIT_EXCEEDED', 'The model request exceeds its body limit.');
+    const window = binding.capabilities.contextWindow?.tokens;
+    if (window !== null && window !== undefined) requireValue(Math.ceil(projection.length / 4) + prepared.request.maxOutputTokens <= window, 'MODEL_CONTEXT_LIMIT', 'The request and reserved output exceed the configured context window.');
+  }
   const url = normalizeModelEndpoint(binding.protocol, binding.baseUrl);
   if (binding.auth.kind !== 'none') requireValue(binding.auth.secretRef && binding.auth.credentialOrigin === new URL(url).origin, 'MODEL_AUTH_REQUIRED', 'A usable credential is required for the selected provider.');
-  return { messages, tools: wireTools, request: prepared.request, timeoutMs: prepared.timeoutMs, limits: prepared.limits, url };
+  return { messages, tools: wireTools, request: prepared.request, timeoutMs: prepared.timeoutMs, limits: prepared.limits, url, ...(operation ? { operation } : {}) };
 }
 
-async function invokeModelTurn({ binding, messages: inputMessages, tools: inputTools = [], request: rawRequest = {}, signal, onEvent, fetchFn, resolveCredential, purpose = 'workload', diagnosticCheck, providerState } = {}) {
+async function invokeModelTurn({ binding, messages: inputMessages, tools: inputTools = [], request: rawRequest = {}, signal, onEvent, fetchFn, resolveCredential, purpose = 'workload', diagnosticCheck, providerState, operationBudget } = {}) {
   requireValue(isResolvedModelBinding(binding), 'MODEL_BINDING_INVALID', 'A main-process resolved model binding is required.');
   const adapter = getModelAdapter(binding.protocol);
   let nextState; let context; let attemptId;
   const modelSource = publicModelSource(binding);
   try {
-    const prepared = preflightModelRequest({ binding, messages: inputMessages, tools: inputTools, request: rawRequest, purpose, diagnosticCheck });
+    const prepared = preflightModelRequest({ binding, messages: inputMessages, tools: inputTools, request: rawRequest, purpose, diagnosticCheck, operationBudget });
     const { messages, tools, url } = prepared;
-    context = createRequestContext({ signal, timeoutMs: prepared.timeoutMs, limits: prepared.limits, onEvent });
+    const auth = binding.auth;
+    const resolveHeaders = async () => {
+      const headers = {}; context.check();
+      if (auth.kind !== 'none') {
+        requireValue(typeof resolveCredential === 'function', 'MODEL_AUTH_REQUIRED', 'A usable credential is required for the selected provider.');
+        let value;
+        try { value = await context.wait(Promise.resolve().then(() => { if (operationBudget !== undefined) context.check(); return resolveCredential(binding); })); }
+        catch { if (context.signal.aborted) throw context.signal.reason; throw new ModelError('MODEL_CREDENTIAL_UNAVAILABLE', 'The selected provider credential is unavailable.'); }
+        requireValue(typeof value === 'string' && value.length > 0 && value.length <= 65536 && !/[\r\n\0]/.test(value), 'MODEL_AUTH_REQUIRED', 'A usable credential is required for the selected provider.');
+        if (auth.kind === 'bearer') headers.Authorization = `Bearer ${value}`;
+        else if (auth.kind === 'api-key') headers['x-api-key'] = value;
+        else requireValue(false, 'MODEL_AUTH_REQUIRED');
+      }
+      return headers;
+    };
+    context = createRequestContext({ signal, timeoutMs: prepared.timeoutMs, limits: prepared.limits, onEvent,
+      ...(operationBudget === undefined ? {} : { operationBudget, operationInfo: { protocol: binding.protocol, model: binding.model, contextLimit: prepared.operation.contextLimit, maxOutputTokens: prepared.request.maxOutputTokens }, resolveHeaders, deadlineAt: rawRequest.deadlineAt ?? rawRequest.deadlineMs }) });
     context.check();
-    const auth = binding.auth; const headers = {};
-    if (auth.kind !== 'none') {
-      requireValue(typeof resolveCredential === 'function', 'MODEL_AUTH_REQUIRED', 'A usable credential is required for the selected provider.');
-      let value;
-      try { value = await context.wait(Promise.resolve().then(() => resolveCredential(binding))); }
-      catch { if (context.signal.aborted) throw context.signal.reason; throw new ModelError('MODEL_CREDENTIAL_UNAVAILABLE', 'The selected provider credential is unavailable.'); }
-      requireValue(typeof value === 'string' && value.length > 0 && value.length <= 65536 && !/[\r\n\0]/.test(value), 'MODEL_AUTH_REQUIRED', 'A usable credential is required for the selected provider.');
-      if (auth.kind === 'bearer') headers.Authorization = `Bearer ${value}`;
-      else if (auth.kind === 'api-key') headers['x-api-key'] = value;
-      else requireValue(false, 'MODEL_AUTH_REQUIRED');
-    }
+    if (operationBudget !== undefined) await context.check({ stage: 'prepare', requestBytes: prepared.operation.requestBytes, approxInputTokens: prepared.operation.approxInputTokens });
+    context.check();
+    const headers = operationBudget === undefined ? await resolveHeaders() : {};
     const result = await adapter.invoke({ binding, messages, tools, request: prepared.request, headers, url, context, fetchFn, providerState,
-      onAttempt: () => { requireValue(!attemptId, 'MODEL_PROTOCOL_ERROR', 'Automatic model retries are disabled.'); attemptId = randomUUID(); } });
+      onAttempt: () => { requireValue(!attemptId, 'MODEL_PROTOCOL_ERROR', 'Automatic model retries are disabled.'); attemptId = randomUUID(); return attemptId; } });
     nextState = result.providerState; context.check();
     const toolCalls = validateToolCalls(result.toolCalls, tools, result.finishReason, prepared.limits.maxArgumentsBytes);
     const usage = normalizeUsage(binding.protocol, result.rawUsage, messages, result.content, true);
@@ -153,4 +170,4 @@ async function invokeModelTurn({ binding, messages: inputMessages, tools: inputT
 
 // The sole snake_case boundary lives in llm-client; keep this main-process integration export lazy.
 function createModelChatFunction(options) { return require('./llm-client').createModelChatFunction(options); }
-module.exports = { invokeModelTurn, preflightModelRequest, createModelChatFunction, publicModelSource, ModelError, MODEL_LIMITS: LIMITS };
+module.exports = { invokeModelTurn, preflightModelRequest, createModelChatFunction, createModelOperationBudget, publicModelSource, ModelError, MODEL_LIMITS: LIMITS };

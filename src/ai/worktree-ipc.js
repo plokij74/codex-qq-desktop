@@ -14,11 +14,12 @@ function senderId(event) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, openExternal, checkWorkflowGate } = {}) {
+function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, openExternal, checkWorkflowGate, authorizeSender, inspectProjectRoot, validateProjectRoot } = {}) {
   if (!manager) throw new Error('worktree IPC requires manager');
   const bindingsBySender = new Map();
 
   function bind(event, payload = {}) {
+    if (typeof authorizeSender === 'function' && !authorizeSender(event)) return ipcError('PATH_UNSAFE', '项目发送者无效');
     const owner = senderId(event);
     const projectId = String(payload.projectId || '').trim().slice(0, 200);
     const projectPath = String(payload.projectPath || '').trim();
@@ -33,24 +34,39 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     } catch {
       return ipcError('PATH_UNSAFE', '项目绑定路径不存在');
     }
-    const projectBindingId = `pb_${crypto.randomBytes(16).toString('hex')}`;
-    let bindings = bindingsBySender.get(owner);
-    if (!bindings) {
-      bindings = new Map();
-      bindingsBySender.set(owner, bindings);
-    }
-    for (const [token, binding] of bindings) {
-      if (binding.projectId === projectId) bindings.delete(token);
-    }
-    bindings.set(projectBindingId, { projectId, projectPath: canonical });
-    return { ok: true, projectBindingId };
+    const install = (rootSnapshot) => {
+      if (typeof authorizeSender === 'function' && !authorizeSender(event)) return ipcError('PATH_UNSAFE', '项目发送者已失效');
+      const binding = { projectId, projectPath: canonical, ...(rootSnapshot ? { rootSnapshot } : {}) };
+      if (typeof inspectProjectRoot === 'function' && (!rootSnapshot || typeof validateProjectRoot !== 'function' || !validateProjectRoot(binding, event))) {
+        return ipcError('PATH_UNSAFE', '项目物理根已改变');
+      }
+      const projectBindingId = `pb_${crypto.randomBytes(16).toString('hex')}`;
+      let bindings = bindingsBySender.get(owner);
+      if (!bindings) { bindings = new Map(); bindingsBySender.set(owner, bindings); }
+      for (const [token, previous] of bindings) if (previous.projectId === projectId) bindings.delete(token);
+      bindings.set(projectBindingId, binding);
+      return { ok: true, projectBindingId };
+    };
+    // Production inspects physical identity before publishing a token. The
+    // synchronous default is retained for standalone worktree units only;
+    // renderers cannot supply this main-only snapshot.
+    if (typeof inspectProjectRoot !== 'function') return install();
+    return (async () => {
+      try { return install(await inspectProjectRoot(canonical, event)); }
+      catch { return ipcError('PATH_UNSAFE', '项目物理根不可安全验证'); }
+    })();
   }
 
   function resolveBinding(event, payload = {}) {
     const owner = senderId(event);
     const token = String(payload.projectBindingId || '');
-    const binding = owner == null ? null : bindingsBySender.get(owner)?.get(token);
-    return binding || null;
+    const bindings = owner == null ? null : bindingsBySender.get(owner);
+    const binding = bindings?.get(token);
+    if (!binding || typeof authorizeSender === 'function' && !authorizeSender(event)) return null;
+    if (typeof validateProjectRoot === 'function' && !validateProjectRoot(binding, event)) {
+      bindings.delete(token); if (!bindings.size) bindingsBySender.delete(owner); return null;
+    }
+    return binding;
   }
 
   function hasProjectBinding(event, projectPath) {
@@ -59,7 +75,9 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     let canonical;
     try { canonical = fs.realpathSync.native(projectPath); } catch { canonical = path.resolve(projectPath); }
     const target = process.platform === 'win32' ? canonical.toLowerCase() : canonical;
-    return [...(bindingsBySender.get(owner)?.values() || [])].some((binding) => {
+    return [...(bindingsBySender.get(owner)?.keys() || [])].some((token) => {
+      const binding = resolveBinding(event, { projectBindingId: token });
+      if (!binding) return false;
       const current = process.platform === 'win32' ? String(binding.projectPath).toLowerCase() : binding.projectPath;
       return current === target;
     });
@@ -198,7 +216,8 @@ function createWorktreeIpcHandlers({ manager, isBusy, withMutation, openPath, op
     },
     hasProjectBinding,
     // Main-only ownership reconciliation; never expose canonical paths via IPC.
-    listProjectPaths: (event) => [...new Set([...(bindingsBySender.get(senderId(event))?.values() || [])].map((binding) => binding.projectPath))],
+    listProjectPaths: (event) => [...new Set([...(bindingsBySender.get(senderId(event))?.keys() || [])]
+      .map(projectBindingId => resolveBinding(event, { projectBindingId })?.projectPath).filter(Boolean))],
     unbind,
     list,
     get,

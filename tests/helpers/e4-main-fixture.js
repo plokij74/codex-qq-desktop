@@ -30,6 +30,27 @@ function deferred() {
 }
 function loadMainFixture(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-e4-main-'));
+  const rootStat = fs.lstatSync(root, { bigint: true });
+  const fixtureRootIdentity = `${rootStat.dev}:${rootStat.ino}`;
+  function fixtureProjectSnapshot(projectRoot) {
+    const unsafe = () => Object.assign(new Error('Synthetic fixture root is not owned'), { code: 'ATTACHMENT_READ_DENIED' });
+    if (typeof projectRoot !== 'string' || !path.isAbsolute(projectRoot) || projectRoot.length > 32768) throw unsafe();
+    const resolved = path.resolve(projectRoot), relative = path.relative(root, resolved);
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw unsafe();
+    const fixtureStat = fs.lstatSync(root, { bigint: true });
+    if (!fixtureStat.isDirectory() || fixtureStat.isSymbolicLink() || `${fixtureStat.dev}:${fixtureStat.ino}` !== fixtureRootIdentity) throw unsafe();
+    const physicalPath = fs.realpathSync.native(resolved);
+    if (physicalPath.toLowerCase() !== resolved.toLowerCase()) throw unsafe();
+    const ancestors = []; let current = resolved;
+    while (true) {
+      const stat = fs.lstatSync(current, { bigint: true });
+      if (!stat.isDirectory() || stat.isSymbolicLink() || ancestors.length >= 64) throw unsafe();
+      ancestors.unshift(Object.freeze({ path: current, identity: `${stat.dev}:${stat.ino}` }));
+      const parent = path.dirname(current); if (parent === current) break; current = parent;
+    }
+    if (!ancestors.some(entry => entry.path.toLowerCase() === root.toLowerCase() && entry.identity === fixtureRootIdentity)) throw unsafe();
+    return Object.freeze({ physicalPath, rootIdentity: ancestors.at(-1).identity, ancestors: Object.freeze(ancestors) });
+  }
   const handlers = new Map(); const syncHandlers = new Map(); const events = []; const requests = [];
   const emitter = new EventEmitter(); const appEvents = new EventEmitter(); const secrets = new Map();
   const credentialReads = []; const settingsLoads = [];
@@ -77,6 +98,28 @@ function loadMainFixture(t, options = {}) {
   const realRequire = createRequire(mainPath);
   const controlledRequire = request => {
     if (request === 'electron') return electron;
+    if (request === './ai/attachment-reader') {
+      const custom = options.modules && Object.hasOwn(options.modules, request);
+      const module = custom ? options.modules[request] : realRequire(request);
+      return { ...module, createAttachmentReader: args => {
+        const reader = module.createAttachmentReader(args);
+        // The default E4 harness uses its temporary project as fake userData.
+        // Inspect only owned temporary directory metadata in Node tests; never
+        // create a source grant, read file bytes, or weaken the real reader.
+        const fixtureMetadata = !custom && Boolean(process.env.NODE_TEST_CONTEXT);
+        // The VM has a different Object.prototype. Only trusted main-created
+        // metadata options cross here; grant/work brands remain untouched.
+        return { ...reader,
+          ...(fixtureMetadata ? { inspectRoot: (projectRoot, options = {}) => args.budget.withWork(options, async work => {
+            const reservation = work.reserve(64 * 32768 * 2);
+            try { work.check(); const snapshot = fixtureProjectSnapshot(projectRoot); work.check(); return snapshot; }
+            finally { reservation.release(); }
+          }) } : {}),
+          ...(reader.createProjectListingGrant ? { createProjectListingGrant: args => reader.createProjectListingGrant({ ...args }) } : {}),
+          ...(reader.listProject ? { listProject: (grant, args) => reader.listProject(grant, { ...args }) } : {}),
+        };
+      } };
+    }
     if (options.modules && Object.hasOwn(options.modules, request)) return options.modules[request];
     if (request === './ai/settings') return settings;
     if (request === './ai/model-router') return { ...router, createModelChatFunction: args => router.createModelChatFunction({ ...args, fetchFn }) };
@@ -95,7 +138,19 @@ function loadMainFixture(t, options = {}) {
     setInterval, clearInterval, setImmediate, clearImmediate, structuredClone,
     fetch: () => { throw new Error('Synthetic harness prohibits global network'); } });
   new vm.Script(fs.readFileSync(mainPath, 'utf8'), { filename: mainPath }).runInContext(context);
-  const inspect = expression => vm.runInContext(expression, context);
+  const inspect = expression => {
+    // Trusted test inspection only: legacy owner-state assertions may name an
+    // ID, but the real resolver must still receive its actual registered sender.
+    // invoke/IPC is deliberately untouched, and unknown/destroyed IDs stay fake.
+    const inspected = process.env.NODE_TEST_CONTEXT ? expression.replace(
+      /(\bworktreeIpc\.resolveBinding\s*\()\s*\{\s*sender\s*:\s*\{\s*id\s*:\s*(\d+)\s*\}\s*\}/g,
+      (original, call, id) => {
+        const ownerId = Number(id);
+        const owner = BrowserWindow.getAllWindows().find(win => win.webContents.id === ownerId && !win.webContents.isDestroyed());
+        return owner ? `${call}{ sender: require('electron').BrowserWindow.getAllWindows().find(win => win.webContents.id === ${ownerId})?.webContents || { id: ${ownerId} } }` : original;
+      }) : expression;
+    return vm.runInContext(inspected, context);
+  };
   const invoke = async (channel, payload = {}, owner = sender) => {
     const handler = handlers.get(channel);
     if (!handler) throw new Error(`IPC handler missing: ${channel}`);
@@ -138,6 +193,10 @@ function loadMainFixture(t, options = {}) {
     await options.beforeClose?.();
     const lease = inspect('foregroundModels.current');
     lease?.abort.abort(); if (lease?.completion) await lease.completion;
+    await inspect('(async () => { const operations = [...attachmentMetadataOperations.values()].flatMap(set => [...set]); for (const operation of operations) operation.abort.abort(); await Promise.allSettled(operations.map(operation => operation.completion)); })()');
+    await inspect('attachmentIpc?.service.close()');
+    await inspect('Promise.allSettled([...attachmentOwnerCleanups])');
+    await inspect('attachmentStore?.close()');
     await inspect('modelDiagnostics?.close?.()');
     await inspect('engineeringIpc?.close?.()');
     await inspect('mcpSessionManager?.close?.()');
@@ -145,7 +204,7 @@ function loadMainFixture(t, options = {}) {
     // Only remove the exact temporary root created by this fixture.
     const resolved = path.resolve(root);
     if (resolved !== root || path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith('codex-e4-main-')) throw new Error('Unsafe synthetic cleanup path');
-    fs.rmSync(resolved, { recursive: true, force: true });
+    fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
   return { root, handlers, syncHandlers, electron, events, requests, sender, otherSender, secrets, credentialReads, settingsLoads, appEvents, invoke, accept, inspect, waitForEvent, settle,
     settings: () => clone(state), patchSettings: partial => { state = clone({ ...state, ...partial }); },

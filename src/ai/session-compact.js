@@ -1,7 +1,27 @@
 'use strict';
 
 const { generateMemoryCandidates } = require('./memory-candidates');
-const { createMessageV2, projectToStorageJson, normalizeMessage, PART_TYPES } = require('./message-schema');
+const { createMessageV2, projectToStorageJson, normalizeMessage, normalizeAttachmentRef, attachmentMetadataText, attachmentProjectionError, PART_TYPES } = require('./message-schema');
+const { LIMITS: ATTACHMENT_LIMITS } = require('./attachment-contract');
+
+/** Public locators only; no host fetch, paths, bytes, grants or renderer manifests. */
+function gatherAttachmentManifest(messages) {
+  const refs = [], seen = new Set();
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || typeof message !== 'object') continue;
+    const normalized = normalizeMessage(message);
+    const candidates = [...normalized.parts.filter(p => p.type === PART_TYPES.ATTACHMENT_REF), ...(normalized.attachmentManifest || [])];
+    for (const raw of candidates) {
+      const ref = { type: PART_TYPES.ATTACHMENT_REF, ...normalizeAttachmentRef(raw) };
+      const key = ref.attachmentId || JSON.stringify([ref.name, ref.mimeType, ref.size, ref.source]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push(ref);
+      if (refs.length > ATTACHMENT_LIMITS.MAX_COMPACT_ATTACHMENT_REFS) throw attachmentProjectionError('ATTACHMENT_COMPACT_MANIFEST_LIMIT');
+    }
+  }
+  return refs;
+}
 
 /**
  * Phase D.1 — structured session compaction.
@@ -77,6 +97,7 @@ function planCompact(messages, opts = {}) {
     keep,
     approxTokens,
     olderApproxTokens: approxTokensFromMessages(older),
+    attachmentManifest: gatherAttachmentManifest(older),
   };
 }
 
@@ -101,13 +122,14 @@ function serializeOlderTranscript(older, opts = {}) {
         return `[action:${t.kind}]`;
       }).join('\n');
       parts.push(`[${role}]\n${norm.content || ''}\n【执行轨迹】\n${trajDesc}`);
-    } else if (m.tool || role === 'tool') {
-      const name = m.tool || m.name || 'tool';
-      const body = String(m.toolSummary || m.content || '').slice(0, TOOL_SUMMARY_MAX);
+    } else if (norm.tool || role === 'tool') {
+      const name = norm.tool || 'tool';
+      const body = String(norm.toolSummary || norm.content || '').slice(0, TOOL_SUMMARY_MAX);
       parts.push(`[tool:${name}]\n${body}`);
     } else {
       parts.push(`[${role}]\n${String(norm.content || '')}`);
     }
+    for (const ref of norm.parts || []) if (ref.type === PART_TYPES.ATTACHMENT_REF) parts.push(attachmentMetadataText(ref));
   }
   let text = parts.join('\n\n');
   if (text.length > maxChars) {
@@ -118,15 +140,17 @@ function serializeOlderTranscript(older, opts = {}) {
 
 /** Replace `plan.older` with a single summary bubble; returns a new array. */
 function applyCompact(messages, plan, summary) {
-  const keep = plan && Array.isArray(plan.keep) ? plan.keep.map(normalizeMessage) : [];
-  const olderLen = plan && Array.isArray(plan.older) ? plan.older.length : 0;
+  const source = Array.isArray(messages) ? messages : [];
+  const keepCount = plan && Array.isArray(plan.keep) ? Math.min(source.length, plan.keep.length) : 0;
+  const keep = source.slice(source.length - keepCount).map(normalizeMessage);
+  const older = source.slice(0, source.length - keepCount);
+  const attachmentManifest = gatherAttachmentManifest(older);
+  const content = `${SUMMARY_PREFIX.replace('%d', String(older.length))}\n${String(summary || '').trim()}`;
   const summaryMsg = createMessageV2({
-    role: 'assistant',
-    content: `${SUMMARY_PREFIX.replace('%d', String(olderLen))}\n${String(summary || '').trim()}`,
-    compact: true,
-    compactAt: Date.now(),
-    compactedCount: olderLen,
-    createdAt: Date.now(),
+    role: 'assistant', content,
+    parts: [{ type: PART_TYPES.TEXT, text: content }, ...attachmentManifest],
+    attachmentManifest,
+    compact: true, compactAt: Date.now(), compactedCount: older.length, createdAt: Date.now(),
   });
   return [summaryMsg, ...keep];
 }
@@ -241,6 +265,7 @@ async function generateCompactArtifacts({
 }
 
 module.exports = {
+  gatherAttachmentManifest,
   approxTokensFromText,
   approxTokensFromMessages,
   planCompact,

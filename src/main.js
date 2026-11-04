@@ -14,6 +14,14 @@ const {
 const { createModelIpcHandlers, registerModelIpc } = require('./ai/model-ipc');
 const { createForegroundRuntime, publicModelSource } = require('./ai/model-runtime');
 const { createModelChatFunction, preflightModelRequest } = require('./ai/model-router');
+const { createModelOperationBudget } = require('./ai/model-operation-budget');
+const { LIMITS: ATTACHMENT_LIMITS, attachmentError, publicAttachmentError, createAttachmentBudget, checkedId, normalizeRelativePath, assertFields } = require('./ai/attachment-contract');
+const { createAttachmentReader } = require('./ai/attachment-reader');
+const { redactAttachmentText, getSecretRedactionGeneration } = require('./ai/attachment-redaction');
+const { createAttachmentStore, createElectronSafeStorageAdapter } = require('./ai/attachment-store');
+const { createAttachmentIpcHandlers } = require('./ai/attachment-ipc');
+const { getAttachmentRunData } = require('./ai/attachment-preview');
+const { projectAttachmentRunMessages, buildAttachmentSelectionMessages, attachmentRunSummary } = require('./ai/attachment-projection');
 const { buildModelUsageEvent } = require('./ai/model-usage');
 const { assistantContextPolicy, assertAssistantToolAllowed, filterAssistantTools } = require('./ai/assistant-policy');
 const { generateLocalReply } = require('./ai/local-mock');
@@ -53,6 +61,10 @@ const RUN_BUSINESS_ERRORS = Object.freeze({
 function publicRunError(error, modelSource) {
   let code;
   try { code = Object.getOwnPropertyDescriptor(error || {}, 'code')?.value; } catch { /* no untrusted getter */ }
+  if (typeof code === 'string' && code.startsWith('ATTACHMENT_')) {
+    const attachment = publicAttachmentError(error);
+    return { code: attachment.code, safeMessage: attachment.safeMessage, retryable: attachment.retryable === true, ...(modelSource ? { modelSource } : {}) };
+  }
   const safeMessage = typeof code === 'string' && Object.hasOwn(RUN_BUSINESS_ERRORS, code) ? RUN_BUSINESS_ERRORS[code] : undefined;
   return publicModelError(error, { modelSource, redactMessage: redactModelPartialOutput, redactPartial: redactModelPartialOutput,
     ...(safeMessage ? { preserveCodes: [code], safeMessage } : {}) });
@@ -74,7 +86,7 @@ const {
   buildTreeReply,
 } = require('./ai/project-fs');
 const { gitStatus, gitDiff } = require('./ai/git');
-const { expandAtRefs, completeAtPath } = require('./ai/at-ref');
+const { parseAtRefs } = require('./ai/at-ref');
 const { computeUnifiedDiff, truncateDiff } = require('./ai/diff');
 const {
   normalizeAgentMode,
@@ -103,7 +115,7 @@ const {
   defaultExportFilename,
 } = require('./ai/session-export');
 const {
-  projectToModelMessages,
+  projectToModelMessagesWithoutStorageTruncation,
   createMessageV2,
   PLAN_STATUS,
 } = require('./ai/message-schema');
@@ -133,19 +145,12 @@ const {
 const PERMISSION_MODES = new Set(['read-only', 'confirm-writes', 'full-auto']);
 const AGENT_MODES = new Set(['plan', 'agent']);
 
-/**
- * Canonical model projection: project versioned messages for LLM completion;
- * expand @refs on the last user message only.
- * Renderer history keeps the original text/parts (not this expanded copy).
- */
-function messagesForModel(messages, projectPath) {
+/** Metadata-only base projection. Source bytes require an E5 run brand. */
+function messagesForModel(messages) {
   if (Array.isArray(messages) && messages.some((message) => message?.role === 'system')) {
     throw Object.assign(new Error('会话历史不能提供主机 system 指令；请在助手设置中配置提示词。'), { code: 'MODEL_MESSAGE_ROLE_INVALID' });
   }
-  return projectToModelMessages(messages, {
-    projectPath,
-    expandAtRefs,
-  });
+  return projectToModelMessagesWithoutStorageTruncation(messages);
 }
 
 /**
@@ -266,9 +271,9 @@ function resolveModelContext(event, payload = {}, metadata = {}) {
 }
 
 function isProjectModelBindingCurrent(binding) {
-  return !binding.projectBindingId || Boolean(worktreeIpc.resolveBinding(
-    { sender: { id: binding.senderId } }, { projectBindingId: binding.projectBindingId },
-  ));
+  if (!binding.projectBindingId) return true;
+  const sender = BrowserWindow.getAllWindows().find(win => !win.isDestroyed() && win.webContents.id === binding.senderId)?.webContents;
+  return Boolean(sender && worktreeIpc.resolveBinding({ sender }, { projectBindingId: binding.projectBindingId }));
 }
 
 /** Revocation is token- and owner-scoped; the foreground lease stays held through cleanup. */
@@ -286,10 +291,11 @@ function revokeInvalidProjectModelBindings(event) {
   }
 }
 
-function boundModelChat(binding, settings, { kind = binding.kind || 'chat', signal, onUsage } = {}) {
-  const chat = createModelChatFunction({ binding, signal, kind, resolveCredential: (accepted) => getModelIpc().resolveCredential(accepted),
+function boundModelChat(binding, settings, { kind = binding.kind || 'chat', signal, onUsage, operationBudget } = {}) {
+  const chat = createModelChatFunction({ binding, signal, kind, operationBudget, resolveCredential: (accepted) => getModelIpc().resolveCredential(accepted),
     onUsage: (attempt) => {
-      const usage = buildModelUsageEvent({ binding, settings, attempt, kind });
+      const usage = buildModelUsageEvent({ binding, settings, attempt, kind,
+        ...(operationBudget?.attachmentSummary ? { attachmentSummary: { ...operationBudget.attachmentSummary, contextLimit: operationBudget.contextLimit } } : {}) });
       if (!usage) return;
       if (onUsage) onUsage(usage); else persistUsageEvent(settings, binding.sessionId, usage);
     },
@@ -435,10 +441,266 @@ const rootTokensBySender = new Map();
 const rootTokenRecords = new Map();
 const mcpProjectBySender = new Map();
 
+// One application-wide accounting domain, shared by source handles, package IO,
+// previews and all physical model requests. No renderer path creates a grant.
+const attachmentBudget = createAttachmentBudget();
+let attachmentReader = null;
+let attachmentStore = null;
+let attachmentIpc = null;
+let attachmentInitialization = null;
+const attachmentOwnerListeners = new WeakSet();
+const attachmentOwnerCleanups = new Set();
+const attachmentMetadataOperations = new Map();
+const attachmentAcceptedContexts = new WeakMap();
+const attachmentPlanSnapshots = new WeakMap();
+const attachmentRunLeases = new WeakMap();
+
+function isAuthorizedMainSender(event) {
+  return Boolean(event?.sender && !event.sender.isDestroyed?.()
+    && BrowserWindow.getAllWindows().some(win => !win.isDestroyed() && win.webContents === event.sender));
+}
+function trackAttachmentOwner(sender) {
+  if (attachmentOwnerListeners.has(sender)) return;
+  attachmentOwnerListeners.add(sender);
+  const drop = () => {
+    const metadata = [...(attachmentMetadataOperations.get(sender.id) || [])];
+    for (const operation of metadata) operation.abort.abort();
+    dropModelOwner(sender.id); worktreeIpc.dropSender(sender.id); planState.expireSender(sender.id);
+    const cleanup = Promise.allSettled([Promise.resolve().then(() => attachmentIpc?.service.dropOwner(sender.id)), ...metadata.map(operation => operation.completion)]);
+    attachmentOwnerCleanups.add(cleanup);
+    cleanup.finally(() => attachmentOwnerCleanups.delete(cleanup)).catch(() => {});
+  };
+  sender.on?.('did-start-navigation', (_event, _url, _inPlace, mainFrame) => { if (mainFrame !== false) drop(); });
+  sender.once?.('destroyed', drop);
+}
+function authorizeAttachmentSender(event) {
+  if (!isAuthorizedMainSender(event)) return false;
+  trackAttachmentOwner(event.sender); return true;
+}
+function getAttachmentReader() {
+  if (!attachmentReader) {
+    const home = app.getPath('home');
+    attachmentReader = createAttachmentReader({ budget: attachmentBudget, protectedPaths: [userDataPath(), app.getPath('appData'),
+      path.join(home, '.ssh'), path.join(home, '.gnupg'), path.join(home, '.aws')] });
+  }
+  return attachmentReader;
+}
+function nodeProjectIdentityChain(root) {
+  const entries = []; let current = path.resolve(root);
+  while (true) {
+    const stat = fs.lstatSync(current, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw attachmentError('ATTACHMENT_SOURCE_CHANGED');
+    entries.unshift(Object.freeze({ path: current, identity: `${stat.dev}:${stat.ino}` }));
+    const parent = path.dirname(current); if (parent === current) break; current = parent;
+  }
+  return Object.freeze(entries);
+}
+function samePhysicalAncestors(expected, actual) {
+  return Array.isArray(expected) && Array.isArray(actual) && expected.length <= actual.length
+    && expected.every((entry, index) => entry.identity === actual[index]?.identity
+      && String(entry.path).toLowerCase() === String(actual[index]?.path).toLowerCase());
+}
+async function inspectProjectRootForBinding(root, event) {
+  if (!authorizeAttachmentSender(event)) throw attachmentError();
+  const before = nodeProjectIdentityChain(root);
+  const native = await getAttachmentReader().inspectRoot(root);
+  if (!isAuthorizedMainSender(event) || !samePhysicalAncestors(before, nodeProjectIdentityChain(root))) throw attachmentError('ATTACHMENT_SOURCE_CHANGED');
+  return Object.freeze({ ...native, ancestors: Object.freeze(native.ancestors.map(entry => Object.freeze({ ...entry }))), auxiliary: before });
+}
+function isProjectRootSnapshotCurrent(binding) {
+  try {
+    const snapshot = binding?.rootSnapshot;
+    return Boolean(snapshot?.rootIdentity && snapshot.ancestors?.length && snapshot.auxiliary?.length
+      && String(snapshot.physicalPath).toLowerCase() === String(binding.projectPath).toLowerCase()
+      && samePhysicalAncestors(snapshot.auxiliary, nodeProjectIdentityChain(binding.projectPath)));
+  } catch { return false; }
+}
+function attachmentContextLimit(binding, settings) {
+  const explicit = Number(settings.compactMaxApproxTokens);
+  const window = binding.capabilities.contextWindow?.tokens;
+  return Math.min(Number.isSafeInteger(window) && window > 0 ? window : ATTACHMENT_LIMITS.UNKNOWN_CONTEXT_APPROX_LIMIT,
+    Number.isSafeInteger(explicit) && explicit > 0 ? explicit : ATTACHMENT_LIMITS.UNKNOWN_CONTEXT_APPROX_LIMIT);
+}
+function attachmentSystemPrompt(binding, project, contextPolicy) {
+  const parts = [binding.assistant.systemPrompt || '你是一位 AI 助手。回答清楚、准确，不编造外部操作的结果。'];
+  if (contextPolicy.projectContext && project) parts.push(`当前已授权项目：${path.basename(project.path)}。仅本次确认的附件正文可作为文件上下文；历史附件记录只是元信息，不表示重新读取了文件。`);
+  return parts.join('\n\n');
+}
+function attachmentTarget(binding) {
+  return { origin: new URL(binding.baseUrl).origin, providerId: binding.providerId, modelProfileId: binding.modelProfileId,
+    model: binding.model, assistantId: binding.assistantId, protocol: binding.protocol };
+}
+function currentAttachmentUser(messages) {
+  const current = [...messages].reverse().find(message => message?.role === 'user');
+  if (!current) throw attachmentError('ATTACHMENT_REFERENCE_INVALID');
+  const textParts = Array.isArray(current.parts) ? current.parts.filter(part => part?.type === 'text') : [];
+  const userText = textParts.length ? textParts.map(part => String(part.text ?? part.content ?? '')).join('\n') : String(current.content || '');
+  if (Buffer.byteLength(userText, 'utf8') > ATTACHMENT_LIMITS.MAX_REQUEST_BYTES) throw attachmentError('ATTACHMENT_TEXT_LIMIT');
+  return { current, userText };
+}
+function ownedPlanForAttachmentPreview(event, payload, binding) {
+  const captured = attachmentPlanSnapshots.get(payload);
+  if (captured) return captured;
+  const plan = planState.getPending(payload.sessionId, resolvePlanBinding(event, payload, binding));
+  if (!plan || plan.planId !== payload.planId) throw Object.assign(new Error('计划不存在或绑定已改变。'), { code: 'PLAN_BINDING_CHANGED' });
+  return plan;
+}
+async function describeAttachmentSend(event, payload = {}) {
+  if (!authorizeAttachmentSender(event)) throw attachmentError();
+  if (payload.requestKind !== undefined && (!['chat', 'approvePlan'].includes(payload.requestKind)
+    || (payload.requestKind === 'approvePlan') !== Boolean(payload.planId))) throw attachmentError();
+  const accepted = attachmentAcceptedContexts.get(payload) || (() => {
+    const resolved = resolveModelContext(event, payload, { kind: 'chat', clientRequestId: payload.clientRequestId });
+    return { ...resolved, settings: modelSettings() };
+  })();
+  const { binding, settings, project, contextPolicy } = accepted;
+  const capturedPlan = attachmentPlanSnapshots.get(payload);
+  const plan = payload.planId ? ownedPlanForAttachmentPreview(event, payload, binding) : null;
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const effectiveMessages = plan && !capturedPlan
+    ? [...messages, createMessageV2({ sessionId: payload.sessionId, role: 'user', content: buildApproveExecutionMessage(plan) })] : messages;
+  messagesForModel(effectiveMessages); // Host-only system roles and malformed histories fail before byte IO.
+  const { current, userText } = currentAttachmentUser(effectiveMessages);
+  const partIds = (Array.isArray(current.parts) ? current.parts : []).filter(part => part?.type === 'attachment_ref'
+    && typeof part.attachmentId === 'string' && /^att_[a-f0-9]{32}$/.test(part.attachmentId)).map(part => part.attachmentId);
+  const attachmentIds = payload.attachmentIds === undefined ? [] : payload.attachmentIds;
+  if (!Array.isArray(attachmentIds) || new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > ATTACHMENT_LIMITS.MAX_SELECTION_FILES) throw attachmentError('ATTACHMENT_SELECTION_LIMIT');
+  for (const id of attachmentIds) checkedId(id, { prefix: 'att' });
+  if (partIds.length && (new Set(partIds).size !== partIds.length || partIds.length !== attachmentIds.length
+    || partIds.some(id => !attachmentIds.includes(id)))) throw attachmentError('ATTACHMENT_PREVIEW_REQUIRED');
+  const inventory = parseAtRefs(userText).map(ref => ({ path: normalizeRelativePath(ref.path.replace(/%20/gi, ' ')),
+    ...(ref.startLine === undefined ? {} : { startLine: ref.startLine, endLine: ref.endLine }) }));
+  if (inventory.length + attachmentIds.length > ATTACHMENT_LIMITS.MAX_SELECTION_FILES) throw attachmentError('ATTACHMENT_SELECTION_LIMIT');
+  if (payload.refs !== undefined) {
+    if (!Array.isArray(payload.refs) || payload.refs.length > ATTACHMENT_LIMITS.MAX_SELECTION_FILES) throw attachmentError('ATTACHMENT_SELECTION_LIMIT');
+    const proposal = payload.refs.map(ref => ({ path: normalizeRelativePath(ref?.path),
+      ...(ref?.startLine === undefined ? {} : { startLine: ref.startLine, endLine: ref.endLine }) }));
+    if (JSON.stringify(proposal) !== JSON.stringify(inventory)) throw attachmentError('ATTACHMENT_PREVIEW_REQUIRED');
+  }
+  const systemPrompt = attachmentSystemPrompt(binding, project, contextPolicy);
+  const semanticMessages = messagesForModel(effectiveMessages);
+  const policyRevision = modelPolicyRevision(settings);
+  const budget = { contextLimit: attachmentContextLimit(binding, settings), maxOutputTokens: binding.request.maxOutputTokens };
+  const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ senderId: event.sender.id, sessionId: payload.sessionId,
+    clientRequestId: payload.clientRequestId, draftRevision: payload.draftRevision ?? 0, attachmentSessionBindingId: payload.attachmentSessionBindingId,
+    attachmentIds, inventory, messages: semanticMessages,
+    projectBindingId: binding.projectBindingId, assistantId: binding.assistantId, assistantRevision: binding.assistantRevision,
+    providerId: binding.providerId, providerRevision: binding.providerRevision, modelProfileId: binding.modelProfileId, modelRevision: binding.modelRevision,
+    bindingRevision: binding.bindingRevision, registryRevision: binding.registryRevision, contextPolicy, systemPrompt, policyRevision,
+    plan: plan ? { planId: plan.planId, createdAt: plan.createdAt, title: plan.title, markdown: plan.markdown, steps: plan.steps } : null,
+    agentMode: plan ? 'agent' : normalizeAgentMode(payload.agentMode), budget,
+  })).digest('hex');
+  return { binding, settings, project, contextPolicy, policyRevision, systemPrompt, fingerprint, inventory, attachmentIds, userText,
+    messages: effectiveMessages, userMessage: createMessageV2({ ...current, sessionId: payload.sessionId, role: 'user', content: userText }),
+    target: attachmentTarget(binding), budget, projectBindingId: binding.projectBindingId, sessionId: payload.sessionId,
+    clientRequestId: payload.clientRequestId, assistantId: binding.assistantId };
+}
+function preflightAttachmentSelection(description, entries, { work } = {}) {
+  const source = description.messages.slice();
+  const index = source.map(message => message?.role).lastIndexOf('user');
+  source[index] = { ...description.userMessage, content: description.userText,
+    parts: [...(description.userMessage.parts || [{ type: 'text', text: description.userText }]).filter(part => part.type !== 'attachment_ref'),
+      ...entries.map(entry => ({ type: 'attachment_ref', ...entry.ref }))] };
+  const projected = buildAttachmentSelectionMessages(source, entries, { work });
+  const messages = [{ role: 'system', content: description.systemPrompt }, ...projected];
+  const tools = []; // Base preview estimate; every actual Agent tool schema/wire is checked before credentials and dispatch.
+  const encoded = JSON.stringify({ model: description.binding.model, messages, tools, request: description.binding.request });
+  const requestBytes = Buffer.byteLength(encoded, 'utf8'), estimatedInputTokens = Math.ceil(encoded.length / 4);
+  if (requestBytes > ATTACHMENT_LIMITS.MAX_REQUEST_BYTES || estimatedInputTokens + description.budget.maxOutputTokens > description.budget.contextLimit) throw attachmentError('ATTACHMENT_TEXT_LIMIT');
+  preflightModelRequest({ binding: description.binding, messages, tools });
+  return { ...description.budget, requestBytes, estimatedInputTokens };
+}
+async function validateAttachmentCurrent(event, description, { signal } = {}) {
+  if (signal?.aborted || !isAuthorizedMainSender(event)) throw attachmentError('ABORTED');
+  const current = resolveModelContext(event, { sessionId: description.sessionId, assistantId: description.assistantId,
+    modelProfileId: description.binding.modelProfileId, projectBindingId: description.projectBindingId });
+  if (current.binding.bindingRevision !== description.binding.bindingRevision || current.binding.assistantRevision !== description.binding.assistantRevision
+    || JSON.stringify(current.contextPolicy) !== JSON.stringify(description.contextPolicy) || modelPolicyRevision(modelSettings()) !== description.policyRevision) throw attachmentError('ATTACHMENT_PREVIEW_STALE');
+}
+async function resolveAttachmentProject(event, description, { signal, work } = {}) {
+  await validateAttachmentCurrent(event, description, { signal });
+  const binding = description.projectBindingId ? worktreeIpc.resolveBinding(event, { projectBindingId: description.projectBindingId }) : null;
+  if (!binding || !description.contextPolicy.projectContext) throw attachmentError('ATTACHMENT_READ_DENIED');
+  const snapshot = await getAttachmentReader().inspectRoot(binding.projectPath, { signal, work });
+  if (!isProjectRootSnapshotCurrent(binding) || snapshot.rootIdentity !== binding.rootSnapshot.rootIdentity
+    || !samePhysicalAncestors(binding.rootSnapshot.ancestors, snapshot.ancestors)) throw attachmentError('ATTACHMENT_SOURCE_CHANGED');
+  const gate = createPermissionGate({ projectRoot: binding.projectPath, projectId: JSON.stringify([event.sender.id, description.projectBindingId, binding.projectId]),
+    permissionMode: description.settings.permissionMode, policyLevel: description.settings.executionPolicy, agentMode: 'plan' });
+  try {
+    const permission = await gate.authorize({ tool: 'read_file', risk: 'read', path: '.', args: { path: '.' },
+      summary: '读取本次显式选择的项目文本附件', sessionKey: description.sessionId, signal, agentMode: 'plan' });
+    if (!permission?.allowed) throw attachmentError('ATTACHMENT_READ_DENIED');
+  } finally { gate.cancelPending?.('附件读取许可检查结束'); }
+  if (!isAuthorizedMainSender(event) || signal?.aborted || !isProjectRootSnapshotCurrent(binding)) throw attachmentError('ABORTED');
+  return { projectRoot: binding.projectPath, projectId: binding.projectId, rootIdentity: snapshot.rootIdentity, ancestors: snapshot.ancestors };
+}
+async function attachmentConfirmation(event, message) {
+  if (!authorizeAttachmentSender(event)) throw attachmentError();
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  const answer = await dialog.showMessageBox(owner, { type: 'question', buttons: ['取消', '确认'], defaultId: 0, cancelId: 0, noLink: true, message });
+  return isAuthorizedMainSender(event) && answer.response === 1;
+}
+function getAttachmentIpc() {
+  if (attachmentIpc) return attachmentIpc;
+  const reader = getAttachmentReader();
+  const safeAdapter = createElectronSafeStorageAdapter(safeStorage);
+  const profileNamespace = `profile_${crypto.createHash('sha256').update(path.resolve(userDataPath())).digest('hex').slice(0, 32)}`;
+  attachmentStore = createAttachmentStore({ cacheRoot: path.join(userDataPath(), 'attachments-v1'), profileNamespace, safeStorage: safeAdapter, reader, budget: attachmentBudget });
+  attachmentIpc = createAttachmentIpcHandlers({ reader, store: attachmentStore, budget: attachmentBudget, authorizeSender: authorizeAttachmentSender,
+    describeSend: describeAttachmentSend, resolveProject: resolveAttachmentProject, validateCurrent: validateAttachmentCurrent, preflightSelection: preflightAttachmentSelection,
+    chooseExternal: async event => {
+      if (!authorizeAttachmentSender(event)) throw attachmentError();
+      const selected = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), { title: '选择本次允许读取的文本附件', properties: ['openFile', 'multiSelections'],
+        filters: [{ name: '文本文件', extensions: ['txt', 'md', 'json', 'csv', 'js', 'ts', 'py', 'log', 'yaml', 'yml', 'xml', 'html', 'css', 'sql'] }] });
+      if (!isAuthorizedMainSender(event)) throw attachmentError('ABORTED'); return selected.canceled ? [] : selected.filePaths;
+    },
+    confirmDrop: event => attachmentConfirmation(event, '允许读取并复制本次拖入的文本文件？源文件不会被修改或删除。'),
+    confirmRestore: event => attachmentConfirmation(event, '恢复本应用保存的附件副本？这不允许重新读取旧源路径。'),
+    confirmDelete: event => attachmentConfirmation(event, '删除本应用保存的附件副本？源文件不会被删除。'),
+    confirmClear: event => attachmentConfirmation(event, '清理当前会话的附件副本？源文件不会被删除。'),
+    onRunInvalidated: run => { const lease = attachmentRunLeases.get(run); if (lease) { lease.abort.abort(); lease.gate?.cancelPending?.('附件权限或引用已失效'); } },
+    getRedactionGeneration: getSecretRedactionGeneration, redact: redactAttachmentText,
+  });
+  return attachmentIpc;
+}
+function createAttachmentOperationBudget(lease, run) {
+  let wireWork = null;
+  const summary = attachmentRunSummary(run);
+  const attachmentSummary = Object.fromEntries(['count', 'rawBytes', 'selectedBytes', 'selectedChars', 'truncatedCount'].map(key => [key, summary[key]]));
+  return createModelOperationBudget({ binding: lease.binding, contextLimit: attachmentContextLimit(lease.binding, lease.settings),
+    compactMaxApproxTokens: lease.settings.compactMaxApproxTokens, attachmentSummary,
+    check: async () => { await run.check({ work: wireWork }); },
+    reserveWire: async info => {
+      const bytes = Number(info.stringBytes) + Number(info.requestBytes);
+      if (!Number.isSafeInteger(bytes) || bytes < 0) throw attachmentError('ATTACHMENT_TEXT_LIMIT');
+      let announce, reject, finish;
+      const admitted = new Promise((resolve, fail) => { announce = resolve; reject = fail; });
+      const completion = attachmentBudget.withWork({ signal: info.signal }, async work => {
+        const reservation = work.reserve(bytes); wireWork = work;
+        await new Promise(resolve => {
+          finish = resolve;
+          announce(async () => { finish(); await completion; });
+        });
+        wireWork = null; reservation.release();
+      });
+      completion.catch(error => { wireWork = null; reject(error); });
+      return await admitted;
+    },
+  });
+}
+async function initializeAttachments() {
+  getAttachmentIpc();
+  if (!attachmentInitialization) attachmentInitialization = attachmentStore.initialize();
+  await attachmentInitialization;
+}
+
 const worktreeManager = createWorktreeManager();
 const subagentRuntime = createSubagentRuntime({ runLoop: runAgentLoop, worktreeManager });
 const worktreeIpc = createWorktreeIpcHandlers({
   manager: worktreeManager,
+  authorizeSender: isAuthorizedMainSender,
+  inspectProjectRoot: inspectProjectRootForBinding,
+  validateProjectRoot: isProjectRootSnapshotCurrent,
   checkWorkflowGate: (event, payload) => getEngineeringIpc().workflowGateCheck(event, payload),
   isBusy: () => Boolean(activeRun || manualTerm || worktreeMutation),
   withMutation: async (fn) => {
@@ -1065,7 +1327,10 @@ app.on('before-quit', (event) => {
   abortActiveRun();
   try { lease?.gate?.cancelPending('应用正在关闭'); } catch { /* shutdown cannot keep a permission request */ }
   for (const controllers of activeModelRequests.values()) for (const controller of controllers) controller.abort();
+  const metadata = [...attachmentMetadataOperations.values()].flatMap(operations => [...operations]);
+  for (const operation of metadata) operation.abort.abort();
   Promise.allSettled([
+    ...metadata.map(operation => operation.completion),
     Promise.resolve().then(() => lease?.completion),
     Promise.resolve().then(() => modelDiagnostics?.close?.()),
     Promise.resolve().then(() => mcpOAuthManager?.closeAll?.()),
@@ -1073,6 +1338,12 @@ app.on('before-quit', (event) => {
     Promise.resolve().then(() => mcpTaskManager?.close?.()),
     Promise.resolve().then(() => mcpElicitationController?.cancelAll?.()),
     Promise.resolve().then(() => engineeringIpc?.close?.()),
+    Promise.resolve().then(async () => {
+      await lease?.completion;
+      await attachmentIpc?.service.close();
+      await Promise.allSettled([...attachmentOwnerCleanups]);
+      await attachmentStore?.close();
+    }),
   ]).catch(() => {}).finally(() => app.quit());
 });
 
@@ -1644,12 +1915,13 @@ async function compactAcceptedHistory(messages, payload, lease, manual) {
   const artifacts = await generateCompactArtifacts({
     transcript: serializeOlderTranscript(plan.older), settings, modelBinding: binding,
     signal: lease.abort.signal, candidateLimit,
-    chatFn: boundModelChat(binding, settings, { kind: 'compact', signal: lease.abort.signal, onUsage }),
-    candidateChatFn: boundModelChat(binding, settings, { kind: 'memory-candidate', signal: lease.abort.signal, onUsage }),
+    chatFn: boundModelChat(binding, settings, { kind: 'compact', signal: lease.abort.signal, onUsage, operationBudget: lease.operationBudget }),
+    candidateChatFn: boundModelChat(binding, settings, { kind: 'memory-candidate', signal: lease.abort.signal, onUsage, operationBudget: lease.operationBudget }),
   });
   if (lease.abort.signal.aborted) throwAborted();
   const compacted = applyCompact(messages, plan, artifacts.summary);
   if (compacted[0]) compacted[0] = { ...compacted[0], modelSource: lease.modelSource };
+  if (lease.attachmentRun) await lease.attachmentRun.syncMessageLinks(compacted);
   return { ok: true, needed: true, messages: compacted, compactedCount: plan.older.length,
     approxTokens: plan.approxTokens, olderApproxTokens: plan.olderApproxTokens, usage: compactUsage,
     candidates: artifacts.candidates, candidateWarning: artifacts.candidateWarning };
@@ -1707,9 +1979,35 @@ ipcMain.handle('memory:update', async (_e, payload = {}) => memoryUpdate({
 
 // Phase D.5 worktree results. Only bind accepts a project path; every later
 // call routes through the sender-scoped opaque binding token.
+for (const channel of ['attachments:registerSession', 'attachments:restoreSession', 'attachments:chooseExternal',
+  'attachments:proposeDrop', 'attachments:list', 'attachments:captureProjectRefs', 'attachments:prepareSend',
+  'attachments:previewPage', 'attachments:remove', 'attachments:deleteCopy', 'attachments:cancel',
+  'attachments:cacheStatus', 'attachments:clearCache']) {
+  ipcMain.handle(channel, async (event, payload = {}) => {
+    if (!authorizeAttachmentSender(event)) return { ok: false, ...publicAttachmentError(attachmentError()) };
+    try {
+      await initializeAttachments();
+      const result = { ok: true, ...await getAttachmentIpc().handlers[channel](event, payload) };
+      if (channel === 'attachments:cancel' && result.ok) {
+        const lease = foregroundModels.current;
+        if (lease?.attachmentRun && lease.senderId === event.sender.id && lease.sessionId === payload.sessionId
+          && lease.clientRequestId === payload.targetClientRequestId) {
+          lease.abort.abort(); lease.gate?.cancelPending?.('已取消本次附件运行'); await lease.completion;
+        }
+      }
+      if (['attachments:remove', 'attachments:deleteCopy', 'attachments:clearCache'].includes(channel) && result.ok) {
+        const lease = foregroundModels.current;
+        if (lease?.attachmentRun && lease.senderId === event.sender.id && lease.sessionId === payload.sessionId
+          && lease.abort.signal.aborted) await lease.completion;
+      }
+      return result;
+    } catch (error) { return { ok: false, ...publicAttachmentError(error) }; }
+  });
+}
+
 ipcMain.handle('worktree:bind', async (event, payload = {}) => {
   const previousPaths = worktreeIpc.listProjectPaths(event);
-  const result = worktreeIpc.bind(event, payload);
+  const result = await worktreeIpc.bind(event, payload);
   if (result?.ok) {
     revokeInvalidProjectModelBindings(event);
     planState.expireBinding({ senderId: event.sender.id, projectId: payload.projectId });
@@ -1847,10 +2145,16 @@ ipcMain.handle('shell:openPath', async (_e, targetPath) => {
   return true;
 });
 
-ipcMain.handle('project:listTree', async (_e, projectPath, opts) => listTree(projectPath, opts || {}));
-ipcMain.handle('project:readFile', async (_e, projectPath, relPath) => readFile(projectPath, relPath));
-ipcMain.handle('project:writeFile', async (_e, projectPath, relPath, content) => writeFile(projectPath, relPath, content));
-ipcMain.handle('project:deletePath', async (_e, projectPath, relPath) => deletePath(projectPath, relPath));
+function rejectLegacyProjectPath(event) {
+  const code = authorizeAttachmentSender(event) ? 'ATTACHMENT_READ_DENIED' : 'ATTACHMENT_REFERENCE_INVALID';
+  return { ok: false, ...publicAttachmentError(attachmentError(code)) };
+}
+// Positional projectPath is metadata, never a file capability. These legacy
+// APIs cannot safely downgrade to ordinary path IO; callers must use E5 grants.
+ipcMain.handle('project:listTree', async event => rejectLegacyProjectPath(event));
+ipcMain.handle('project:readFile', async event => rejectLegacyProjectPath(event));
+ipcMain.handle('project:writeFile', async event => rejectLegacyProjectPath(event));
+ipcMain.handle('project:deletePath', async event => rejectLegacyProjectPath(event));
 
 // Read-only git IPC (no commit — commit only via agent tool)
 ipcMain.handle('git:status', async (_e, payload = {}) => {
@@ -2078,33 +2382,56 @@ ipcMain.handle('terminal:clear', async () => {
   return { ok: true };
 });
 
-ipcMain.handle('atRef:complete', async (_e, payload = {}) => {
-  const projectPath = payload.projectPath || payload.project?.path || null;
-  const prefix = payload.prefix != null ? String(payload.prefix) : '';
-  if (!projectPath) return { items: [] };
-  try {
-    const items = completeAtPath(projectPath, prefix, {
-      limit: payload.limit != null ? Number(payload.limit) : undefined,
-    });
-    return { items };
-  } catch (err) {
-    return { items: [], error: err instanceof Error ? err.message : String(err) };
-  }
+ipcMain.handle('atRef:complete', (event, payload = {}) => {
+  const operation = { abort: new AbortController(), completion: null };
+  const timer = setTimeout(() => operation.abort.abort(), ATTACHMENT_LIMITS.CAPTURE_TIMEOUT_MS);
+  let owned;
+  operation.completion = (async () => {
+    try {
+      assertFields(payload, ['projectBindingId', 'assistantId', 'modelProfileId', 'expectedRegistryRevision', 'sessionId', 'clientRequestId', 'projectPath', 'project', 'prefix', 'limit']);
+      if (!authorizeAttachmentSender(event)) throw attachmentError();
+      if (!payload.projectBindingId || !payload.assistantId || !payload.modelProfileId) throw attachmentError('ATTACHMENT_READ_DENIED');
+      const prefix = payload.prefix ?? '';
+      if (typeof prefix !== 'string' || prefix.length > 32768) throw attachmentError('ATTACHMENT_READ_DENIED');
+      const limit = payload.limit ?? ATTACHMENT_LIMITS.MAX_DIRECTORY_LIST_ENTRIES;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > ATTACHMENT_LIMITS.MAX_DIRECTORY_LIST_ENTRIES) throw attachmentError('ATTACHMENT_READ_DENIED');
+      const resolved = resolveModelContext(event, payload, { kind: 'chat', clientRequestId: String(payload.clientRequestId || '') });
+      const settings = modelSettings();
+      const description = { ...resolved, settings, policyRevision: modelPolicyRevision(settings),
+        projectBindingId: resolved.binding.projectBindingId, assistantId: resolved.binding.assistantId,
+        sessionId: String(payload.sessionId || ''), clientRequestId: String(payload.clientRequestId || '') };
+      if (!description.contextPolicy.projectContext) throw attachmentError('ATTACHMENT_READ_DENIED');
+      owned = attachmentMetadataOperations.get(event.sender.id);
+      if (!owned) { owned = new Set(); attachmentMetadataOperations.set(event.sender.id, owned); }
+      owned.add(operation);
+      return await attachmentBudget.withWork({ signal: operation.abort.signal }, async work => {
+        const project = await resolveAttachmentProject(event, description, { signal: operation.abort.signal, work });
+        const reader = getAttachmentReader();
+        const grant = reader.createProjectListingGrant({ projectRoot: project.projectRoot, rootIdentity: project.rootIdentity,
+          expectedAncestors: project.ancestors, prefix });
+        const listing = await reader.listProject(grant, { maxEntries: limit, maxScanned: ATTACHMENT_LIMITS.MAX_DIRECTORY_SCAN_ENTRIES,
+          signal: operation.abort.signal, work });
+        await validateAttachmentCurrent(event, description, { signal: operation.abort.signal, work });
+        const binding = worktreeIpc.resolveBinding(event, { projectBindingId: description.projectBindingId });
+        if (!binding || !isProjectRootSnapshotCurrent(binding)) throw attachmentError('ATTACHMENT_SOURCE_CHANGED');
+        const normalized = prefix.replace(/\\/g, '/'), slash = normalized.lastIndexOf('/');
+        const directory = slash < 0 ? '' : normalized.slice(0, slash + 1);
+        const items = listing.entries.slice().sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.name.localeCompare(b.name)).map(entry => {
+          const relative = directory + entry.name;
+          return { path: relative, type: entry.isDirectory ? 'dir' : 'file',
+            insertText: relative.replace(/ /g, '%20') + (entry.isDirectory ? '/' : '') };
+        });
+        return { ok: true, items, truncated: listing.truncated };
+      });
+    } catch (error) { return { ...publicAttachmentError(error), items: [] }; }
+    finally { clearTimeout(timer); owned?.delete(operation); if (owned?.size === 0) attachmentMetadataOperations.delete(event.sender?.id); }
+  })();
+  return operation.completion;
 });
-
-ipcMain.handle('atRef:expand', async (_e, payload = {}) => {
-  const projectPath = payload.projectPath || payload.project?.path || null;
-  const text = payload.text != null ? String(payload.text) : '';
-  try {
-    return expandAtRefs(projectPath, text);
-  } catch (err) {
-    return {
-      contextBlock: null,
-      refs: [],
-      warnings: [err instanceof Error ? err.message : String(err)],
-    };
-  }
-});
+ipcMain.handle('atRef:expand', async event => ({ ok: false,
+  ...publicAttachmentError(attachmentError(authorizeAttachmentSender(event) ? 'ATTACHMENT_PREVIEW_REQUIRED' : 'ATTACHMENT_REFERENCE_INVALID')),
+  contextBlock: null, refs: [], warnings: [],
+}));
 
 /**
  * Shared chat run entry for chat:send and chat:approvePlan.
@@ -2151,9 +2478,10 @@ function preflightAcceptedRun(binding, settings, contextPolicy, project, payload
 
 async function startForegroundModelRun(event, payload = {}, opts = {}, kind = 'chat') {
   if (worktreeMutation || foregroundModels.current) return busyRunResult();
-  let lease;
+  let lease, attachmentRun;
   try {
     payload = structuredClone(payload);
+    if (opts.attachmentPlanSnapshot) attachmentPlanSnapshots.set(payload, opts.attachmentPlanSnapshot);
     const runId = makeRunId();
     const sessionId = String(payload.sessionId || '');
     const clientRequestId = String(payload.clientRequestId || '');
@@ -2162,8 +2490,28 @@ async function startForegroundModelRun(event, payload = {}, opts = {}, kind = 'c
     const agentMode = normalizeAgentMode(payload.agentMode);
     preflightAcceptedRun(binding, settings, contextPolicy, project, payload, kind);
     const planBinding = kind === 'chat' && agentMode === 'plan' ? resolvePlanBinding(event, payload, binding) : null;
+    let userMessage = opts.userMessage;
+    if (kind === 'chat') {
+      attachmentAcceptedContexts.set(payload, { binding, settings, project, contextPolicy });
+      const description = await describeAttachmentSend(event, payload);
+      userMessage = description.userMessage;
+      // Even a renderer omitting every attachment field cannot skip inventory.
+      // claimSend describes before reading blobs and pure text returns null.
+      const ipc = getAttachmentIpc();
+      attachmentRun = await ipc.service.claimSend(event, payload);
+    }
+    // claimSend is asynchronous; another foreground operation may have won.
     lease = foregroundModels.acquire({ senderId: event.sender.id, sessionId, clientRequestId, runId, kind, binding,
       sender: event.sender, settings, project, contextPolicy, agentMode, planBinding });
+    if (attachmentRun) {
+      attachmentRun.setSignal(lease.abort.signal);
+      attachmentRunLeases.set(attachmentRun, lease);
+      getAttachmentIpc().service.consume(attachmentRun);
+      lease.attachmentRun = attachmentRun;
+      lease.operationBudget = createAttachmentOperationBudget(lease, attachmentRun);
+      userMessage = getAttachmentRunData(attachmentRun).userMessage;
+    }
+    lease.userMessage = userMessage;
     lease.modelSource = publicModelSource(binding, { kind: settings.mode === 'api' ? 'api' : 'local-demo' });
     lease.task = new TaskHandle({ taskId: runId, kind: kind === 'chat' ? TASK_KINDS.CHAT_RUN : TASK_KINDS.SESSION_COMPACT,
       sessionId, projectId: project?.id, ownerId: event.sender.id, abortController: lease.abort,
@@ -2172,15 +2520,14 @@ async function startForegroundModelRun(event, payload = {}, opts = {}, kind = 'c
     });
     lease.emit = (entry) => emitAcceptedRun(lease, entry);
     activeRun = lease;
-    // Spend Plan authority synchronously before any accepted execution can run.
     opts.onExecutionStarted?.(runId);
     lease.completion = (async () => {
       await new Promise((resolve) => setImmediate(resolve));
       let result; let failure;
       try {
         lease.task.start();
-        lease.emit({ type: kind === 'chat' ? AGENT_EVENTS.RUN_START : 'compact-start',
-          ...(opts.userMessage ? { userMessage: opts.userMessage } : {}) });
+        lease.emit({ type: kind === 'chat' ? AGENT_EVENTS.RUN_START : 'compact-start', ...(userMessage ? { userMessage } : {}) });
+        if (attachmentRun) { await attachmentRun.ready(); await attachmentRun.check(); }
         result = kind === 'chat' ? await executeAcceptedChat(event, payload, opts, lease) : await executeAcceptedCompact(payload, lease);
         if (!lease.terminalEmitted) lease.emit({ type: kind === 'chat' ? AGENT_EVENTS.DONE : 'compact-done', ...result });
       } catch (error) {
@@ -2193,6 +2540,8 @@ async function startForegroundModelRun(event, payload = {}, opts = {}, kind = 'c
           : (aborted ? 'compact-cancelled' : 'compact-error'), message, ...result });
       } finally {
         try { lease.gate?.cancelPending('运行已结束'); } catch { /* no authority remains */ }
+        // Pins, commits and native cleanup settle before the foreground slot.
+        try { await attachmentRun?.release(); } catch { /* preserve the original terminal outcome */ }
         try { await lease.cleanup?.(); } catch { /* cleanup cannot turn a failed attempt into success */ }
         result = redactSecrets({ ok: true, ...result, accepted: true, mode: result?.mode || settings.mode, ...acceptedRunMetadata(lease) });
         try { await opts.onSettled?.(result, failure); } catch { /* completion cannot revive spent authority */ }
@@ -2201,9 +2550,9 @@ async function startForegroundModelRun(event, payload = {}, opts = {}, kind = 'c
       }
       return result;
     })();
-    // Acceptance is carried by run-start/compact-start; invoke keeps its final-result contract.
     return await lease.completion;
   } catch (error) {
+    try { await attachmentRun?.release(); } catch { /* never retain a failed reservation */ }
     if (lease) { foregroundModels.release(lease); if (activeRun === lease) activeRun = null; }
     const projected = publicRunError(error);
     return { ...projected, ok: false, error: projected.safeMessage };
@@ -2293,7 +2642,7 @@ async function executeAcceptedChat(event, payload, opts, lease) {
     const samplingController = createMcpSamplingController({
       settings: { ...settings, model: modelBinding.model, baseUrl: modelBinding.baseUrl },
       modelBinding,
-      chatFn: boundModelChat(modelBinding, settings, { kind: 'mcp-sampling' }),
+      chatFn: boundModelChat(modelBinding, settings, { kind: 'mcp-sampling', signal, operationBudget: lease.operationBudget }),
       gate,
       sessionKey: sessionId,
       signal,
@@ -2367,7 +2716,7 @@ async function executeAcceptedChat(event, payload, opts, lease) {
     const runExtensions = {
       modelBinding,
       contextPolicy,
-      createBoundChat: (kind, callOptions = {}) => boundModelChat(modelBinding, settings, { kind, signal: callOptions.signal || signal, onUsage: callOptions.onUsage || emit }),
+      createBoundChat: (kind, callOptions = {}) => boundModelChat(modelBinding, settings, { kind, signal: callOptions.signal || signal, onUsage: callOptions.onUsage || emit, operationBudget: lease.operationBudget }),
       userDataPath: userDataPath(),
       worktreeManager,
       mcpOAuthManager: getMcpOAuthManager(),
@@ -2439,13 +2788,15 @@ async function executeAcceptedChat(event, payload, opts, lease) {
           : { ok: false, code: 'ENGINEERING_PROJECT_BINDING_INVALID', error: '项目绑定已失效' },
       },
     };
-    // Expand @refs only on the copy fed to the model (history keeps original).
-    const modelMessages = messagesForModel(messages, contextPolicy.projectContext ? project?.path : null);
+    // Only the current consumed run may add text; all historical refs stay metadata.
+    const modelMessages = lease.attachmentRun
+      ? await attachmentBudget.withWork({ signal }, work => projectAttachmentRunMessages(messages, lease.attachmentRun, { work }))
+      : messagesForModel(messages);
 
     // Host shortcuts are tools too; never substitute them for a denied role tool.
     const shortcutToolAllowed = (name) => { try { assertAssistantToolAllowed(name, modelBinding); return true; } catch { return false; } };
     const shortcutWantsSave = isStructureIntent(userText) || /保存|写入|生成\s*\.md|PROJECT_STRUCTURE/i.test(userText);
-    if (project?.path && contextPolicy.toolsAllowed && shortcutToolAllowed('list_dir')
+    if (!lease.attachmentRun && project?.path && contextPolicy.toolsAllowed && shortcutToolAllowed('list_dir')
       && (!shortcutWantsSave || shortcutToolAllowed('write_file')) && (isListIntent(userText) || isStructureIntent(userText))) {
       const authorization = await gate.authorize({ tool: 'list_dir', risk: 'read', summary: '读取项目目录结构',
         path: '.', sessionKey: sessionId, signal, agentMode });
@@ -2565,10 +2916,11 @@ async function executeAcceptedChat(event, payload, opts, lease) {
 
     if (useAgent) {
       const result = await runAgentLoop({
+        automaticProjectContext: !lease.attachmentRun,
         project,
         settings,
         modelBinding,
-        chatFn: boundModelChat(modelBinding, settings, { signal, onUsage: emit }),
+        chatFn: boundModelChat(modelBinding, settings, { signal, onUsage: emit, operationBudget: lease.operationBudget }),
         messages: modelMessages,
         gate,
         onEvent: emit,
@@ -2593,14 +2945,15 @@ async function executeAcceptedChat(event, payload, opts, lease) {
     }
 
     // Fallback single-shot
-    const systemParts = [modelBinding.assistant.systemPrompt || '你是一位 AI 助手。回答清楚、准确，不编造外部操作的结果。'];
-    if (contextPolicy.projectContext && project) systemParts.push(buildProjectSystemPrompt(project));
+    const systemParts = lease.attachmentRun ? [getAttachmentRunData(lease.attachmentRun).description.systemPrompt]
+      : [modelBinding.assistant.systemPrompt || '你是一位 AI 助手。回答清楚、准确，不编造外部操作的结果。'];
+    if (!lease.attachmentRun && contextPolicy.projectContext && project) systemParts.push(buildProjectSystemPrompt(project));
 
     let content;
     let streamedText = false;
     if (settings.mode === 'api') {
       const sentMessages = [{ role: 'system', content: systemParts.join('\n\n') }, ...modelMessages];
-      const msg = await boundModelChat(modelBinding, settings, { signal, onUsage: emit })({
+      const msg = await boundModelChat(modelBinding, settings, { signal, onUsage: emit, operationBudget: lease.operationBudget })({
         modelBinding,
         messages: sentMessages,
         signal,
@@ -2704,6 +3057,7 @@ ipcMain.handle('chat:approvePlan', async (event, payload = {}) => {
       messages: [...(Array.isArray(payload.messages) ? payload.messages : []), userMessage],
     }, {
       userMessage,
+      attachmentPlanSnapshot: claim.plan,
       onExecutionStarted: () => {
         planState.markStarted(planId, claim.claimId); executionStarted = true;
         safeSend(event.sender, 'chat:event', { type: 'plan-approving', planId, sessionId, ...acceptedRunMetadata(foregroundModels.current) });

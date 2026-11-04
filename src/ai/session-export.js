@@ -7,7 +7,8 @@
  * to whatever path the user picked in the save dialog.
  */
 
-const { projectToStorageJson, normalizeMessage, PART_TYPES } = require('./message-schema');
+const { projectToStorageJson, attachmentMetadataText, PART_TYPES } = require('./message-schema');
+const ATTACHMENT_EXPORT_NOTICE = '附件仅导出元信息（metadata）、状态与截断标记；未读取原件，缺少原件正文，不能据此恢复或授权附件。历史模型答案可能引用用户内容，本导出不声称擦除所有用户内容。';
 
 /** Keys never written to an export, at any nesting depth. */
 const SECRET_KEYS = new Set(['apikey', 'authorization', 'token', 'password', 'secret', 'accesstoken', 'refreshtoken']);
@@ -68,6 +69,8 @@ function exportSessionMarkdown(session) {
   lines.push(`- 消息数：${messages.length}`);
   lines.push(`- 导出时间：${new Date().toISOString()}`);
   lines.push('');
+  lines.push(ATTACHMENT_EXPORT_NOTICE);
+  lines.push('');
   lines.push('---');
 
   messages.forEach((rawMsg, i) => {
@@ -94,7 +97,7 @@ function exportSessionMarkdown(session) {
         lines.push(part.markdown);
       } else if (part.type === PART_TYPES.ATTACHMENT_REF) {
         lines.push('');
-        lines.push(`- 📎 附件：${part.name} (${part.mimeType || 'file'}, ${part.size || 0} 字节)`);
+        lines.push(`- 📎 ${attachmentMetadataText(part)}`);
       }
     }
 
@@ -109,13 +112,13 @@ function exportSessionMarkdown(session) {
         else if (t.kind === 'file_change') lines.push(`- 文件改动：${t.path} (${t.op})`);
       }
     } else {
-      if (rawMsg?.tool) {
+      if (norm.tool) {
         lines.push('');
-        lines.push(`- 工具 \`${String(rawMsg.tool)}\`：${String(rawMsg.toolSummary ?? '').slice(0, 500)}`);
+        lines.push(`- 工具 \`${String(norm.tool)}\`：${String(norm.toolSummary ?? '').slice(0, 500)}`);
       }
-      if (Array.isArray(rawMsg?.fileChanges) && rawMsg.fileChanges.length) {
+      if (Array.isArray(norm.fileChanges) && norm.fileChanges.length) {
         lines.push('');
-        for (const fc of rawMsg.fileChanges) {
+        for (const fc of norm.fileChanges) {
           lines.push(`- 文件改动：${String(fc?.path ?? fc ?? '')}`);
         }
       }
@@ -142,7 +145,7 @@ function exportSessionJson(session) {
     messages: sessionMessages(s).map(projectToStorageJson),
   });
   return JSON.stringify(
-    { version: 1, exportedAt: new Date().toISOString(), session: safe },
+    { version: 1, exportedAt: new Date().toISOString(), attachmentPolicy: ATTACHMENT_EXPORT_NOTICE, session: safe },
     null,
     2
   );

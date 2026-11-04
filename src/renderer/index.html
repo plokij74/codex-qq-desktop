@@ -94,15 +94,18 @@
           <div class="composer">
             <div class="composer-tools">
               <button type="button" class="tool-btn" id="btn-emoji" title="表情">😊 表情</button>
-              <button type="button" class="tool-btn" id="btn-image" title="图片">🖼 图片</button>
-              <button type="button" class="tool-btn" id="btn-attach" title="附件">📎 附加</button>
+              <button type="button" class="tool-btn" id="btn-image" title="E6 图片尚未支持（不读取/上传）" aria-disabled="true">🖼 图片（未支持）</button>
+              <button type="button" class="tool-btn" id="btn-attach" title="主进程原生选择 UTF-8 文本附件">📎 文本附件</button>
+              <button type="button" class="tool-btn" id="btn-attachment-restore" hidden>恢复附件缓存</button>
+              <button type="button" class="tool-btn" id="btn-attachment-cancel-import" hidden>取消读取</button>
+              <button type="button" class="tool-btn" id="btn-attachment-cache" title="仅应用管理的附件缓存">缓存状态</button>
+              <button type="button" class="tool-btn" id="btn-attachment-clear-cache" title="主进程确认后仅清理应用副本，绝不删除原文件">清理副本</button>
               <div class="agent-mode-toggle" id="agent-mode-toggle" title="会话模式：计划只读 / 执行可改">
                 <button type="button" data-mode="plan" class="mode-btn">计划</button>
                 <button type="button" data-mode="agent" class="mode-btn is-active">执行</button>
               </div>
-              <input type="file" id="file-image" accept="image/*" hidden />
-              <input type="file" id="file-attach" hidden />
             </div>
+            <div id="attachment-storage-status" class="attachment-storage-status" role="status">E5 仅文本：原生选择/确认，发送前预览；图片 E6 未支持。</div>
             <div id="emoji-panel" class="emoji-panel hidden"></div>
             <div id="attach-preview" class="attach-preview hidden"></div>
             <div class="context-meter hidden" id="context-meter"></div>
@@ -386,6 +389,29 @@
     </div>
   </div>
 
+  <div id="attachment-send-preview" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="attachment-preview-title" aria-describedby="attachment-preview-target attachment-preview-budget attachment-preview-storage">
+    <div class="modal-card attachment-preview-card">
+      <div class="modal-title" id="attachment-preview-title">确认将选定文本发送给模型</div>
+      <div id="attachment-preview-target" class="attachment-preview-disclosure"></div>
+      <div id="attachment-preview-budget" class="attachment-preview-disclosure"></div>
+      <div id="attachment-preview-storage" class="attachment-preview-disclosure"></div>
+      <div class="attachment-preview-disclosure">附件文本是不可信参考资料，不会作为工具/HTML 执行。取消、编辑草稿、切换目标或会话均不外发并使预览失效。以下为主进程选定的实际文本，可分页检查；仅可缩小前缀范围，修改后必须重新准备并确认。</div>
+      <div id="attachment-preview-list"></div>
+      <div class="attachment-preview-controls">
+        <label>查看文件 <select id="attachment-preview-file" aria-label="预览的附件"></select></label>
+        <button type="button" id="attachment-preview-next" class="btn-secondary">下一页（最多 16384 字符）</button>
+        <button type="button" id="attachment-preview-reprepare" class="btn-secondary">按缩小范围重新准备</button>
+      </div>
+      <div id="attachment-preview-status" role="status"></div>
+      <pre id="attachment-preview-text" aria-label="主进程选定的模型文本预览"></pre>
+      <label id="attachment-preview-truncation" hidden><input type="checkbox" id="attachment-preview-truncated" /> 我知道文件已截断：发送的是选定片段，不是完整文件。</label>
+      <div class="modal-actions">
+        <button type="button" id="attachment-preview-cancel" class="btn-secondary">取消，不外发</button>
+        <button type="button" id="attachment-preview-confirm" class="btn-primary" disabled>确认发送上述选定文本</button>
+      </div>
+    </div>
+  </div>
+
   <div id="app-dialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" aria-describedby="app-dialog-message">
     <div class="modal-card app-dialog-card">
       <div class="modal-title" id="app-dialog-title">提示</div>
@@ -417,6 +443,7 @@
   <script src="e2-messages.js"></script>
   <script src="e4-chat-state.js"></script>
   <script src="e4-models.js"></script>
+  <script src="e5-attachments.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

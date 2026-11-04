@@ -6,6 +6,8 @@ const os = require('os');
 const crypto = require('crypto');
 
 const registeredSecrets = new Map();
+let secretRedactionGeneration = 0;
+function getSecretRedactionGeneration() { return secretRedactionGeneration; }
 let electronSafeStorage = null;
 try {
   const electron = require('electron');
@@ -211,7 +213,9 @@ class SecretManager {
 
   registerSecret(value, label = 'SECRET') {
     if (typeof value === 'string' && value.trim().length >= 4) {
-      this.registeredSecrets.set(value.trim(), label);
+      const normalized = value.trim();
+      if (!this.registeredSecrets.has(normalized) || this.registeredSecrets.get(normalized) !== label) secretRedactionGeneration++;
+      this.registeredSecrets.set(normalized, label);
     }
   }
 
@@ -353,6 +357,7 @@ module.exports = {
   createSecretOutputBuffer,
   SecretManager,
   defaultSecretManager,
+  getSecretRedactionGeneration,
   redactSecrets,
   migrateSettingsFile,
 };

@@ -547,8 +547,8 @@ function boundAgentSystemPrompt(project, settings, opts) {
   if (modelBinding.assistant.systemPrompt) parts.push(`【助手指令】\n${modelBinding.assistant.systemPrompt}`);
   if (project?.path) {
     parts.push(`当前工作项目：${project.name || path.basename(project.path)}`);
-    parts.push(`项目根目录（host 指定）: ${project.path}`);
-    if (policy.projectContext) {
+    if (opts.automaticProjectContext !== false) parts.push(`项目根目录（host 指定）: ${project.path}`);
+    if (policy.projectContext && opts.automaticProjectContext !== false) {
       try {
         const instructions = loadProjectInstructions(project.path);
         if (instructions.parts) parts.push(instructions.parts);
@@ -581,6 +581,7 @@ async function systemFragmentsForTools(registry, ctx, advertisedTools) {
   if (!Array.isArray(providers) || !route || typeof route.entries !== 'function') return '';
   const parts = [];
   for (const provider of providers) {
+    if (ctx.automaticProjectContext === false && provider.id !== 'memory') continue;
     if (typeof provider.isEnabled === 'function' && !provider.isEnabled(ctx)) continue;
     if (typeof provider.getSystemFragment !== 'function') continue;
     const names = [...route.entries()].filter(([, owner]) => owner === provider).map(([name]) => name);
@@ -1782,6 +1783,7 @@ async function runAgentLoop({
   registry: registryOpt,
   extensions: extensionsOpt,
   modelBinding,
+  automaticProjectContext = true,
 }) {
   modelBinding = modelBinding ?? extensionsOpt?.modelBinding;
   if (modelBinding != null) {
@@ -1811,7 +1813,8 @@ async function runAgentLoop({
     extensions.contextPolicy = contextPolicy;
   }
   // Skills trigger matching: last user message text for system fragment
-  extensions.userPromptText = extractLastUserText(messages);
+  extensions.userPromptText = automaticProjectContext === false ? '' : extractLastUserText(messages);
+  extensions.automaticProjectContext = automaticProjectContext !== false;
 
   const rawTurns = Number(settings.maxAgentTurns);
   // 0 = unlimited; otherwise clamp 1..50 for safety when user sets a number
@@ -1827,6 +1830,7 @@ async function runAgentLoop({
   let verifyLastFailed = false;
 
   const runCtx = {
+    automaticProjectContext: automaticProjectContext !== false,
     project,
     modelBinding,
     projectBindingId: modelBinding?.projectBindingId,
@@ -1868,12 +1872,12 @@ async function runAgentLoop({
     const terminalAvailable = !modelBinding
       || (settings.terminalEnabled && mode === 'agent' && depth === 0 && advertisedTools.has('run_terminal'));
     if (modelBinding && tools.length) assertBindingToolCapability(modelBinding);
-    if (modelBinding && hasProject && terminalAvailable && settings.verifyBeforeDone !== false
+    if (automaticProjectContext !== false && modelBinding && hasProject && terminalAvailable && settings.verifyBeforeDone !== false
       && (contextPolicy.projectContext || String(settings.verifyCommand || '').trim())) {
       verifyCmd = resolveVerifyCommand(project.path, settings);
     }
 
-    if (hasProject && depth === 0 && terminalAvailable && (!modelBinding || contextPolicy.projectContext)
+    if (automaticProjectContext !== false && hasProject && depth === 0 && terminalAvailable && (!modelBinding || contextPolicy.projectContext)
       && settings.hooksEnabled !== false && userDataPath) {
       const resolved = loadHooks({ userDataPath, projectPath: project.path });
       hooksRunner = createHooksRunner({
@@ -1903,6 +1907,7 @@ async function runAgentLoop({
       const fileChanges = [];
 
       let systemContent = agentSystemPrompt(project, settings, {
+        automaticProjectContext,
         modelBinding,
         tools,
         contextPolicy,

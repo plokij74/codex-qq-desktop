@@ -13,6 +13,8 @@
 const SCHEMA_VERSION = 2;
 
 const { DEFAULT_BUDGETS } = require('./task-contract');
+const { normalizePublicAttachment, newAttachmentId, sanitizeName, LIMITS: ATTACHMENT_LIMITS } = require('./attachment-contract');
+const { redactSecrets } = require('./secret-manager');
 
 const MODEL_SOURCE_KINDS = new Set(['api', 'local-demo', 'legacy-demo', 'unknown']);
 const MODEL_SOURCE_PROTOCOLS = new Set(['openai-chat-completions', 'openai-responses', 'anthropic-messages']);
@@ -69,8 +71,12 @@ const ATTACHMENT_SOURCES = Object.freeze({
 const ATTACHMENT_STATUS = Object.freeze({
   READY: 'ready',
   MISSING: 'missing',
+  CORRUPT: 'corrupt',
   DELETED: 'deleted',
   EXPIRED: 'expired',
+  REVOKED: 'revoked',
+  LEGACY_UNAVAILABLE: 'legacy_unavailable',
+  UNSUPPORTED: 'unsupported',
 });
 
 const PLAN_STATUS = Object.freeze({
@@ -114,7 +120,7 @@ function createMessageId() {
 }
 
 function createAttachmentId() {
-  return `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return newAttachmentId();
 }
 
 /**
@@ -146,31 +152,115 @@ function truncateString(str, max = 500) {
 /**
  * Normalize an attachment reference object.
  */
+function ownValue(value, key) {
+  if (!value || typeof value !== 'object') return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function attachmentProjectionError(code) {
+  const message = code === 'ATTACHMENT_LEGACY_REQUIRES_MIGRATION'
+    ? '历史附件需要显式迁移；未读取或导出原件。'
+    : '附件引用数量超限；未替换会话。';
+  return Object.assign(new Error(message), { code, safeMessage: message });
+}
+
 function normalizeAttachmentRef(att = {}) {
-  return {
-    attachmentId: String(att.attachmentId || att.id || createAttachmentId()),
-    name: String(att.name || 'unnamed_file'),
-    mimeType: String(att.mimeType || att.mime || att.type || 'application/octet-stream'),
-    size: typeof att.size === 'number' && Number.isFinite(att.size) ? Math.max(0, att.size) : 0,
-    hash: att.hash ? String(att.hash) : null,
-    source: Object.values(ATTACHMENT_SOURCES).includes(att.source)
-      ? att.source
-      : ATTACHMENT_SOURCES.USER_UPLOAD,
-    status: Object.values(ATTACHMENT_STATUS).includes(att.status)
-      ? att.status
-      : ATTACHMENT_STATUS.READY,
-    budget: {
-      estimatedTokens: typeof att.budget?.estimatedTokens === 'number' ? att.budget.estimatedTokens : 0,
-      maxBytes: typeof att.budget?.maxBytes === 'number' ? att.budget.maxBytes : (att.size || 0),
-      truncated: Boolean(att.budget?.truncated),
-    },
-    storagePath: att.storagePath ? String(att.storagePath) : null,
-  };
+  const mime = ownValue(att, 'mimeType') || ownValue(att, 'mime') || ownValue(att, 'type');
+  const mimeType = typeof mime === 'string' && mime !== PART_TYPES.ATTACHMENT_REF ? mime : 'application/octet-stream';
+  const oldPayload = ownValue(att, 'refVersion') !== 1 &&
+    (typeof ownValue(att, 'dataUrl') === 'string' || typeof ownValue(att, 'base64') === 'string' || mimeType.startsWith('image/'));
+  return normalizePublicAttachment({
+    refVersion: ownValue(att, 'refVersion'),
+    attachmentId: ownValue(att, 'attachmentId') || ownValue(att, 'id'),
+    name: ownValue(att, 'name'), mimeType, size: ownValue(att, 'size'),
+    source: ownValue(att, 'source'),
+    status: oldPayload ? ATTACHMENT_STATUS.UNSUPPORTED : ownValue(att, 'status'),
+    storageMode: ownValue(att, 'storageMode'), budget: ownValue(att, 'budget'),
+  });
+}
+
+/** A ref is metadata, never proof that the current model has received bytes. */
+function attachmentMetadataText(raw) {
+  const ref = normalizeAttachmentRef(raw);
+  return `[附件: ${ref.name} (${ref.mimeType}, ${ref.size} 字节)] ` +
+    `（仅元信息；状态: ${ref.status}；存储: ${ref.storageMode}；` +
+    `截断: ${ref.budget.truncated ? '是' : '否'}；未提供正文、未读取原件）`;
+}
+
+function assertAttachmentPartsLimit(parts) {
+  if (Array.isArray(parts) && parts.length > 256 && parts.slice(256).some(p => p && p.type === PART_TYPES.ATTACHMENT_REF)) {
+    throw attachmentProjectionError('ATTACHMENT_PARTS_LIMIT');
+  }
+}
+
+function normalizeAttachmentManifest(value) {
+  if (!Array.isArray(value)) return undefined;
+  const refs = [], seen = new Set();
+  for (const raw of value) {
+    const ref = { type: PART_TYPES.ATTACHMENT_REF, ...normalizeAttachmentRef(raw) };
+    const key = ref.attachmentId || JSON.stringify([ref.name, ref.mimeType, ref.size, ref.source]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    refs.push(ref);
+    if (refs.length > ATTACHMENT_LIMITS.MAX_COMPACT_ATTACHMENT_REFS) throw attachmentProjectionError('ATTACHMENT_COMPACT_MANIFEST_LIMIT');
+  }
+  return refs;
+}
+
+function appendAttachmentParts(parts, attachments, manifest) {
+  for (const list of [attachments, manifest]) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      const ref = { type: PART_TYPES.ATTACHMENT_REF, ...normalizeAttachmentRef(raw) };
+      if (!parts.some(p => p.type === PART_TYPES.ATTACHMENT_REF && (ref.attachmentId
+        ? p.attachmentId === ref.attachmentId : p.name === ref.name && p.mimeType === ref.mimeType && p.size === ref.size))) parts.push(ref);
+    }
+  }
+  return parts;
 }
 
 /**
  * Normalize a single content part.
  */
+function sanitizeManagedLegacyMessage(raw) {
+  if (!raw || typeof raw !== 'object') return raw;
+  const rawParts = Array.isArray(raw.parts) ? raw.parts : [];
+  const carriers = [...rawParts.filter(p => ownValue(p, 'type') === PART_TYPES.ATTACHMENT_REF), ...(Array.isArray(raw.attachments) ? raw.attachments : [])];
+  const unsupported = new Set();
+  const sanitizeText = text => {
+    if (typeof text !== 'string' || (raw.role || 'user') !== 'user') return text;
+    const lines = text.split(/\r?\n/);
+    let fence = '', changed = false;
+    const output = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const marker = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+      if (marker) { if (!fence) fence = marker[1][0]; else if (fence === marker[1][0]) fence = ''; output.push(line); continue; }
+      const image = !fence && /^\s{0,3}!\[([^\]\r\n]*)\]\((data:image\/[^\s)]*;base64,[^\s)]*)\)\s*$/.exec(line);
+      const standalone = (i === 0 || !lines[i - 1].trim()) && (i === lines.length - 1 || !lines[i + 1].trim());
+      if (!image || !standalone) { output.push(line); continue; }
+      const matches = carriers.filter(c => ownValue(c, 'refVersion') !== 1 &&
+        (ownValue(c, 'dataUrl') === image[2] || sanitizeName(ownValue(c, 'name')) === sanitizeName(image[1]) &&
+          String(ownValue(c, 'mimeType') || ownValue(c, 'mime') || ownValue(c, 'type') || '').startsWith('image/')));
+      if (!matches.length) throw attachmentProjectionError('ATTACHMENT_LEGACY_REQUIRES_MIGRATION');
+      for (const carrier of matches) unsupported.add(carrier);
+      changed = true;
+    }
+    return changed ? output.join('\n').replace(/\n{3,}/g, '\n\n').trim() : text;
+  };
+  const content = sanitizeText(raw.content);
+  const parts = rawParts.map(part => ownValue(part, 'type') === PART_TYPES.TEXT ? { ...part, text: sanitizeText(part.text) } : part);
+  const safeRef = ref => ({ type: PART_TYPES.ATTACHMENT_REF, ...normalizeAttachmentRef(unsupported.has(ref)
+    ? { attachmentId: ownValue(ref, 'attachmentId') || ownValue(ref, 'id'), name: ownValue(ref, 'name'), mimeType: ownValue(ref, 'mimeType') || ownValue(ref, 'type'), size: ownValue(ref, 'size'), source: ownValue(ref, 'source'), status: 'unsupported' } : ref) });
+  const safeParts = parts.map(p => ownValue(p, 'type') === PART_TYPES.ATTACHMENT_REF ? safeRef(p) : p);
+  const result = { ...raw, content };
+  if (Array.isArray(raw.parts)) result.parts = safeParts;
+  if (Array.isArray(raw.attachments)) result.attachments = raw.attachments.map(safeRef);
+  if (Array.isArray(raw.attachmentManifest)) result.attachmentManifest = normalizeAttachmentManifest(raw.attachmentManifest);
+  return result;
+}
+
 function normalizePart(part) {
   if (!part || typeof part !== 'object') {
     return { type: PART_TYPES.TEXT, text: String(part || '') };
@@ -316,9 +406,11 @@ function createMessageV2(roleOrOpts = {}, contentOrParts = null, extraOpts = {})
     opts = roleOrOpts || {};
   }
 
-  const parts = Array.isArray(opts.parts) && opts.parts.length
+  opts = sanitizeManagedLegacyMessage(opts);
+  const parts = appendAttachmentParts(Array.isArray(opts.parts) && opts.parts.length
     ? opts.parts.map(normalizePart)
-    : (opts.content != null ? [{ type: PART_TYPES.TEXT, text: String(opts.content) }] : []);
+    : (opts.content != null ? [{ type: PART_TYPES.TEXT, text: String(opts.content) }] : []), opts.attachments, opts.attachmentManifest);
+  assertAttachmentPartsLimit(parts);
 
   const trajectory = Array.isArray(opts.trajectory)
     ? opts.trajectory.map(normalizeTrajectoryItem).filter(Boolean).slice(-LIMITS.MAX_TRAJECTORY_ITEMS)
@@ -382,12 +474,15 @@ function normalizeMessage(msg) {
     return createMessageV2({ role: 'user', content: '' });
   }
 
+  msg = sanitizeManagedLegacyMessage(msg);
   // Already v2
   if (msg.schemaVersion === SCHEMA_VERSION && Array.isArray(msg.parts)) {
+    const parts = appendAttachmentParts(msg.parts.map(normalizePart), msg.attachments, msg.attachmentManifest);
+    assertAttachmentPartsLimit(parts);
     return normalizeMessageModelSource({
       ...msg,
       id: msg.id || createMessageId(),
-      parts: msg.parts.map(normalizePart),
+      parts,
       trajectory: Array.isArray(msg.trajectory)
         ? msg.trajectory.map(normalizeTrajectoryItem).filter(Boolean).slice(-LIMITS.MAX_TRAJECTORY_ITEMS)
         : [],
@@ -502,56 +597,25 @@ function projectToUiModel(msg) {
  * Project messages into standard OpenAI-compatible format `{ role, content }`.
  * Never leaks raw UI trajectory or sensitive machine-local paths.
  */
-function projectToModelMessages(messages, opts = {}) {
+function projectToModelMessagesWithoutStorageTruncation(messages) {
   const list = Array.isArray(messages) ? messages : (messages && typeof messages === 'object' ? [messages] : []);
-  const out = [];
-
-  for (const raw of list) {
+  return list.map(raw => {
     const msg = normalizeMessage(raw);
     const contentParts = [];
-
     for (const part of msg.parts) {
-      if (part.type === PART_TYPES.TEXT) {
-        if (part.text) contentParts.push(part.text);
-      } else if (part.type === PART_TYPES.PLAN) {
-        // Feed plan back to model if present in history
-        const title = part.title ? `# ${part.title}\n\n` : '';
-        contentParts.push(`已提交计划：\n${title}${part.markdown || ''}`);
-      } else if (part.type === PART_TYPES.ATTACHMENT_REF) {
-        // In E2, attachments provide metadata description to model
-        // (E5/E6 will project real text contents or image payload parts)
-        contentParts.push(`[附件: ${part.name} (${part.mimeType || 'application/octet-stream'}, ${part.size} 字节)]`);
-      }
+      if (part.type === PART_TYPES.TEXT && part.text) contentParts.push(part.text);
+      else if (part.type === PART_TYPES.PLAN) contentParts.push(`已提交计划：\n${part.title ? `# ${part.title}\n\n` : ''}${part.markdown || ''}`);
+      else if (part.type === PART_TYPES.ATTACHMENT_REF) contentParts.push(attachmentMetadataText(part));
     }
+    // Main-process caller owns context/wire limits. Storage sanitization is not
+    // a model budget and must never silently slice the independently bounded run.
+    return { role: redactSecrets(String(msg.role)), content: redactSecrets(contentParts.join('\n\n')) };
+  });
+}
 
-    let textContent = contentParts.join('\n\n');
-
-    out.push({
-      role: msg.role,
-      content: textContent,
-    });
-  }
-
-  // Handle @refs expansion on the last user message if projectPath and expandAtRefs are provided
-  if (opts.projectPath && typeof opts.expandAtRefs === 'function') {
-    for (let i = out.length - 1; i >= 0; i -= 1) {
-      if (out[i].role !== 'user') continue;
-      try {
-        const expanded = opts.expandAtRefs(opts.projectPath, out[i].content);
-        if (expanded && expanded.contextBlock) {
-          out[i] = {
-            role: 'user',
-            content: `${out[i].content}\n\n${expanded.contextBlock}`,
-          };
-        }
-      } catch {
-        // keep original text on failure
-      }
-      break;
-    }
-  }
-
-  return stripSecrets(out);
+function projectToModelMessages(messages) {
+  // Intentionally no opts, projectPath, expander, body map, or file access.
+  return stripSecrets(projectToModelMessagesWithoutStorageTruncation(messages));
 }
 
 // =========================================================================
@@ -566,12 +630,7 @@ function projectToStorageJson(msg) {
   const normalized = normalizeMessage(msg);
 
   const safeParts = normalized.parts.map((p) => {
-    if (p.type === PART_TYPES.ATTACHMENT_REF) {
-      // Do not store absolute local path in export/storage if sensitive
-      const safeAtt = { ...p };
-      delete safeAtt.localAbsPath;
-      return safeAtt;
-    }
+    if (p.type === PART_TYPES.ATTACHMENT_REF) return { type: PART_TYPES.ATTACHMENT_REF, ...normalizeAttachmentRef(p) };
     if (p.type === PART_TYPES.TOOL_CALL) return { ...p, args: truncateString(JSON.stringify(stripSecrets(p.args)), LIMITS.MAX_TOOL_ARGS_CHARS) };
     return p;
   });
@@ -590,6 +649,7 @@ function projectToStorageJson(msg) {
     createdAt: normalized.createdAt,
     schemaVersion: SCHEMA_VERSION,
     parts: safeParts,
+    ...(normalized.attachmentManifest ? { attachmentManifest: normalizeAttachmentManifest(normalized.attachmentManifest) } : {}),
     trajectory: safeTrajectory,
     content: normalized.content, // legacy fallback
     applied: normalized.applied,
@@ -643,6 +703,11 @@ module.exports = {
   projectToUiModel,
   projectToUIMessage: projectToUiModel,
   projectToModelMessages,
+  projectToModelMessagesWithoutStorageTruncation,
+  attachmentMetadataText,
+  normalizeAttachmentManifest,
+  assertAttachmentPartsLimit,
+  attachmentProjectionError,
   projectToStorageJson,
   projectToStorageMessage: projectToStorageJson,
   fromStorageJson,

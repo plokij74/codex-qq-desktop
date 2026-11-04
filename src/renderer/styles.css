@@ -1021,12 +1021,27 @@ html, body {
   font-size: 11px;
   max-width: 100%;
 }
-.attach-chip img {
-  width: 22px;
-  height: 22px;
-  object-fit: cover;
-  border-radius: 3px;
-}
+.attachment-storage-status { margin: 4px 0 6px; font-size: 11px; color: #53697b; overflow-wrap: anywhere; }
+#btn-image[aria-disabled="true"] { opacity: .65; }
+.composer-tools { flex-wrap: wrap; }
+.attach-chip span { overflow-wrap: anywhere; }
+.attachment-history-item { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 2px 4px 2px 0; }
+.attachment-history-item button { font-size: 10px; padding: 2px 4px; }
+.attachment-preview-card { width: min(880px, 94vw); max-height: 90vh; overflow: auto; }
+.attachment-preview-card .modal-title { margin-bottom: 10px; }
+.attachment-preview-disclosure { font-size: 12px; line-height: 1.5; padding: 6px 0; overflow-wrap: anywhere; }
+#attachment-preview-storage { color: #8a4f06; }
+#attachment-preview-list { margin: 8px 0; max-height: 160px; overflow: auto; }
+.attachment-preview-ref { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px; border-bottom: 1px solid #d6e0eb; font-size: 12px; }
+.attachment-preview-ref span { overflow-wrap: anywhere; min-width: 0; }
+.attachment-preview-ref input { width: 110px; padding: 3px 5px; border: 1px solid #9bb0c5; }
+.attachment-preview-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; font-size: 12px; }
+.attachment-preview-controls select { max-width: 100%; }
+#attachment-preview-text { white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; max-height: 36vh; min-height: 110px; overflow: auto; padding: 10px; border: 1px solid #bdcddb; background: #f7faff; color: #17212b; font: 12px/1.5 Consolas, monospace; user-select: text; }
+#attachment-preview-status { font-size: 11px; color: #53697b; margin: 6px 0; }
+#attachment-preview-truncation { color: #9e3d0c; display: block; font-size: 12px; margin-top: 8px; }
+#attachment-preview-truncation[hidden] { display: none; }
+.attachment-preview-card .modal-actions { position: sticky; bottom: -1px; padding: 10px 0 0; background: #fff; }
 .attach-chip button {
   border: none;
   background: transparent;

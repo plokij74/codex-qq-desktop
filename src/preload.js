@@ -1,6 +1,64 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+// This is a transport filter, not a capability grant. Main owns picker/drop
+// confirmation, namespace ownership, all file reads and every resource limit.
+const attachmentEnvelopeFields = ['sessionId', 'attachmentSessionBindingId', 'clientRequestId'];
+function attachmentFields(payload, fields = []) {
+  const result = {};
+  for (const key of fields) if (Object.prototype.hasOwnProperty.call(payload || {}, key)) result[key] = payload[key];
+  return result;
+}
+function attachmentEnvelope(payload, fields = []) {
+  return attachmentFields(payload, [...attachmentEnvelopeFields, ...fields]);
+}
+function attachmentSendSnapshot(payload = {}) {
+  const result = attachmentEnvelope(payload, ['requestKind', 'draftRevision', 'attachmentIds', 'messages',
+    'assistantId', 'modelProfileId', 'expectedRegistryRevision', 'projectBindingId', 'agentMode', 'planId', 'planRevision']);
+  if (Object.prototype.hasOwnProperty.call(payload, 'project')) {
+    result.project = payload.project ? attachmentFields(payload.project, ['id', 'name', 'path']) : null;
+  }
+  if (Array.isArray(payload.attachmentSelections)) {
+    result.attachmentSelections = payload.attachmentSelections.map(selection => attachmentFields(selection, ['attachmentId', 'prefixCodePoints']));
+  }
+  return result;
+}
+const attachments = Object.freeze({
+  registerSession: async (payload = {}) => ipcRenderer.invoke('attachments:registerSession', attachmentFields(payload, ['sessionId', 'clientRequestId'])),
+  restoreSession: async (payload = {}) => ipcRenderer.invoke('attachments:restoreSession', attachmentFields(payload, ['sessionId', 'namespaceRef', 'clientRequestId'])),
+  chooseExternal: async (payload = {}) => ipcRenderer.invoke('attachments:chooseExternal', attachmentEnvelope(payload)),
+  proposeDrop: async (payload = {}) => {
+    let files;
+    try { files = Array.from(payload.files || []); } catch { files = []; }
+    if (!files.length || files.length > 20 || typeof webUtils?.getPathForFile !== 'function') {
+      return { ok: false, code: 'ATTACHMENT_DROP_CANDIDATES_REQUIRED', error: '请拖放本地文本文件，或使用原生文件选择器' };
+    }
+    const paths = [];
+    try {
+      for (const file of files) {
+        // Never use payload.paths, File.path, file text/arrayBuffer or FileReader.
+        const candidate = webUtils.getPathForFile(file);
+        if (typeof candidate !== 'string' || !candidate) throw new TypeError('No native file candidate');
+        paths.push(candidate);
+      }
+    } catch { return { ok: false, code: 'ATTACHMENT_DROP_CANDIDATES_REQUIRED', error: '拖放对象不是可确认的本地文件；请重新选择' }; }
+    return ipcRenderer.invoke('attachments:proposeDrop', { ...attachmentEnvelope(payload), paths });
+  },
+  captureProjectRefs: async (payload = {}) => ipcRenderer.invoke('attachments:captureProjectRefs', {
+    ...attachmentSendSnapshot(payload),
+    refs: Array.isArray(payload.refs) ? payload.refs.map(ref => attachmentFields(ref, ['path', 'startLine', 'endLine'])) : [],
+  }),
+  list: async (payload = {}) => ipcRenderer.invoke('attachments:list', attachmentEnvelope(payload)),
+  prepareSend: async (payload = {}) => ipcRenderer.invoke('attachments:prepareSend', attachmentSendSnapshot(payload)),
+  previewPage: async (payload = {}) => ipcRenderer.invoke('attachments:previewPage', attachmentEnvelope(payload, ['previewId', 'attachmentId', 'offset', 'limit'])),
+  remove: async (payload = {}) => ipcRenderer.invoke('attachments:remove', attachmentEnvelope(payload, ['attachmentId'])),
+  deleteCopy: async (payload = {}) => ipcRenderer.invoke('attachments:deleteCopy', attachmentEnvelope(payload, ['attachmentId'])),
+  cancel: async (payload = {}) => ipcRenderer.invoke('attachments:cancel', attachmentEnvelope(payload, ['previewId', 'targetClientRequestId'])),
+  cacheStatus: async (payload = {}) => ipcRenderer.invoke('attachments:cacheStatus', attachmentEnvelope(payload)),
+  clearCache: async (payload = {}) => ipcRenderer.invoke('attachments:clearCache', attachmentEnvelope(payload)),
+});
 
 contextBridge.exposeInMainWorld('codex', {
+  attachments,
   messageSchema: {
     normalizeMessage: (message) => ipcRenderer.sendSync('message:project', { kind: 'normalize', message }),
     projectToStorageJson: (message) => ipcRenderer.sendSync('message:project', { kind: 'storage', message }),
@@ -64,7 +122,8 @@ contextBridge.exposeInMainWorld('codex', {
   runTerminal: (payload) => ipcRenderer.invoke('terminal:run', payload),
   stopTerminal: (payload) => ipcRenderer.invoke('terminal:stop', payload || {}),
   clearTerminal: () => ipcRenderer.invoke('terminal:clear'),
-  atRefComplete: (payload) => ipcRenderer.invoke('atRef:complete', payload || {}),
+  atRefComplete: (payload = {}) => ipcRenderer.invoke('atRef:complete', attachmentFields(payload,
+    ['sessionId', 'assistantId', 'modelProfileId', 'expectedRegistryRevision', 'projectBindingId', 'prefix'])),
   atRefExpand: (payload) => ipcRenderer.invoke('atRef:expand', payload || {}),
   listSkills: (payload) => ipcRenderer.invoke('skills:list', payload || {}),
   getSkill: (payload) => ipcRenderer.invoke('skills:get', payload || {}),

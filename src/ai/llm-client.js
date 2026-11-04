@@ -2,6 +2,7 @@
 
 // The only legacy snake_case boundary. Production callers never supply endpoint/key/model authority.
 const { invokeModelTurn } = require('./model-router');
+const { assertModelOperationBudget } = require('./model-operation-budget');
 const { isResolvedModelBinding } = require('./model-profiles');
 const { ModelError, requireValue, normalizeMessages, unavailableUsage } = require('./model-adapters/common');
 const responses = require('./model-adapters/openai-responses');
@@ -17,8 +18,9 @@ function combineSignals(signals) {
   return { signal: controller.signal, dispose() { for (const signal of unique) signal.removeEventListener('abort', abort); } };
 }
 function notify(onUsage, event) { if (typeof onUsage !== 'function') return; try { Promise.resolve(onUsage(event)).catch(() => {}); } catch {} }
-function createModelChatFunction({ binding, resolveCredential, fetchFn, signal, onUsage, onResult } = {}) {
+function createModelChatFunction({ binding, resolveCredential, fetchFn, signal, onUsage, onResult, operationBudget } = {}) {
   requireValue(isResolvedModelBinding(binding), 'MODEL_BINDING_INVALID', 'A main-process resolved model binding is required.');
+  assertModelOperationBudget(operationBudget);
   let state; let expectedHistory; let active = false;
   return async function boundModelChat(options = {}) {
     requireValue(!active, 'MODEL_BUSY', 'A request is already using this bound model client.'); active = true;
@@ -33,7 +35,7 @@ function createModelChatFunction({ binding, resolveCredential, fetchFn, signal, 
       if (options.deadlineAt !== undefined) request.deadlineAt = options.deadlineAt;
       if (binding.compatibility.streamMode === 'auto' && options.stream === false) request.stream = false;
       if (options.stop !== undefined) request.stop = options.stop;
-      result = await invokeModelTurn({ binding, resolveCredential, fetchFn, signal: combined.signal, messages, tools: legacyTools(options.tools), request, providerState: state,
+      result = await invokeModelTurn({ binding, resolveCredential, fetchFn, signal: combined.signal, messages, tools: legacyTools(options.tools), request, providerState: state, operationBudget,
         onEvent: typeof options.onDelta === 'function' ? (event) => { if (event.type === 'text-delta') options.onDelta({ text: event.delta }); } : undefined });
       state = result.providerState;
       expectedHistory = [...messages, { role: 'assistant', content: result.content, ...(result.toolCalls.length ? { toolCalls: result.toolCalls } : {}) }];

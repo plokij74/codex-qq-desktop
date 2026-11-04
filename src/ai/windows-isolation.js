@@ -163,4 +163,7 @@ function runWindowsIsolated(scope, opts = {}) {
     } catch (error) { finish(null, error); }
   });
 }
-module.exports = { getWindowsIsolationStatus, authorizeIsolatedExecution, isIsolatedExecutionGrant, consumeIsolatedExecutionGrant, runWindowsIsolated, recoverNativeIsolation };
+// E5 reuses only the verified executable/environment, never the E3 execution
+// or ACL setup path. The dedicated native modes return before E3 initialization.
+function getVerifiedNativeLauncher() { return prepareLauncher(); }
+module.exports = { getWindowsIsolationStatus, authorizeIsolatedExecution, isIsolatedExecutionGrant, consumeIsolatedExecutionGrant, runWindowsIsolated, recoverNativeIsolation, getVerifiedNativeLauncher, helperEnvironment };
